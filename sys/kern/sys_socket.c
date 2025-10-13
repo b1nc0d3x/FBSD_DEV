@@ -598,7 +598,7 @@ soaio_enqueue(struct task *task)
 }
 
 static void
-soaio_init(void)
+soaio_init(void *dummy __unused)
 {
 
 	soaio_lifetime = AIOD_LIFETIME_DEFAULT;
