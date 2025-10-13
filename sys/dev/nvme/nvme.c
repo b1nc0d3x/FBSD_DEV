@@ -52,7 +52,7 @@ int32_t		nvme_retry_count;
 MALLOC_DEFINE(M_NVME, "nvme", "nvme(4) memory allocations");
 
 static void
-nvme_init(void)
+nvme_init(void *dummy __unused)
 {
 	uint32_t	i;
 
@@ -63,7 +63,7 @@ nvme_init(void)
 SYSINIT(nvme_register, SI_SUB_DRIVERS, SI_ORDER_SECOND, nvme_init, NULL);
 
 static void
-nvme_uninit(void)
+nvme_uninit(void *dummy __unused)
 {
 }
 
