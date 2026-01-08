@@ -3394,4 +3394,14 @@
 		);
 	}
 
+599	AUE_NULL	UNIMPL	kexec_load
+
+600     AUE_PDRFORK     STD|CAPENABLED {
+		int pdrfork(
+			_Out_ int *fdp,
+			int pdflags,
+			int rfflags
+		);
+	}
+
 ; vim: syntax=off
