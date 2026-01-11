@@ -27,7 +27,7 @@
 .\"
 .\"     @(#)newfs.8	8.6 (Berkeley) 5/3/95
 .\"
-.Dd November 19, 2024
+.Dd January 7, 2026
 .Dt NEWFS 8
 .Os
 .Sh NAME
@@ -35,7 +35,7 @@
 .Nd construct a new UFS1/UFS2 file system
 .Sh SYNOPSIS
 .Nm
-.Op Fl EJNUjlnt
+.Op Fl EJNUjlntu
 .Op Fl L Ar volname
 .Op Fl O Ar filesystem-type
 .Op Fl S Ar sector-size
@@ -100,10 +100,20 @@ The default format is UFS2.
 For backward compatibility.
 .It Fl U
 Enable soft updates on the new file system.
-Soft updates are enabled by default for UFS2 format file systems.
-Use
-.Xr tunefs 8
-to disable soft updates if they are not wanted.
+If neither
+.Fl U
+nor
+.Fl u
+is specified, soft updates are enabled by default for UFS2 format file
+systems and disabled otherwise.
+.It Fl u
+Do not enable soft updates on the new file system.
+If neither
+.Fl U
+nor
+.Fl u
+is specified, soft updates are enabled by default for UFS2 format file
+systems and disabled otherwise.
 .It Fl a Ar maxcontig
 Specify the maximum number of contiguous blocks that will be
 laid out before forcing a rotational delay.
@@ -168,6 +178,8 @@ One inode is required for each distinct file, so this value effectively
 specifies the average file size on the file system.
 .It Fl j
 Enable soft updates journaling on the new file system.
+This implies
+.Fl U .
 This flag is implemented by running the
 .Xr tunefs 8
 utility found in the user's
