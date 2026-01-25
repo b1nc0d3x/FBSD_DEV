@@ -1907,6 +1907,18 @@ struct jail_attach_jd_args {
 struct jail_remove_jd_args {
 	char fd_l_[PADL_(int)]; int fd; char fd_r_[PADR_(int)];
 };
+struct pdrfork_args {
+	char fdp_l_[PADL_(int *)]; int * fdp; char fdp_r_[PADR_(int *)];
+	char pdflags_l_[PADL_(int)]; int pdflags; char pdflags_r_[PADR_(int)];
+	char rfflags_l_[PADL_(int)]; int rfflags; char rfflags_r_[PADR_(int)];
+};
+struct pdwait_args {
+	char fd_l_[PADL_(int)]; int fd; char fd_r_[PADR_(int)];
+	char status_l_[PADL_(int *)]; int * status; char status_r_[PADR_(int *)];
+	char options_l_[PADL_(int)]; int options; char options_r_[PADR_(int)];
+	char wrusage_l_[PADL_(struct __wrusage *)]; struct __wrusage * wrusage; char wrusage_r_[PADR_(struct __wrusage *)];
+	char info_l_[PADL_(struct __siginfo *)]; struct __siginfo * info; char info_r_[PADR_(struct __siginfo *)];
+};
 int	sys__exit(struct thread *, struct _exit_args *);
 int	sys_fork(struct thread *, struct fork_args *);
 int	sys_read(struct thread *, struct read_args *);
@@ -2313,6 +2325,8 @@ int	sys_getgroups(struct thread *, struct getgroups_args *);
 int	sys_setgroups(struct thread *, struct setgroups_args *);
 int	sys_jail_attach_jd(struct thread *, struct jail_attach_jd_args *);
 int	sys_jail_remove_jd(struct thread *, struct jail_remove_jd_args *);
+int	sys_pdrfork(struct thread *, struct pdrfork_args *);
+int	sys_pdwait(struct thread *, struct pdwait_args *);
 
 #ifdef COMPAT_43
 
@@ -3311,6 +3325,8 @@ int	freebsd14_setgroups(struct thread *, struct freebsd14_setgroups_args *);
 #define	SYS_AUE_setgroups	AUE_SETGROUPS
 #define	SYS_AUE_jail_attach_jd	AUE_JAIL_ATTACH
 #define	SYS_AUE_jail_remove_jd	AUE_JAIL_REMOVE
+#define	SYS_AUE_pdrfork	AUE_PDRFORK
+#define	SYS_AUE_pdwait	AUE_PDWAIT
 
 #undef PAD_
 #undef PADL_

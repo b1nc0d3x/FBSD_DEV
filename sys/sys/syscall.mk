@@ -440,4 +440,6 @@ MIASM =  \
 	getgroups.o \
 	setgroups.o \
 	jail_attach_jd.o \
-	jail_remove_jd.o
+	jail_remove_jd.o \
+	pdrfork.o \
+	pdwait.o

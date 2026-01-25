@@ -3514,6 +3514,26 @@ systrace_args(int sysnum, void *params, uint64_t *uarg, int *n_args)
 		*n_args = 1;
 		break;
 	}
+	/* pdrfork */
+	case 600: {
+		struct pdrfork_args *p = params;
+		uarg[a++] = (intptr_t)p->fdp; /* int * */
+		iarg[a++] = p->pdflags; /* int */
+		iarg[a++] = p->rfflags; /* int */
+		*n_args = 3;
+		break;
+	}
+	/* pdwait */
+	case 601: {
+		struct pdwait_args *p = params;
+		iarg[a++] = p->fd; /* int */
+		uarg[a++] = (intptr_t)p->status; /* int * */
+		iarg[a++] = p->options; /* int */
+		uarg[a++] = (intptr_t)p->wrusage; /* struct __wrusage * */
+		uarg[a++] = (intptr_t)p->info; /* struct __siginfo * */
+		*n_args = 5;
+		break;
+	}
 	default:
 		*n_args = 0;
 		break;
@@ -9401,6 +9421,44 @@ systrace_entry_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
 			break;
 		};
 		break;
+	/* pdrfork */
+	case 600:
+		switch (ndx) {
+		case 0:
+			p = "userland int *";
+			break;
+		case 1:
+			p = "int";
+			break;
+		case 2:
+			p = "int";
+			break;
+		default:
+			break;
+		};
+		break;
+	/* pdwait */
+	case 601:
+		switch (ndx) {
+		case 0:
+			p = "int";
+			break;
+		case 1:
+			p = "userland int *";
+			break;
+		case 2:
+			p = "int";
+			break;
+		case 3:
+			p = "userland struct __wrusage *";
+			break;
+		case 4:
+			p = "userland struct __siginfo *";
+			break;
+		default:
+			break;
+		};
+		break;
 	default:
 		break;
 	};
@@ -11406,6 +11464,16 @@ systrace_return_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
 		break;
 	/* jail_remove_jd */
 	case 598:
+		if (ndx == 0 || ndx == 1)
+			p = "int";
+		break;
+	/* pdrfork */
+	case 600:
+		if (ndx == 0 || ndx == 1)
+			p = "int";
+		break;
+	/* pdwait */
+	case 601:
 		if (ndx == 0 || ndx == 1)
 			p = "int";
 		break;

@@ -817,4 +817,8 @@ FBSDprivate_1.0 {
 	__sys_jail_attach_jd;
 	_jail_remove_jd;
 	__sys_jail_remove_jd;
+	_pdrfork;
+	__sys_pdrfork;
+	_pdwait;
+	__sys_pdwait;
 };

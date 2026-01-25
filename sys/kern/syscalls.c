@@ -604,4 +604,7 @@ const char *syscallnames[] = {
 	"setgroups",			/* 596 = setgroups */
 	"jail_attach_jd",			/* 597 = jail_attach_jd */
 	"jail_remove_jd",			/* 598 = jail_remove_jd */
+	"#599",			/* 599 = kexec_load */
+	"pdrfork",			/* 600 = pdrfork */
+	"pdwait",			/* 601 = pdwait */
 };
