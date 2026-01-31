@@ -2070,6 +2070,18 @@ timer_delete_sync(struct timer_list *timer)
 }
 
 int
+del_timer(struct timer_list *timer)
+{
+	return (timer_delete(timer));
+}
+
+int
+del_timer_sync(struct timer_list *timer)
+{
+	return (timer_delete_sync(timer));
+}
+
+int
 timer_shutdown_sync(struct timer_list *timer)
 {
 
