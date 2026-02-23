@@ -1,0 +1,9 @@
+deps {
+	"lld" {
+		version = "${VERSION}"
+	}
+
+	"libcompiler_rt-dev" {
+		version = "${VERSION}"
+	}
+}
