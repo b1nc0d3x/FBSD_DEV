@@ -1,0 +1,19 @@
+#
+# RP64KERN_RKDRM_DDB -- RP64KERN_RKDRM plus stricter debugger support.
+#
+# This kernel exists so we can be explicit about what we boot when we want
+# repeatable panic/DDB behavior while iterating on USB-C DP bring-up.
+#
+
+cpu		ARM64
+ident		RP64KERN_RKDRM_DDB
+
+include		"RP64KERN_RKDRM"
+
+#
+# Ensure the kernel itself is built with debug symbols (useful for kgdb, and
+# makes DDB backtraces far more actionable).
+#
+makeoptions	DEBUG=-g
+options		GDB
+

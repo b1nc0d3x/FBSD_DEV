@@ -1,0 +1,36 @@
+#
+# RP64KERN_RKDRM -- Experimental RockPro64/RK3399 DRM kernel configuration.
+#
+# This is an integration kernel for the in-tree rk_drm scaffold. It is not
+# meant to replace the working rkfb baseline yet.
+#
+
+cpu		ARM64
+ident		RP64KERN_RKDRM
+
+include		"std.arm64"
+include		"std.dev"
+include		"std.rockchip"
+
+#
+# Debugger support (serial DDB).
+# Note: entering DDB on panic is controlled by loader tunables/sysctls
+# (e.g. debug.kdb.panic / debug.debugger_on_panic), not just these options.
+#
+options		KDB
+options		KDB_TRACE
+options		DDB
+options		BREAK_TO_DEBUGGER
+options		ALT_BREAK_TO_DEBUGGER
+
+#
+# DRM/KMS experiment:
+# - drm2 core object model
+# - fbd bridge for framebuffer-style console integration
+# - rk_drm phase-1 Rockchip scaffold
+#
+device		fbd
+device		drm2
+device		rk_drm
+device		rk3399_power
+device		fusb302
