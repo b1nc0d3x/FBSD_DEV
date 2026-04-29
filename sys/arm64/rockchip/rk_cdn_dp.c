@@ -2114,6 +2114,10 @@ rk_cdn_dp_deassert_resets(struct rk_cdn_dp_softc *sc)
 {
 	int error, i;
 
+	/* Linux cdn_dp_clk_enable: assert all resets first for a clean state. */
+	for (i = 0; i < RK_CDN_DP_NRSTS; i++)
+		(void)hwreset_assert(sc->rsts[i]);
+
 	for (i = 0; i < RK_CDN_DP_NRSTS; i++) {
 		error = hwreset_deassert(sc->rsts[i]);
 		if (error != 0) {
