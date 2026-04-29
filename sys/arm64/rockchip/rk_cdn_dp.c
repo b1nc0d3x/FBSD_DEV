@@ -248,6 +248,7 @@
 #define	RK_CDN_DP_FW_ALIVE_TIMEOUT_US	1000000
 #define	RK_CDN_DP_MAILBOX_RETRY_US	1000
 #define	RK_CDN_DP_MAILBOX_TIMEOUT_US	5000000
+#define	RK_CDN_DP_MAILBOX_READ_TIMEOUT_US	2000000
 #define	RK_CDN_DP_DPCD_READ_RETRIES	3
 
 #define	RK_CDN_DP_FIRMWARE_NAME		"rockchip/dptx.bin"
@@ -344,6 +345,8 @@ struct rk_cdn_dp_softc {
 	int			hostcap_lanes_override;
 	int			hostcap_flip_override;
 	int			hostcap_usb_ss_override;
+	int			skip_aux_swap;
+	uint32_t		aux_swap_value;
 	int			dp_altmode_valid;
 	int			dp_altmode_ready;
 	int			dp_altmode_usb_ss;
@@ -662,7 +665,7 @@ rk_cdn_dp_mailbox_read(struct rk_cdn_dp_softc *sc, uint8_t *val)
 	if (error != 0)
 		return (error);
 
-	for (i = 0; i < RK_CDN_DP_MAILBOX_TIMEOUT_US / RK_CDN_DP_MAILBOX_RETRY_US;
+	for (i = 0; i < RK_CDN_DP_MAILBOX_READ_TIMEOUT_US / RK_CDN_DP_MAILBOX_RETRY_US;
 	    i++) {
 		if (rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_EMPTY_ADDR) == 0) {
 			*val = rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX0_RD_DATA) &
@@ -709,9 +712,9 @@ rk_cdn_dp_mailbox_capture_state(struct rk_cdn_dp_softc *sc)
 static int
 rk_cdn_dp_mailbox_write(struct rk_cdn_dp_softc *sc, uint8_t val)
 {
+	uint32_t full, ka_start, ka_end;
 	int error;
 	int i;
-	uint32_t full;
 
 	error = rk_cdn_dp_mailbox_mmio_ready(sc);
 	if (error != 0)
@@ -720,6 +723,7 @@ rk_cdn_dp_mailbox_write(struct rk_cdn_dp_softc *sc, uint8_t val)
 	sc->mbox_last_write_full_first = 0xffffffff;
 	sc->mbox_last_write_full_last = 0xffffffff;
 	sc->mbox_last_write_full_polls = 0;
+	ka_start = rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE);
 
 	for (i = 0; i < RK_CDN_DP_MAILBOX_TIMEOUT_US / RK_CDN_DP_MAILBOX_RETRY_US;
 	    i++) {
@@ -732,9 +736,23 @@ rk_cdn_dp_mailbox_write(struct rk_cdn_dp_softc *sc, uint8_t val)
 			rk_cdn_dp_write_4(sc, RK_CDN_DP_MAILBOX0_WR_DATA, val);
 			return (0);
 		}
+		/*
+		 * Drain FW→HOST FIFO while waiting for FULL to clear.
+		 * After AUX_SWAP_INVERSION_CONTROL the firmware sends
+		 * unsolicited AUX-engine events; if we don't consume them the
+		 * firmware's output FIFO fills, hardware flow-control sets
+		 * FULL=1 on the HOST→FW side, and the firmware hangs.
+		 */
+		rk_cdn_dp_mailbox_drain(sc, 64);
 		DELAY(RK_CDN_DP_MAILBOX_RETRY_US);
 	}
 
+	ka_end = rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE);
+	device_printf(sc->dev,
+	    "mailbox_write timeout: FULL never cleared, "
+	    "keep_alive 0x%08x->0x%08x EMPTY=0x%x\n",
+	    ka_start, ka_end,
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_EMPTY_ADDR));
 	return (ETIMEDOUT);
 }
 
@@ -893,10 +911,17 @@ rk_cdn_dp_load_firmware(struct rk_cdn_dp_softc *sc)
 	iram_data = data + header_size;
 	dram_data = iram_data + iram_size;
 
+	device_printf(sc->dev,
+	    "fw-load: hdr=%u iram=%u dram=%u total=%u\n",
+	    header_size, iram_size, dram_size, size_bytes);
+
 	rk_cdn_dp_write_4(sc, RK_CDN_DP_APB_CTRL,
 	    RK_CDN_DP_APB_IRAM_PATH |
 	    RK_CDN_DP_APB_DRAM_PATH |
 	    RK_CDN_DP_APB_XT_RESET);
+
+	reg = rk_cdn_dp_read_4(sc, RK_CDN_DP_APB_CTRL);
+	device_printf(sc->dev, "fw-load: APB_CTRL after hold=%08x\n", reg);
 
 	for (i = 0; i < iram_size; i += 4) {
 		val = ((const uint32_t *)iram_data)[i / 4];
@@ -907,14 +932,30 @@ rk_cdn_dp_load_firmware(struct rk_cdn_dp_softc *sc)
 		rk_cdn_dp_write_4(sc, RK_CDN_DP_ADDR_DMEM + i, val);
 	}
 
+	/* verify first IMEM word was retained */
+	val = rk_cdn_dp_read_4(sc, RK_CDN_DP_ADDR_IMEM);
+	device_printf(sc->dev, "fw-load: IMEM[0] readback=0x%08x expected=0x%08x\n",
+	    val, ((const uint32_t *)iram_data)[0]);
+
+	reg = rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE);
+	device_printf(sc->dev, "fw-load: KEEP_ALIVE before release=%u\n", reg);
+
 	rk_cdn_dp_write_4(sc, RK_CDN_DP_APB_CTRL, 0);
+
+	reg = rk_cdn_dp_read_4(sc, RK_CDN_DP_APB_CTRL);
+	device_printf(sc->dev, "fw-load: APB_CTRL after release=%08x\n", reg);
 
 	for (i = 0; i < RK_CDN_DP_FW_ALIVE_TIMEOUT_US / 2000; i++) {
 		reg = rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE);
 		if (reg != 0)
 			break;
+		if (i % 50 == 49)
+			device_printf(sc->dev,
+			    "fw-load: waiting for KEEP_ALIVE (%u ms elapsed)\n",
+			    (i + 1) * 2);
 		DELAY(2000);
 	}
+	device_printf(sc->dev, "fw-load: KEEP_ALIVE final=%u (i=%u)\n", reg, i);
 	if (reg == 0)
 		return (ETIMEDOUT);
 
@@ -1023,29 +1064,18 @@ rk_cdn_dp_set_host_cap(struct rk_cdn_dp_softc *sc, uint8_t lanes, bool flip)
 	if (error != 0)
 		return (error);
 
-	error = rk_cdn_dp_mailbox_reg_write(sc,
-	    RK_CDN_DP_DP_AUX_SWAP_INVERSION_CONTROL, RK_CDN_DP_AUX_HOST_INVERT);
-	if (error != 0)
-		return (error);
-
-	/*
-	 * Wait for firmware to consume the queued SET_HOST_CAPABILITIES and
-	 * WRITE_REGISTER bytes from the TX FIFO.  The firmware processes
-	 * SET_HOST_CAPABILITIES by reconfiguring internal AUX state; with the
-	 * TC-PHY external PSM clock active this happens quickly, but give it
-	 * up to 5 s to be safe.  MAILBOX_FULL=0 means the FIFO is no longer
-	 * full and firmware has drained the backlog.
-	 */
-	for (int i = 0; i < RK_CDN_DP_MAILBOX_TIMEOUT_US / RK_CDN_DP_MAILBOX_RETRY_US; i++) {
-		if (rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_FULL_ADDR) == 0)
-			break;
-		DELAY(RK_CDN_DP_MAILBOX_RETRY_US);
-		if (i == RK_CDN_DP_MAILBOX_TIMEOUT_US / RK_CDN_DP_MAILBOX_RETRY_US - 1)
-			device_printf(sc->dev,
-			    "warning: MAILBOX_FULL still set after host_cap "
-			    "(keep_alive=0x%08x)\n",
-			    rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE));
+	if (!sc->skip_aux_swap) {
+		device_printf(sc->dev,
+		    "host_cap: AUX_SWAP=0x%x\n", sc->aux_swap_value);
+		error = rk_cdn_dp_mailbox_reg_write(sc,
+		    RK_CDN_DP_DP_AUX_SWAP_INVERSION_CONTROL,
+		    sc->aux_swap_value);
+		if (error != 0)
+			return (error);
+	} else {
+		device_printf(sc->dev, "host_cap: skipping AUX_SWAP write\n");
 	}
+
 	return (0);
 }
 
@@ -1109,6 +1139,15 @@ rk_cdn_dp_mailbox_dpcd_read(struct rk_cdn_dp_softc *sc, uint32_t addr,
 		}
 
 		if (error == ETIMEDOUT && attempt + 1 < RK_CDN_DP_DPCD_READ_RETRIES) {
+			/*
+			 * Drain any unsolicited/late firmware responses before
+			 * retrying.  Without this, a late AUX-timeout response
+			 * accumulates in the FW→HOST FIFO and we also send a
+			 * second READ_DPCD while the firmware may still be
+			 * processing the first, filling the HOST→FW FIFO and
+			 * causing FULL=1.
+			 */
+			rk_cdn_dp_mailbox_drain(sc, 64);
 			DELAY(5000);
 			continue;
 		}
@@ -1328,7 +1367,7 @@ rk_cdn_dp_wait_sink_ready(struct rk_cdn_dp_softc *sc)
 	uint8_t sink_count;
 	int error, i;
 
-	for (i = 0; i < 500; i++) {
+	for (i = 0; i < 20; i++) {
 		error = rk_cdn_dp_mailbox_dpcd_read(sc,
 		    RK_CDN_DP_DPCD_SINK_COUNT, &sink_count, 1);
 		if (error == 0 && (sink_count & 0x3f) != 0)
@@ -1345,9 +1384,49 @@ rk_cdn_dp_mailbox_probe_dpcd_caps(struct rk_cdn_dp_softc *sc)
 	struct rk3399_typec_dp_altmode_status altmode;
 	int error;
 
-	/* Drain any unsolicited firmware→host messages (events, acks) before
-	 * sending DPCD_READ so validate_receive sees only our response. */
-	rk_cdn_dp_mailbox_drain(sc, 64);
+	/*
+	 * Do not wait for KEEP_ALIVE to change here.  The CDN-DP firmware
+	 * only increments KEEP_ALIVE while actively processing mailbox
+	 * commands; it stops when idle (waiting for the next command).
+	 * Requiring KEEP_ALIVE to change before sending READ_DPCD creates a
+	 * deadlock: we wait for the firmware to prove it's alive, but the
+	 * firmware is waiting for us to give it work.  Linux does not do this
+	 * check before dpcd_read — just send the command and wait for the
+	 * response mailbox to fill.
+	 */
+	device_printf(sc->dev,
+	    "probe_dpcd: enter FULL=0x%x EMPTY=0x%x keep_alive=0x%08x\n",
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_FULL_ADDR),
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_EMPTY_ADDR),
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE));
+
+	/*
+	 * Drain unsolicited firmware→host events.  After AUX_SWAP processing
+	 * the firmware may send an HPD/training event notification that arrives
+	 * with a short delay (~10 ms).  Poll for up to 100 ms draining any data
+	 * that arrives; once EMPTY=1 has been stable for 20 ms, the mailbox is
+	 * quiet and we can safely send the first READ_DPCD command.
+	 */
+	{
+		uint32_t stable = 0;
+		int i;
+		for (i = 0; i < 100; i++) {
+			rk_cdn_dp_mailbox_drain(sc, 64);
+			if (rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_EMPTY_ADDR) != 0)
+				stable++;
+			else
+				stable = 0;
+			if (stable >= 20)
+				break;
+			DELAY(1000);
+		}
+	}
+
+	device_printf(sc->dev,
+	    "probe_dpcd: post-drain FULL=0x%x EMPTY=0x%x keep_alive=0x%08x\n",
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_FULL_ADDR),
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_EMPTY_ADDR),
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE));
 
 	if (rk_cdn_dp_get_altmode_status(sc, &altmode)) {
 		device_printf(sc->dev,
@@ -2536,6 +2615,7 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			}
 			break;
 		case RK_CDN_DP_STAGE_FW_ACTIVE:
+			/* Linux: firmware_init = set_firmware_active + event_config */
 			error = rk_cdn_dp_set_firmware_active(sc, true);
 			if (error != 0) {
 				sc->last_error = error;
@@ -2552,23 +2632,15 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				    sc->mbox_last_keep_alive, error);
 				return (error);
 			}
-			error = rk_cdn_dp_mailbox_enable_events(sc);
+			error = rk_cdn_dp_event_config(sc);
 			if (error != 0) {
 				sc->last_error = error;
-				device_printf(sc->dev, "event enable failed (%d)\n",
-				    error);
+				device_printf(sc->dev,
+				    "event_config failed (%d)\n", error);
 				return (error);
 			}
-			/*
-			 * Enable TC-PHY now that CDN-DP firmware is live and
-			 * driving PIPE PowerDown signals. Matches Linux ordering:
-			 * cdn_dp_firmware_init → cdn_dp_enable_phy → phy_power_on.
-			 */
-			error = rk_cdn_dp_do_enable_phys(sc);
-			if (error != 0) {
-				sc->last_error = error;
-				return (error);
-			}
+			/* Linux: enable_phy = phy_power_on then HPD_SEL (stage 10) */
+			(void)rk_cdn_dp_do_enable_phys(sc);
 			break;
 		case RK_CDN_DP_STAGE_HPD_SEL:
 			error = rk_cdn_dp_select_hpd(sc);
@@ -2589,10 +2661,11 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			}
 			break;
 		case RK_CDN_DP_STAGE_HOSTCAP:
+			/* Linux: set_host_cap after get_hpd_status (stage 11) */
 			error = rk_cdn_dp_mailbox_set_host_cap(sc);
 			if (error != 0) {
 				sc->last_error = error;
-				device_printf(sc->dev, "host cap failed (%d)\n",
+				device_printf(sc->dev, "set_host_cap failed (%d)\n",
 				    error);
 				return (error);
 			}
@@ -2653,6 +2726,8 @@ rk_cdn_dp_reset_runtime_state(struct rk_cdn_dp_softc *sc)
 	sc->hostcap_lanes_override = 0;
 	sc->hostcap_flip_override = -1;
 	sc->hostcap_usb_ss_override = -1;
+	sc->skip_aux_swap = 0;
+	sc->aux_swap_value = RK_CDN_DP_AUX_HOST_INVERT;
 	sc->dp_altmode_valid = 0;
 	sc->dp_altmode_ready = 0;
 	sc->dp_altmode_usb_ss = -1;
@@ -2814,6 +2889,12 @@ rk_cdn_dp_attach(device_t dev)
 	    "hostcap_usb_ss", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    &sc->hostcap_usb_ss_override, 0, rk_cdn_dp_sysctl_hostcap_usb_ss,
 	    "I", "USB_SS state: -1=auto, 0=DP-only(4 lanes), 1=USB3+DP(2 lanes)");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "skip_aux_swap", CTLFLAG_RW, &sc->skip_aux_swap, 0,
+	    "Skip WRITE_REGISTER(AUX_SWAP_INVERSION_CONTROL) in host-cap (debug)");
+	SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "aux_swap_value", CTLFLAG_RW, &sc->aux_swap_value, 0,
+	    "Value for AUX_SWAP_INVERSION_CONTROL (0=none,1=invert,3=invert+init)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "dp_altmode_valid", CTLFLAG_RD, &sc->dp_altmode_valid, 0,
 	    "Last observed DP Alt Mode helper presence");
