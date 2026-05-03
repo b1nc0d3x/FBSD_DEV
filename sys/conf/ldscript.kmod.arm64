@@ -1,0 +1,81 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Kyle Crenshaw
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+/*
+ * ldscript.kmod.arm64
+ *
+ * FreeBSD's arm64 standalone KMOD link path emits the metadata sections
+ * (`set_modmetadata_set`, `set_sysctl_set`, `set_sysinit_set`) but does not
+ * define the usual __start/__stop linker-set symbols for them.  The kernel's
+ * module loader relies on those bounds to find module metadata and process
+ * sysctl/sysinit records, so self-built arm64 modules can load into memory
+ * without actually registering a module entry or exposing their sysctls.
+ *
+ * This linker script mirrors the amd64 kmod text/rodata coalescing and adds
+ * explicit linker-set bounds for the metadata sections needed by arm64 KLDs.
+ */
+
+SECTIONS
+{
+	.plt		:
+	{
+		*(.plt)
+	}
+
+	.text		:
+	{
+		*(.text .text.*)
+		. = ALIGN(CONSTANT(COMMONPAGESIZE));
+	}
+
+	.rodata		:
+	{
+		*(.rodata .rodata.*)
+		. = ALIGN(CONSTANT(COMMONPAGESIZE));
+	}
+
+	set_sysctl_set	:
+	{
+		__start_set_sysctl_set = .;
+		KEEP(*(set_sysctl_set))
+		__stop_set_sysctl_set = .;
+	}
+
+	set_modmetadata_set :
+	{
+		__start_set_modmetadata_set = .;
+		KEEP(*(set_modmetadata_set))
+		__stop_set_modmetadata_set = .;
+	}
+
+	set_sysinit_set :
+	{
+		__start_set_sysinit_set = .;
+		KEEP(*(set_sysinit_set))
+		__stop_set_sysinit_set = .;
+	}
+}

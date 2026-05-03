@@ -438,7 +438,7 @@ vm_memattr_t
 ttm_io_prot(uint32_t caching_flags)
 {
 #if defined(__i386__) || defined(__amd64__) || defined(__powerpc__) || 	\
- defined(__arm__)
+ defined(__arm__) || defined(__aarch64__)
 	if (caching_flags & TTM_PL_FLAG_WC)
 		return (VM_MEMATTR_WRITE_COMBINING);
 	else

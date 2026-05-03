@@ -112,6 +112,10 @@ _Static_assert(offsetof(struct pcb, pcb_fpustate) == 192,
 
 enum arm64_bus arm64_bus_method = ARM64_BUS_NONE;
 
+#ifdef FDT
+void	rk3399_fdt_fixup(void);
+#endif
+
 /*
  * XXX: The .bss is assumed to be in the boot CPU NUMA domain. If not we
  * could relocate this, but will need to keep the same virtual address as
@@ -608,6 +612,7 @@ try_load_dtb(void)
 	if (OF_init((void *)dtbp) != 0)
 		panic("OF_init failed with the found device tree");
 
+	rk3399_fdt_fixup();
 	parse_fdt_bootargs();
 }
 #endif

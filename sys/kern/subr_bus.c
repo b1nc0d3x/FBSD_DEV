@@ -3140,6 +3140,17 @@ resource_list_alloc(struct resource_list *rl, device_t bus, device_t child,
 	struct resource_list_entry *rle = NULL;
 	int passthrough = (device_get_parent(child) != bus);
 	int isdefault = RMAN_IS_DEFAULT_RANGE(start, end);
+	bool trace_fusb302_irq;
+
+	trace_fusb302_irq = type == SYS_RES_IRQ &&
+	    (start == 0x52 || start == 0x55);
+	if (trace_fusb302_irq) {
+		printf("resource_list_alloc: bus=%p child=%p rid=%d "
+		    "start=%#jx end=%#jx count=%#jx flags=%#x "
+		    "passthrough=%d isdefault=%d\n",
+		    bus, child, *rid, start, end, count, flags,
+		    passthrough, isdefault);
+	}
 
 	if (passthrough) {
 		return (BUS_ALLOC_RESOURCE(device_get_parent(bus), child,
@@ -3147,9 +3158,18 @@ resource_list_alloc(struct resource_list *rl, device_t bus, device_t child,
 	}
 
 	rle = resource_list_find(rl, type, *rid);
+	if (trace_fusb302_irq) {
+		printf("resource_list_alloc: rle=%p\n", rle);
+	}
 
 	if (!rle)
 		return (NULL);		/* no resource of that type/rid */
+
+	if (trace_fusb302_irq) {
+		printf("resource_list_alloc: rle range [%#jx,%#jx] "
+		    "count=%#jx flags=%#x res=%p\n",
+		    rle->start, rle->end, rle->count, rle->flags, rle->res);
+	}
 
 	if (rle->res) {
 		if (rle->flags & RLE_RESERVED) {
@@ -3172,10 +3192,17 @@ resource_list_alloc(struct resource_list *rl, device_t bus, device_t child,
 		start = rle->start;
 		count = ulmax(count, rle->count);
 		end = ulmax(rle->end, start + count - 1);
+		if (trace_fusb302_irq) {
+			printf("resource_list_alloc: expanded default to "
+			    "[%#jx,%#jx] count=%#jx\n", start, end, count);
+		}
 	}
 
 	rle->res = BUS_ALLOC_RESOURCE(device_get_parent(bus), child,
 	    type, rid, start, end, count, flags);
+	if (trace_fusb302_irq) {
+		printf("resource_list_alloc: parent alloc -> %p\n", rle->res);
+	}
 
 	/*
 	 * Record the new range.
@@ -3921,10 +3948,29 @@ bus_generic_setup_intr(device_t dev, device_t child, struct resource *irq,
     int flags, driver_filter_t *filter, driver_intr_t *intr, void *arg,
     void **cookiep)
 {
+	bool trace_fusb302_irq;
+	int error;
+
+	trace_fusb302_irq = irq != NULL && rman_get_type(irq) == SYS_RES_IRQ &&
+	    (rman_get_start(irq) == 0x52 || rman_get_start(irq) == 0x55);
+	if (trace_fusb302_irq) {
+		printf("bus_generic_setup_intr: dev=%p parent=%p child=%p "
+		    "irq=%p start=%#jx end=%#jx flags=%#x\n",
+		    dev, dev != NULL ? dev->parent : NULL, child, irq,
+		    rman_get_start(irq), rman_get_end(irq), flags);
+	}
 	/* Propagate up the bus hierarchy until someone handles it. */
-	if (dev->parent)
-		return (BUS_SETUP_INTR(dev->parent, child, irq, flags,
-		    filter, intr, arg, cookiep));
+	if (dev->parent) {
+		error = BUS_SETUP_INTR(dev->parent, child, irq, flags,
+		    filter, intr, arg, cookiep);
+		if (trace_fusb302_irq) {
+			printf("bus_generic_setup_intr: -> %d\n", error);
+		}
+		return (error);
+	}
+	if (trace_fusb302_irq) {
+		printf("bus_generic_setup_intr: -> %d\n", EINVAL);
+	}
 	return (EINVAL);
 }
 
@@ -4049,9 +4095,28 @@ bus_generic_release_resource(device_t dev, device_t child, struct resource *r)
 int
 bus_generic_activate_resource(device_t dev, device_t child, struct resource *r)
 {
+	bool trace_fusb302_irq;
+	int error;
+
+	trace_fusb302_irq = rman_get_type(r) == SYS_RES_IRQ &&
+	    (rman_get_start(r) == 0x52 || rman_get_start(r) == 0x55);
+	if (trace_fusb302_irq) {
+		printf("bus_generic_activate_resource: dev=%p parent=%p "
+		    "child=%p res=%p start=%#jx end=%#jx rflags=%#x\n",
+		    dev, dev != NULL ? dev->parent : NULL, child, r,
+		    rman_get_start(r), rman_get_end(r), rman_get_flags(r));
+	}
 	/* Propagate up the bus hierarchy until someone handles it. */
-	if (dev->parent)
-		return (BUS_ACTIVATE_RESOURCE(dev->parent, child, r));
+	if (dev->parent) {
+		error = BUS_ACTIVATE_RESOURCE(dev->parent, child, r);
+		if (trace_fusb302_irq) {
+			printf("bus_generic_activate_resource: -> %d\n", error);
+		}
+		return (error);
+	}
+	if (trace_fusb302_irq) {
+		printf("bus_generic_activate_resource: -> %d\n", EINVAL);
+	}
 	return (EINVAL);
 }
 
@@ -4335,13 +4400,25 @@ bus_generic_rman_alloc_resource(device_t dev, device_t child, int type,
 {
 	struct resource *r;
 	struct rman *rm;
+	bool trace_fusb302_irq;
 
+	trace_fusb302_irq = type == SYS_RES_IRQ &&
+	    (start == 0x52 || start == 0x55);
 	rm = BUS_GET_RMAN(dev, type, flags);
+	if (trace_fusb302_irq) {
+		printf("bus_generic_rman_alloc_resource: dev=%p child=%p "
+		    "rid=%d start=%#jx end=%#jx count=%#jx flags=%#x rm=%p\n",
+		    dev, child, rid != NULL ? *rid : -1, start, end, count,
+		    flags, rm);
+	}
 	if (rm == NULL)
 		return (NULL);
 
 	r = rman_reserve_resource(rm, start, end, count, flags & ~RF_ACTIVE,
 	    child);
+	if (trace_fusb302_irq) {
+		printf("bus_generic_rman_alloc_resource: reserve -> %p\n", r);
+	}
 	if (r == NULL)
 		return (NULL);
 	rman_set_rid(r, *rid);
@@ -4418,12 +4495,15 @@ bus_generic_rman_activate_resource(device_t dev, device_t child,
     struct resource *r)
 {
 	struct resource_map map;
+	bool trace_fusb302_irq;
 #ifdef INVARIANTS
 	struct rman *rm;
 #endif
 	int error, type;
 
 	type = rman_get_type(r);
+	trace_fusb302_irq = type == SYS_RES_IRQ &&
+	    (rman_get_start(r) == 0x52 || rman_get_start(r) == 0x55);
 #ifdef INVARIANTS
 	rm = BUS_GET_RMAN(dev, type, rman_get_flags(r));
 	KASSERT(rman_is_region_manager(r, rm),
@@ -4431,6 +4511,13 @@ bus_generic_rman_activate_resource(device_t dev, device_t child,
 #endif
 
 	error = rman_activate_resource(r);
+	if (trace_fusb302_irq) {
+		printf("bus_generic_rman_activate_resource: dev=%p child=%p "
+		    "res=%p start=%#jx end=%#jx flags=%#x "
+		    "rman_activate -> %d\n",
+		    dev, child, r, rman_get_start(r), rman_get_end(r),
+		    rman_get_flags(r), error);
+	}
 	if (error != 0)
 		return (error);
 
@@ -4448,11 +4535,19 @@ bus_generic_rman_activate_resource(device_t dev, device_t child,
 #ifdef INTRNG
 	case SYS_RES_IRQ:
 		error = intr_activate_irq(child, r);
+		if (trace_fusb302_irq) {
+			printf("bus_generic_rman_activate_resource: "
+			    "intr_activate_irq -> %d\n", error);
+		}
 		break;
 #endif
 	}
 	if (error != 0)
 		rman_deactivate_resource(r);
+	if (trace_fusb302_irq) {
+		printf("bus_generic_rman_activate_resource: final -> %d\n",
+		    error);
+	}
 	return (error);
 }
 

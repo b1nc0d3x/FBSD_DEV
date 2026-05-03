@@ -727,6 +727,11 @@ arm64/qualcomm/qcom_gcc.c			optional qcom_gcc fdt
 dev/qcom_mdio/qcom_mdio_ipq4018.c		optional qcom_mdio fdt mdio mii
 
 # RockChip Drivers
+arm64/rockchip/rk_cdn_dp.c			optional fdt rk_cdn_dp soc_rockchip_rk3399
+arm64/rockchip/rk_drm.c				optional fdt drm2 rk_drm soc_rockchip_rk3399
+arm64/rockchip/rk_drm_hw.c			optional fdt drm2 rk_drm soc_rockchip_rk3399
+arm64/rockchip/rk3399_power.c			optional fdt rk3399_power soc_rockchip_rk3399
+arm64/rockchip/rk3399_fdt_fixup.c		optional fdt
 arm64/rockchip/rk3328_codec.c			optional fdt rk3328codec soc_rockchip_rk3328
 arm64/rockchip/rk3399_emmcphy.c			optional fdt rk_emmcphy soc_rockchip_rk3399
 arm64/rockchip/rk3568_combphy.c			optional fdt rk_combphy soc_rockchip_rk3568

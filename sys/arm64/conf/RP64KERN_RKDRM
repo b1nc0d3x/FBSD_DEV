@@ -6,7 +6,7 @@
 #
 
 cpu		ARM64
-ident		RP64KERN_RKDRM
+ident		RP64KERN_FUSB302KO
 
 include		"std.arm64"
 include		"std.dev"
@@ -23,14 +23,10 @@ options		DDB
 options		BREAK_TO_DEBUGGER
 options		ALT_BREAK_TO_DEBUGGER
 
-#
-# DRM/KMS experiment:
-# - drm2 core object model
-# - fbd bridge for framebuffer-style console integration
-# - rk_drm phase-1 Rockchip scaffold
-#
-device		fbd
-device		drm2
-device		rk_drm
+# rk3399_power must be compiled in: rk_cdn_dp resolves rk3399_power_enable_domain
+# as a direct kernel symbol (not through module dependency chain).
+# drm2/rk_drm/fbd are NOT compiled in: the Linux KPI SYSINIT chain hangs boot
+# on arm64 because linux_compat_init runs before the scheduler is live.
+# fusb302 is NOT compiled in: crashes on boot when compiled into the kernel;
+# load as a module post-boot instead (kld_list in rc.conf).
 device		rk3399_power
-device		fusb302

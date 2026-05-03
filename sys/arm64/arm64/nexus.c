@@ -240,6 +240,12 @@ nexus_alloc_resource(device_t bus, device_t child, int type, int *rid,
 {
 	struct nexus_device *ndev = DEVTONX(child);
 	struct resource_list_entry *rle;
+	struct resource *res;
+	bool trace_fusb302_irq;
+	struct rman *rm;
+
+	trace_fusb302_irq = type == SYS_RES_IRQ &&
+	    (start == 0x52 || start == 0x55);
 
 	/*
 	 * If this is an allocation of the "default" range for a given
@@ -258,8 +264,28 @@ nexus_alloc_resource(device_t bus, device_t child, int type, int *rid,
 		count = rle->count;
 	}
 
-	return (bus_generic_rman_alloc_resource(bus, child, type, rid, start,
-	    end, count, flags));
+	rm = nexus_get_rman(bus, type, flags);
+	if (trace_fusb302_irq) {
+		printf("nexus_alloc_resource: bus=%p child=%p rid=%d "
+		    "start=%#jx end=%#jx count=%#jx flags=%#x rm=%p "
+		    "descr=%s\n",
+		    bus, child, rid != NULL ? *rid : -1, start, end, count,
+		    flags, rm, rm != NULL && rm->rm_descr != NULL ?
+		    rm->rm_descr : "<null>");
+	}
+
+	res = bus_generic_rman_alloc_resource(bus, child, type, rid, start,
+	    end, count, flags);
+	if (type == SYS_RES_IRQ && child != NULL) {
+		device_printf(bus,
+		    "irq alloc %s rid=%d start=%#jx end=%#jx count=%#jx "
+		    "flags=%#x -> %s\n",
+		    device_get_nameunit(child), rid != NULL ? *rid : -1,
+		    (uintmax_t)start, (uintmax_t)end, (uintmax_t)count, flags,
+		    res != NULL ? "ok" : "null");
+	}
+
+	return (res);
 }
 
 static int
@@ -330,7 +356,17 @@ nexus_activate_resource_flags(device_t bus, device_t child, struct resource *r,
 {
 	struct resource_map_request args;
 	struct resource_map map;
+	bool trace_fusb302_irq;
 	int err, use_np;
+
+	trace_fusb302_irq = rman_get_type(r) == SYS_RES_IRQ &&
+	    (rman_get_start(r) == 0x52 || rman_get_start(r) == 0x55);
+	if (trace_fusb302_irq) {
+		printf("nexus_activate_resource_flags: bus=%p child=%p res=%p "
+		    "start=%#jx end=%#jx flags=%#x rflags=%#x\n",
+		    bus, child, r, rman_get_start(r), rman_get_end(r),
+		    flags, rman_get_flags(r));
+	}
 
 	/*
 	 * If this is a memory resource, map it into the kernel.
@@ -360,7 +396,15 @@ nexus_activate_resource_flags(device_t bus, device_t child, struct resource *r,
 		}
 		break;
 	default:
-		return (bus_generic_rman_activate_resource(bus, child, r));
+		err = bus_generic_rman_activate_resource(bus, child, r);
+		if (trace_fusb302_irq) {
+			printf("nexus_activate_resource_flags: "
+			    "bus_generic_rman_activate_resource -> %d\n", err);
+		}
+		return (err);
+	}
+	if (trace_fusb302_irq) {
+		printf("nexus_activate_resource_flags: final -> 0\n");
 	}
 	return (0);
 }

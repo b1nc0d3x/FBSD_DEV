@@ -27,7 +27,7 @@
 
 /*
  * FUSB302 USB Type-C controller with USB-PD source policy and DP Alt Mode
- * VDM state machine.  Ported from Rockchip Linux 4.4 BSP (drivers/mfd/fusb302.c).
+ * VDM state machine.
  *
  * Implements the DFP (source) path: CC detection → source caps negotiation →
  * Discover_Identity → Discover_SVIDs → Discover_Modes → Enter_Mode →
@@ -68,6 +68,7 @@
 #define	FUSB_REG_DEVICE_ID	0x01
 #define	FUSB_REG_SWITCHES0	0x02
 #define	FUSB_REG_SWITCHES1	0x03
+#define	FUSB_REG_MEASURE	0x04
 #define	FUSB_REG_CONTROL0	0x06
 #define	FUSB_REG_CONTROL1	0x07
 #define	FUSB_REG_CONTROL2	0x08
@@ -114,8 +115,24 @@
 
 /* CONTROL2 bits */
 #define	FUSB_CTL2_TOG_RD_ONLY	0x20
+#define	FUSB_CTL2_MODE_MASK	0x06
+#define	FUSB_CTL2_MODE_DRP	0x02
+#define	FUSB_CTL2_MODE_UFP	0x04
 #define	FUSB_CTL2_MODE_DFP	0x06
 #define	FUSB_CTL2_TOGGLE	0x01
+
+/* TOGSS field values (STATUS1A bits 5:3) */
+#define	FUSB_TOGSS_NOTHING	0
+#define	FUSB_TOGSS_SRC_CC1	1
+#define	FUSB_TOGSS_SRC_CC2	2
+#define	FUSB_TOGSS_SNK_CC1	5
+#define	FUSB_TOGSS_SNK_CC2	6
+#define	FUSB_TOGSS_AUDIO	7
+
+/* Toggle role preference (hw.fusb302.role_pref tunable) */
+#define	FUSB_ROLE_DRP		0
+#define	FUSB_ROLE_SRC		1
+#define	FUSB_ROLE_SNK		2
 
 /* CONTROL3 bits */
 #define	FUSB_CTL3_AUTO_RETRY	0x01
@@ -134,10 +151,15 @@
 
 /* STATUS0 bits */
 #define	FUSB_ST0_VBUSOK		0x80
+#define	FUSB_ST0_COMP		0x20
 #define	FUSB_ST0_BC_LVL_MASK	0x03
 
 /* STATUS1 bits */
 #define	FUSB_ST1_RX_EMPTY	0x20
+
+/* MEASURE thresholds for TYPEC_RP_USB attach probing. */
+#define	FUSB_MEASURE_MDAC_USB_HIGH	0x26
+#define	FUSB_MEASURE_MDAC_USB_LOW	0x05
 
 /* STATUS1A togss field */
 #define	FUSB_ST1A_TOGSS_MASK	0x38
@@ -170,8 +192,10 @@
 /* PD control message types */
 #define	PD_CMT_GOODCRC		1
 #define	PD_CMT_ACCEPT		3
+#define	PD_CMT_REJECT		4
 #define	PD_CMT_PS_RDY		6
 #define	PD_CMT_GETSINKCAP	8
+#define	PD_CMT_WAIT		12
 #define	PD_CMT_SOFTRESET	13
 
 /* PD data message types */
@@ -231,25 +255,31 @@
 #define	FUSB_TX_FAILED	2
 #define	FUSB_TX_SUCCESS	3
 
-/* Event bits (stored in pending_events; match Linux event model) */
+/* Event bits (stored in pending_events). */
 #define	FUSB_EVT_CC		0x01
 #define	FUSB_EVT_RX		0x02
 #define	FUSB_EVT_TX		0x04
 #define	FUSB_EVT_REC_RESET	0x08
 #define	FUSB_EVT_CONTINUE	0x20
-#define	FUSB_EVT_TIMER_MUX	0x40
 #define	FUSB_EVT_TIMER_STATE	0x80
 
 /* Sender response timeout (ms) */
 #define	T_SENDER_RESPONSE	30
 #define	T_SRC_TRANSITION	30
+#define	T_TYPEC_SINK_WAIT_CAP	500
+#define	T_PS_TRANSITION		550
+#define	T_NO_RESPONSE		5500
+
+/* Max hard-reset retries before giving up on PD and falling back to
+ * Type-C default 5V (passive) operation. */
+#define	N_SNK_HARDRESET_RETRY	2
 #define	T_TYPEC_SEND_SRCCAP	100
 
 /* Source capability PDO: 5V fixed, 900mA, USB comm capable */
 #define	FUSB_SRC_PDO_5V900MA	((1u << 26) | (100u << 10) | 90u)
 
 /* -----------------------------------------------------------------------
- * Connection-state enum (DFP / source path only)
+ * Connection-state enum (DFP/source + UFP/sink paths)
  * ----------------------------------------------------------------------- */
 enum fusb302_conn_state {
 	FUSB_ST_DISABLED = 0,
@@ -268,6 +298,15 @@ enum fusb302_conn_state {
 	FUSB_ST_SRC_SEND_HARDRST,
 	FUSB_ST_SRC_SEND_SOFTRST,
 	FUSB_ST_SRC_SOFTRST,
+	FUSB_ST_ATTACHED_SNK,
+	FUSB_ST_SNK_STARTUP,
+	FUSB_ST_SNK_DISCOVERY,
+	FUSB_ST_SNK_EVALUATE_CAPS,
+	FUSB_ST_SNK_SELECT_CAP,
+	FUSB_ST_SNK_TRANSITION_SINK,
+	FUSB_ST_SNK_READY,
+	FUSB_ST_SNK_TRANSITION_DEFAULT,
+	FUSB_ST_SNK_SEND_HARDRST,
 };
 
 /* VDM state (signed: -1 = error) */
@@ -330,6 +369,15 @@ struct fusb302_softc {
 	bool			vconn_enabled;
 	bool			is_pd_support;
 
+	/* Toggle role preference (FUSB_ROLE_*) and current attach role */
+	int			role_pref;
+	bool			attached_as_sink;
+
+	/* hw.fusb302.skip_pd: skip PD negotiation when attached as SNK and
+	 * jump straight to passive 4-lane DP defaults. For passive USB-C→DP
+	 * displays/dongles that don't implement a PD client. */
+	int			skip_pd;
+
 	/* VDM */
 	enum fusb302_vdm_state	vdm_state;
 	int			vdm_send_state;
@@ -359,7 +407,6 @@ struct fusb302_softc {
 
 	/* Timers */
 	struct callout		timer_state;
-	struct callout		timer_mux;
 
 	/* DP Alt Mode result exported to rk_cdn_dp */
 	struct rk3399_typec_dp_altmode_status	dp_altmode;
@@ -378,11 +425,18 @@ static int	fusb302_probe(device_t dev);
 static int	fusb302_attach(device_t dev);
 static int	fusb302_detach(device_t dev);
 static void	fusb302_irq_task(void *context, int pending);
-static void	fusb302_intr(void *context);
+static int	fusb302_intr(void *context);
 static void	fusb302_timer_state_cb(void *arg);
-static void	fusb302_timer_mux_cb(void *arg);
+int		fusb302_get_typec_status(device_t dev,
+		    struct fusb302_typec_status *status);
+int		fusb302_get_dp_altmode_state(device_t dev,
+		    struct rk3399_typec_dp_altmode_status *status);
+static bool	fusb302_is_rockpro64(device_t dev);
 static int	fusb302_try_ofw_irq(struct fusb302_softc *sc);
 static void	fusb302_add_sysctls(struct fusb302_softc *sc);
+static void	fusb302_notify_dp_locked(struct fusb302_softc *sc);
+static int	fusb302_probe_cc_pull_up_locked(struct fusb302_softc *sc,
+		    int polarity);
 
 /* -----------------------------------------------------------------------
  * Low-level I2C helpers
@@ -412,6 +466,75 @@ fusb302_update_reg(struct fusb302_softc *sc, uint8_t reg, uint8_t mask,
 		return (error);
 	cur = (cur & ~mask) | (val & mask);
 	return (fusb302_write_reg(sc, reg, cur));
+}
+
+static bool
+fusb302_is_rockpro64(device_t dev)
+{
+	phandle_t root;
+
+	root = OF_finddevice("/");
+	if (root <= 0)
+		return (false);
+
+	return (ofw_bus_node_is_compatible(root, "pine64,rockpro64") ||
+	    ofw_bus_node_is_compatible(root, "pine64,rockpro64-v2.0") ||
+	    ofw_bus_node_is_compatible(root, "pine64,rockpro64-v2.1"));
+}
+
+/*
+ * tcpm-style get_cc_pull_up: with toggle stopped, source-measure a
+ * specific CC pin and classify it as open/Rd/Ra. We only need to detect Rd
+ * here to bootstrap a hot-plugged DFP/source attach after kldload.
+ */
+static int
+fusb302_probe_cc_pull_up_locked(struct fusb302_softc *sc, int polarity)
+{
+	uint8_t store, status0;
+	uint8_t sw0, measure;
+	int retry, comp_high;
+	int ret;
+
+	ret = 0;
+	if (fusb302_read_reg(sc, FUSB_REG_SWITCHES0, &store) != 0)
+		return (0);
+
+	sw0 = store & ~(FUSB_SW0_MEAS_CC1 | FUSB_SW0_MEAS_CC2 |
+	    FUSB_SW0_PU_EN1 | FUSB_SW0_PU_EN2);
+	if (polarity == 0)
+		sw0 |= FUSB_SW0_MEAS_CC1 | FUSB_SW0_PU_EN1;
+	else
+		sw0 |= FUSB_SW0_MEAS_CC2 | FUSB_SW0_PU_EN2;
+	if (fusb302_write_reg(sc, FUSB_REG_SWITCHES0, sw0) != 0)
+		return (0);
+
+	measure = FUSB_MEASURE_MDAC_USB_HIGH;
+	(void)fusb302_write_reg(sc, FUSB_REG_MEASURE, measure);
+	DELAY(300);
+
+	comp_high = 0;
+	for (retry = 0; retry < 3; retry++) {
+		(void)fusb302_write_reg(sc, FUSB_REG_MEASURE, measure);
+		DELAY(300);
+		if (fusb302_read_reg(sc, FUSB_REG_STATUS0, &status0) != 0)
+			break;
+		if ((status0 & FUSB_ST0_COMP) != 0)
+			comp_high++;
+	}
+
+	if (comp_high != 3) {
+		measure = FUSB_MEASURE_MDAC_USB_LOW;
+		(void)fusb302_write_reg(sc, FUSB_REG_MEASURE, measure);
+		DELAY(300);
+		if (fusb302_read_reg(sc, FUSB_REG_STATUS0, &status0) == 0 &&
+		    (status0 & FUSB_ST0_COMP) != 0)
+			ret = 1;
+	}
+
+	(void)fusb302_write_reg(sc, FUSB_REG_SWITCHES0, store);
+	(void)fusb302_write_reg(sc, FUSB_REG_MEASURE,
+	    FUSB_MEASURE_MDAC_USB_HIGH);
+	return (ret);
 }
 
 /*
@@ -510,13 +633,26 @@ fusb302_set_polarity_locked(struct fusb302_softc *sc, int polarity)
 		/* VCONN on the opposite CC pin */
 		sw0 |= polarity ? FUSB_SW0_VCONN_CC1 : FUSB_SW0_VCONN_CC2;
 	}
-	/* DFP: measure + pull-up on active CC */
-	if (polarity == 0)
-		sw0 |= FUSB_SW0_MEAS_CC1 | FUSB_SW0_PU_EN1;
-	else
-		sw0 |= FUSB_SW0_MEAS_CC2 | FUSB_SW0_PU_EN2;
+	if (sc->attached_as_sink) {
+		/*
+		 * UFP/sink: keep Rd on both CC (PDWN1|PDWN2), measure on
+		 * the active CC pin only. No Rp.
+		 */
+		if (polarity == 0)
+			sw0 |= FUSB_SW0_MEAS_CC1;
+		else
+			sw0 |= FUSB_SW0_MEAS_CC2;
+		sw0 |= FUSB_SW0_PDWN1 | FUSB_SW0_PDWN2;
+	} else {
+		/* DFP/source: pull-up + measure on active CC, drop pull-downs */
+		if (polarity == 0)
+			sw0 |= FUSB_SW0_MEAS_CC1 | FUSB_SW0_PU_EN1;
+		else
+			sw0 |= FUSB_SW0_MEAS_CC2 | FUSB_SW0_PU_EN2;
+	}
 
 	(void)fusb302_update_reg(sc, FUSB_REG_SWITCHES0,
+	    FUSB_SW0_PDWN1 | FUSB_SW0_PDWN2 |
 	    FUSB_SW0_VCONN_CC1 | FUSB_SW0_VCONN_CC2 |
 	    FUSB_SW0_MEAS_CC1 | FUSB_SW0_MEAS_CC2 |
 	    FUSB_SW0_PU_EN1 | FUSB_SW0_PU_EN2, sw0);
@@ -600,12 +736,6 @@ fusb302_start_state_timer(struct fusb302_softc *sc, int ms)
 	    fusb302_timer_state_cb, sc, 0);
 }
 
-static void
-fusb302_start_mux_timer(struct fusb302_softc *sc, int ms)
-{
-	callout_reset_sbt(&sc->timer_mux, SBT_1MS * ms, 0,
-	    fusb302_timer_mux_cb, sc, 0);
-}
 
 /* -----------------------------------------------------------------------
  * PD message building
@@ -633,6 +763,41 @@ fusb302_set_mesg_srccap_locked(struct fusb302_softc *sc)
 {
 	fusb302_build_header_locked(sc, PD_DMT_SRCCAP, 1);
 	sc->send_load[0] = FUSB_SRC_PDO_5V900MA;
+}
+
+/*
+ * Build a Sink Request Data Object for the partner's selected fixed PDO.
+ * sc->pos_power holds the 1-based PDO index chosen by snk_evaluate_caps.
+ */
+static uint32_t
+fusb302_build_rdo_locked(struct fusb302_softc *sc)
+{
+	uint32_t pdo, op_cur, max_cur, rdo;
+	int pos;
+
+	pos = sc->pos_power;
+	if (pos < 1 || pos > 7)
+		pos = 1;
+	pdo = sc->partner_cap[pos - 1];
+	max_cur = pdo & 0x3ff;		/* 10mA units */
+	if (max_cur == 0)
+		max_cur = 90;		/* 900mA fallback */
+	op_cur = max_cur;
+
+	rdo = ((uint32_t)pos << 28) |
+	    (1u << 25) |		/* USB Communications Capable */
+	    (1u << 24) |		/* No USB Suspend */
+	    ((op_cur & 0x3ff) << 10) |
+	    (max_cur & 0x3ff);
+	return (rdo);
+}
+
+/* Build a sink Request data message for the selected PDO. */
+static void
+fusb302_set_mesg_request_locked(struct fusb302_softc *sc)
+{
+	fusb302_build_header_locked(sc, PD_DMT_REQUEST, 1);
+	sc->send_load[0] = fusb302_build_rdo_locked(sc);
 }
 
 /* Build a control message (no data objects). */
@@ -689,7 +854,7 @@ fusb302_set_vdm_mesg_locked(struct fusb302_softc *sc, int cmd, int type,
 	}
 }
 
-/* Select pin assignment from DP caps + status (mirrors Linux algorithm). */
+/* Select pin assignment from DP caps + status. */
 static int
 fusb302_dp_pin_assignment(uint32_t caps, uint32_t status)
 {
@@ -710,7 +875,7 @@ fusb302_dp_pin_assignment(uint32_t caps, uint32_t status)
 }
 
 /* -----------------------------------------------------------------------
- * TX state machine (mirrors Linux policy_send_data)
+ * TX state machine for USB-PD policy data sends.
  * ----------------------------------------------------------------------- */
 static int
 fusb302_policy_send_data_locked(struct fusb302_softc *sc)
@@ -756,6 +921,14 @@ fusb302_process_vdm_msg_locked(struct fusb302_softc *sc)
 			sc->notify_dp_status = sc->rec_load[1] & 0xff;
 			device_printf(sc->dev, "VDM attention dp_status=0x%x\n",
 			    sc->notify_dp_status);
+			/*
+			 * Refresh exported DP altmode state. VDM Attention
+			 * is how the partner tells us about HPD transitions
+			 * after Enter_Mode/DP_Configure — without this call
+			 * the cdn_dp consumer sees the pre-HPD snapshot
+			 * (dp_ready=0) forever.
+			 */
+			fusb302_notify_dp_locked(sc);
 		}
 		break;
 
@@ -822,11 +995,11 @@ fusb302_process_vdm_msg_locked(struct fusb302_softc *sc)
 }
 
 /* -----------------------------------------------------------------------
- * VDM send sub-functions (mirror Linux vdm_send_* functions)
+ * VDM send sub-functions.
  * Each returns: 0 = success, -EINPROGRESS = still waiting, <0 = error
  * ----------------------------------------------------------------------- */
 
-/* Macro mirrors Linux AUTO_VDM_HANDLE */
+/* Auto-VDM step+state encoding macro. */
 #define	VDM_HANDLE(fn, sc, evt, cond)			\
 do {							\
 	(cond) = (fn)((sc), (evt));			\
@@ -1098,8 +1271,16 @@ fusb302_notify_dp_locked(struct fusb302_softc *sc)
 	sc->dp_altmode.dp_ready = sc->notify_is_enter_mode && hpd;
 	sc->dp_altmode.pin_assignment = sc->notify_pin_def;
 	sc->dp_altmode.dp_status = sc->notify_dp_status;
-	/* usb_ss: 0 = DP-only (4-lane), 1 = USB3+DP (2-lane) */
-	sc->dp_altmode.usb_ss = (sc->notify_pin_def & DP_PIN_MF_MASK) ? 1 : 0;
+	/*
+	 * usb_ss: 0 = DP-only (4-lane), 1 = USB3+DP (2-lane).
+	 *
+	 * RockPro64's working path reports pin_assignment=0x4 (Pin C)
+	 * while still following the 2-lane USB3+DP Cadence bring-up path, so
+	 * treat Pin C as usb_ss=1 here as well.
+	 */
+	sc->dp_altmode.usb_ss =
+	    ((sc->notify_pin_def & DP_PIN_MF_MASK) != 0 ||
+	    sc->notify_pin_def == DP_PIN_C) ? 1 : 0;
 
 	device_printf(sc->dev,
 	    "DP Alt Mode: dp_ready=%d pin=0x%x usb_ss=%d dp_status=0x%x\n",
@@ -1108,7 +1289,7 @@ fusb302_notify_dp_locked(struct fusb302_softc *sc)
 }
 
 /* -----------------------------------------------------------------------
- * VDM state machine (mirrors Linux auto_vdm_machine)
+ * VDM state machine driving the Discover_Identity → Enter_Mode → DP_Config sequence.
  * ----------------------------------------------------------------------- */
 static void
 fusb302_auto_vdm_machine_locked(struct fusb302_softc *sc, uint32_t evt)
@@ -1146,32 +1327,110 @@ fusb302_auto_vdm_machine_locked(struct fusb302_softc *sc, uint32_t evt)
 /* -----------------------------------------------------------------------
  * PD state functions (DFP / source path)
  * ----------------------------------------------------------------------- */
-static void
-fusb302_state_attached_source_locked(struct fusb302_softc *sc,
-    uint32_t evt __unused)
-{
-	int polarity;
+/*
+ * After TOGDONE the sink's PD controller needs time to power up via VBUS and
+ * start listening on CC.  Wait ~400ms here; without it the first
+ * several src_caps transmissions get RETRYFAIL even though the sink is
+ * PD-capable.
+ */
+#define	T_ATTACH_WAIT_MS	400
 
-	/* Derive polarity from STATUS1A TOGSS */
-	switch ((sc->status1a & FUSB_ST1A_TOGSS_MASK) >> FUSB_ST1A_TOGSS_SHIFT)
-	{
-	case 2:	/* src-cc2 */
-		polarity = 1;
+static void
+fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
+{
+	int polarity, error;
+	uint8_t st0;
+
+	switch (sc->sub_state) {
+	case 0:
+		/*
+		 * Trust the previously detected polarity. RockPro64 late-load
+		 * source bootstrap can synthesize ATTACHED_SRC before STATUS1A
+		 * reflects the final orientation, and re-deriving polarity from
+		 * TOGSS here can incorrectly flip CC2 back to CC1.
+		 */
+		polarity = sc->cc_polarity;
+		if (polarity != 0 && polarity != 1) {
+			switch ((sc->status1a & FUSB_ST1A_TOGSS_MASK) >>
+			    FUSB_ST1A_TOGSS_SHIFT) {
+			case 2:	/* src-cc2 */
+				polarity = 1;
+				break;
+			default: /* src-cc1 */
+				polarity = 0;
+				break;
+			}
+		}
+
+		/*
+		 * Partner-sources-VBUS detection: TOGSS resolved as Source on
+		 * our side, but if VBUS is already present (we have not yet
+		 * enabled our own regulator) the partner is sourcing it. The
+		 * monitor was just slow to flip its CC pull during DRP toggle.
+		 * Flip to Sink role rather than fight the partner's Source.
+		 *
+		 * Gated to DRP only. On this RockPro64 the FUSB302's VBUSOK is
+		 * a board-level rail that reads 1 regardless of partner state,
+		 * so this heuristic always triggers and undoes any explicit SRC
+		 * choice. When the user forces role_pref=SRC, honor it: trust
+		 * TOGSS, don't second-guess via VBUSOK.
+		 */
+		if (sc->role_pref == FUSB_ROLE_DRP &&
+		    fusb302_read_reg(sc, FUSB_REG_STATUS0, &st0) == 0 &&
+		    (st0 & FUSB_ST0_VBUSOK) && !sc->vbus_enabled) {
+			device_printf(sc->dev,
+			    "TOGSS=src but partner sources VBUS; "
+			    "flipping to UFP/sink on CC%d\n", polarity + 1);
+
+			/*
+			 * Drop all CC pulls/MEAS so the partner sees an
+			 * electrical detach (~tCCDisconnect 25ms; use 50ms
+			 * for margin). ATTACHED_SNK will reapply Rd/MEAS.
+			 */
+			(void)fusb302_update_reg(sc, FUSB_REG_SWITCHES0,
+			    FUSB_SW0_PDWN1 | FUSB_SW0_PDWN2 |
+			    FUSB_SW0_PU_EN1 | FUSB_SW0_PU_EN2 |
+			    FUSB_SW0_MEAS_CC1 | FUSB_SW0_MEAS_CC2 |
+			    FUSB_SW0_VCONN_CC1 | FUSB_SW0_VCONN_CC2, 0);
+			DELAY(50000);
+
+			sc->cc_polarity = polarity;
+			sc->attached_as_sink = true;
+			fusb302_set_state_locked(sc, FUSB_ST_ATTACHED_SNK);
+			return;
+		}
+
+		sc->notify_is_cc = true;
+		sc->notify_power_role = 1;	/* source */
+		sc->notify_data_role = 1;	/* DFP */
+		sc->hardrst_count = 0;
+		sc->attached_as_sink = false;
+
+		/* Now that we are committed to Source, enable VBUS supply. */
+		if (sc->vbus_supply != NULL && !sc->vbus_enabled) {
+			error = regulator_enable(sc->vbus_supply);
+			if (error != 0) {
+				device_printf(sc->dev,
+				    "regulator_enable(vbus) failed: %d\n",
+				    error);
+			} else {
+				sc->vbus_enabled = true;
+			}
+		}
+
+		fusb302_set_polarity_locked(sc, polarity);
+		device_printf(sc->dev, "attached as DFP on CC%d, "
+		    "waiting %dms for sink PD init\n",
+		    polarity + 1, T_ATTACH_WAIT_MS);
+		fusb302_start_state_timer(sc, T_ATTACH_WAIT_MS);
+		sc->sub_state++;
 		break;
-	default: /* src-cc1 */
-		polarity = 0;
+
+	default:
+		if (evt & FUSB_EVT_TIMER_STATE)
+			fusb302_set_state_locked(sc, FUSB_ST_SRC_STARTUP);
 		break;
 	}
-
-	sc->notify_is_cc = true;
-	sc->notify_power_role = 1;	/* source */
-	sc->notify_data_role = 1;	/* DFP */
-	sc->hardrst_count = 0;
-
-	fusb302_set_polarity_locked(sc, polarity);
-	fusb302_set_state_locked(sc, FUSB_ST_SRC_STARTUP);
-
-	device_printf(sc->dev, "attached as DFP on CC%d\n", polarity + 1);
 }
 
 static void
@@ -1187,6 +1446,7 @@ fusb302_state_src_startup_locked(struct fusb302_softc *sc,
 	fusb302_set_polarity_locked(sc, sc->cc_polarity);
 	fusb302_enable_rx_locked(sc, true);
 
+	device_printf(sc->dev, "src_startup: PD init done, sending caps\n");
 	fusb302_set_state_locked(sc, FUSB_ST_SRC_SEND_CAPS);
 }
 
@@ -1197,6 +1457,7 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 
 	switch (sc->sub_state) {
 	case 0:
+		device_printf(sc->dev, "send_caps: writing src caps to FIFO\n");
 		fusb302_set_mesg_srccap_locked(sc);
 		sc->tx_state = FUSB_TX_IDLE;
 		sc->sub_state++;
@@ -1204,6 +1465,7 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 	case 1:
 		tmp = fusb302_policy_send_data_locked(sc);
 		if (tmp == FUSB_TX_SUCCESS) {
+			device_printf(sc->dev, "send_caps: TXSENT, waiting for REQUEST\n");
 			sc->hardrst_count = 0;
 			sc->caps_counter = 0;
 			sc->is_pd_support = true;
@@ -1211,8 +1473,30 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->sub_state++;
 		} else if (tmp == FUSB_TX_FAILED) {
 			sc->caps_counter++;
-			if (sc->caps_counter >= 50)
+			device_printf(sc->dev,
+			    "send_caps: RETRYFAIL caps_counter=%d\n",
+			    sc->caps_counter);
+			if (sc->caps_counter >= 50) {
+				/*
+				 * No GoodCRC after 50 attempts: passive USB-C
+				 * cable/adapter with no PD controller (e.g. a
+				 * direct USB-C-to-display cable using a signal
+				 * mux like HD3SS3220).  CC orientation is known
+				 * from TOGDONE; publish a true DP-only fallback
+				 * so rk_cdn_dp sees 4-lane semantics
+				 * (usb_ss=0) without waiting for VDM
+				 * negotiation.
+				 */
+				sc->notify_is_enter_mode = true;
+				sc->notify_pin_def = DP_PIN_E;
+				sc->notify_dp_status = (1u << 7); /* HPD high */
+				fusb302_notify_dp_locked(sc);
+				device_printf(sc->dev,
+				    "send_caps: passive cable on CC%d, "
+				    "exporting 4-lane DP defaults\n",
+				    sc->cc_polarity + 1);
 				fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
+			}
 			else {
 				fusb302_start_state_timer(sc,
 				    T_TYPEC_SEND_SRCCAP);
@@ -1233,6 +1517,9 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 				    FUSB_ST_SRC_SEND_SOFTRST);
 			}
 		} else if (evt & FUSB_EVT_TIMER_STATE) {
+			device_printf(sc->dev,
+			    "send_caps: timeout, no REQUEST (hardrst_count=%d)\n",
+			    sc->hardrst_count);
 			if (sc->hardrst_count <= 0)
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_SRC_SEND_HARDRST);
@@ -1300,6 +1587,10 @@ fusb302_state_src_ready_locked(struct fusb302_softc *sc, uint32_t evt)
 
 	vdm_active = (sc->notify_data_role &&
 	    sc->vdm_state < VDM_READY_ST);
+
+	if (evt & FUSB_EVT_CONTINUE)
+		device_printf(sc->dev, "src_ready: vdm_active=%d vdm_state=%d\n",
+		    vdm_active, sc->vdm_state);
 
 	if (evt & FUSB_EVT_RX) {
 		if (PD_IS_DATA(sc->rec_head, PD_DMT_VDM)) {
@@ -1461,6 +1752,348 @@ fusb302_state_src_send_softrst_locked(struct fusb302_softc *sc, uint32_t evt)
 	}
 }
 
+/* -----------------------------------------------------------------------
+ * PD state functions (UFP / sink path)
+ * ----------------------------------------------------------------------- */
+static void
+fusb302_state_attached_sink_locked(struct fusb302_softc *sc, uint32_t evt)
+{
+	int polarity;
+
+	switch (sc->sub_state) {
+	case 0:
+		switch ((sc->status1a & FUSB_ST1A_TOGSS_MASK) >>
+		    FUSB_ST1A_TOGSS_SHIFT) {
+		case FUSB_TOGSS_SNK_CC2:
+			polarity = 1;
+			break;
+		default:
+			polarity = 0;
+			break;
+		}
+
+		sc->notify_is_cc = true;
+		sc->notify_power_role = 0;	/* sink */
+		sc->notify_data_role = 0;	/* UFP */
+		sc->hardrst_count = 0;
+		sc->attached_as_sink = true;
+
+		fusb302_set_polarity_locked(sc, polarity);
+		device_printf(sc->dev, "attached as UFP on CC%d, "
+		    "waiting %dms for VBUS\n",
+		    polarity + 1, T_ATTACH_WAIT_MS);
+		fusb302_start_state_timer(sc, T_ATTACH_WAIT_MS);
+		sc->sub_state++;
+		break;
+
+	default:
+		if (evt & FUSB_EVT_TIMER_STATE)
+			fusb302_set_state_locked(sc, FUSB_ST_SNK_STARTUP);
+		break;
+	}
+}
+
+static void
+fusb302_state_snk_startup_locked(struct fusb302_softc *sc,
+    uint32_t evt __unused)
+{
+	sc->notify_is_pd = false;
+	fusb302_reset_pd_params_locked(sc);
+	memset(sc->partner_cap, 0, sizeof(sc->partner_cap));
+
+	fusb302_pd_reset_locked(sc);
+	fusb302_set_msg_header_locked(sc);
+	fusb302_set_polarity_locked(sc, sc->cc_polarity);
+	fusb302_enable_rx_locked(sc, true);
+
+	device_printf(sc->dev,
+	    "snk_startup: PD init done, listening for src caps\n");
+	fusb302_set_state_locked(sc, FUSB_ST_SNK_DISCOVERY);
+}
+
+static void
+fusb302_state_snk_discovery_locked(struct fusb302_softc *sc, uint32_t evt)
+{
+	int n, i;
+
+	if (sc->sub_state == 0) {
+		fusb302_start_state_timer(sc, T_TYPEC_SINK_WAIT_CAP);
+		sc->sub_state = 1;
+	}
+	if (evt & FUSB_EVT_RX) {
+		if (PD_IS_DATA(sc->rec_head, PD_DMT_SRCCAP)) {
+			n = PD_HDR_CNT(sc->rec_head);
+			if (n > 7)
+				n = 7;
+			for (i = 0; i < n; i++)
+				sc->partner_cap[i] = sc->rec_load[i];
+			for (; i < 7; i++)
+				sc->partner_cap[i] = 0;
+			sc->is_pd_support = true;
+			device_printf(sc->dev,
+			    "snk: src_caps n=%d PDO[0]=0x%08x\n",
+			    n, sc->partner_cap[0]);
+			fusb302_set_state_locked(sc,
+			    FUSB_ST_SNK_EVALUATE_CAPS);
+			return;
+		}
+	}
+	if (evt & FUSB_EVT_TIMER_STATE) {
+		if (sc->skip_pd) {
+			device_printf(sc->dev,
+			    "snk: skip_pd=1, no PD; exporting 4-lane DP "
+			    "defaults on CC%d\n", sc->cc_polarity + 1);
+			sc->notify_is_enter_mode = true;
+			sc->notify_pin_def = DP_PIN_E;
+			sc->notify_dp_status = (1u << 7);
+			fusb302_notify_dp_locked(sc);
+			fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
+		} else if (sc->hardrst_count <= N_SNK_HARDRESET_RETRY) {
+			device_printf(sc->dev,
+			    "snk: no src caps within %dms; sending hard "
+			    "reset (try %d/%d) to wake partner\n",
+			    T_TYPEC_SINK_WAIT_CAP, sc->hardrst_count + 1,
+			    N_SNK_HARDRESET_RETRY + 1);
+			fusb302_set_state_locked(sc,
+			    FUSB_ST_SNK_SEND_HARDRST);
+		} else {
+			device_printf(sc->dev,
+			    "snk: partner not PD-capable after %d retries; "
+			    "exporting 4-lane DP defaults on CC%d, going "
+			    "DISABLED\n",
+			    N_SNK_HARDRESET_RETRY + 1, sc->cc_polarity + 1);
+			/*
+			 * Hand cdn_dp a best-guess Alt Mode state so it can
+			 * still try to bring DP up without a PD contract.
+			 * Use a true DP-only pin assignment so the exported
+			 * usb_ss state is internally consistent with the
+			 * intended 4-lane fallback.
+			 */
+			sc->notify_is_enter_mode = true;
+			sc->notify_pin_def = DP_PIN_E;
+			sc->notify_dp_status = (1u << 7); /* HPD high */
+			fusb302_notify_dp_locked(sc);
+			fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
+		}
+	}
+}
+
+static void
+fusb302_state_snk_send_hardrst_locked(struct fusb302_softc *sc, uint32_t evt)
+{
+	int error;
+
+	switch (sc->sub_state) {
+	case 0:
+		/*
+		 * Increment counter before TX so HARDSENT interrupt routing
+		 * (which jumps straight to SNK_TRANSITION_DEFAULT) doesn't
+		 * skip our retry accounting.
+		 */
+		sc->hardrst_count++;
+		error = fusb302_update_reg(sc, FUSB_REG_CONTROL3,
+		    FUSB_CTL3_SEND_HARDRST, FUSB_CTL3_SEND_HARDRST);
+		if (error != 0)
+			device_printf(sc->dev,
+			    "snk hard reset send failed: %d\n", error);
+		sc->sub_state++;
+		fusb302_start_state_timer(sc, 30);
+		break;
+	default:
+		if (evt & FUSB_EVT_TIMER_STATE)
+			fusb302_set_state_locked(sc,
+			    FUSB_ST_SNK_TRANSITION_DEFAULT);
+		break;
+	}
+}
+
+static void
+fusb302_state_snk_evaluate_caps_locked(struct fusb302_softc *sc,
+    uint32_t evt __unused)
+{
+	uint32_t pdo;
+	int i, n, pos;
+
+	sc->hardrst_count = 0;
+	pos = 0;
+
+	/*
+	 * Walk the partner's source caps and pick the highest-numbered
+	 * Fixed PDO at <=5V (50mV units => 100). Per spec, position 1 is
+	 * always Vsafe5V Fixed, so we always have a valid choice.
+	 */
+	n = 0;
+	for (i = 0; i < 7; i++) {
+		if (sc->partner_cap[i] == 0)
+			break;
+		n++;
+	}
+	for (i = 0; i < n; i++) {
+		pdo = sc->partner_cap[i];
+		if (((pdo >> 30) & 3) == 0) {
+			uint32_t mv50 = (pdo >> 10) & 0x3ff;
+			if (mv50 <= 100)
+				pos = i + 1;
+		}
+	}
+	if (pos == 0)
+		pos = 1;
+	sc->pos_power = pos;
+	device_printf(sc->dev, "snk: selecting PDO position %d (PDO=0x%08x)\n",
+	    pos, sc->partner_cap[pos - 1]);
+	fusb302_set_state_locked(sc, FUSB_ST_SNK_SELECT_CAP);
+}
+
+static void
+fusb302_state_snk_select_cap_locked(struct fusb302_softc *sc, uint32_t evt)
+{
+	int tmp;
+
+	switch (sc->sub_state) {
+	case 0:
+		fusb302_set_mesg_request_locked(sc);
+		device_printf(sc->dev, "snk: send REQUEST RDO=0x%08x\n",
+		    sc->send_load[0]);
+		sc->tx_state = FUSB_TX_IDLE;
+		sc->sub_state++;
+		/* FALLTHROUGH */
+	case 1:
+		tmp = fusb302_policy_send_data_locked(sc);
+		if (tmp == FUSB_TX_SUCCESS) {
+			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
+			sc->sub_state++;
+		} else if (tmp == FUSB_TX_FAILED) {
+			device_printf(sc->dev, "snk: REQUEST tx failed\n");
+			fusb302_set_state_locked(sc, FUSB_ST_SNK_DISCOVERY);
+		}
+		break;
+	default:
+		if (evt & FUSB_EVT_RX) {
+			if (PD_IS_CTRL(sc->rec_head, PD_CMT_ACCEPT)) {
+				device_printf(sc->dev, "snk: REQUEST accepted\n");
+				fusb302_start_state_timer(sc, T_PS_TRANSITION);
+				fusb302_set_state_locked(sc,
+				    FUSB_ST_SNK_TRANSITION_SINK);
+			} else if (PD_IS_CTRL(sc->rec_head, PD_CMT_REJECT) ||
+			    PD_IS_CTRL(sc->rec_head, PD_CMT_WAIT)) {
+				device_printf(sc->dev,
+				    "snk: REQUEST rejected/wait, staying in 5V default\n");
+				fusb302_set_state_locked(sc, FUSB_ST_SNK_READY);
+			}
+		} else if (evt & FUSB_EVT_TIMER_STATE) {
+			device_printf(sc->dev, "snk: SenderResponse timeout\n");
+			fusb302_set_state_locked(sc, FUSB_ST_SNK_DISCOVERY);
+		}
+		break;
+	}
+}
+
+static void
+fusb302_state_snk_transition_sink_locked(struct fusb302_softc *sc,
+    uint32_t evt)
+{
+	if (sc->sub_state == 0) {
+		/* Timer was started by snk_select_cap on Accept */
+		sc->sub_state = 1;
+	}
+	if (evt & FUSB_EVT_RX) {
+		if (PD_IS_CTRL(sc->rec_head, PD_CMT_PS_RDY)) {
+			sc->notify_is_pd = true;
+			device_printf(sc->dev,
+			    "PD connected as UFP (5V contract)\n");
+			fusb302_set_state_locked(sc, FUSB_ST_SNK_READY);
+			return;
+		}
+		if (PD_IS_DATA(sc->rec_head, PD_DMT_SRCCAP)) {
+			fusb302_set_state_locked(sc,
+			    FUSB_ST_SNK_EVALUATE_CAPS);
+			return;
+		}
+	}
+	if (evt & FUSB_EVT_TIMER_STATE) {
+		device_printf(sc->dev, "snk: PS_RDY timeout\n");
+		fusb302_set_state_locked(sc, FUSB_ST_SNK_TRANSITION_DEFAULT);
+	}
+}
+
+static void
+fusb302_state_snk_ready_locked(struct fusb302_softc *sc, uint32_t evt)
+{
+	/*
+	 * Minimal ready state. VDM/Alt-Mode dispatch added by the next task.
+	 * Re-evaluate caps if a new src_caps arrives.
+	 */
+	if (evt & FUSB_EVT_RX) {
+		if (PD_IS_DATA(sc->rec_head, PD_DMT_SRCCAP)) {
+			fusb302_set_state_locked(sc,
+			    FUSB_ST_SNK_EVALUATE_CAPS);
+			return;
+		}
+		device_printf(sc->dev,
+		    "snk_ready: RX head=0x%04x type=%d cnt=%d\n",
+		    sc->rec_head, PD_HDR_TYPE(sc->rec_head),
+		    PD_HDR_CNT(sc->rec_head));
+	}
+}
+
+static void
+fusb302_state_snk_transition_default_locked(struct fusb302_softc *sc,
+    uint32_t evt)
+{
+	switch (sc->sub_state) {
+	case 0:
+		sc->notify_is_pd = false;
+		/*
+		 * Electrical detach: drop all CC pulls/MEAS for ~200ms so the
+		 * partner sees a real detach edge (tCCDisconnect=25ms min;
+		 * many real partners need 100-150ms to re-arm their PD stack).
+		 * This is the in-driver equivalent of unplugging the cable.
+		 */
+		(void)fusb302_update_reg(sc, FUSB_REG_SWITCHES0,
+		    FUSB_SW0_PDWN1 | FUSB_SW0_PDWN2 |
+		    FUSB_SW0_PU_EN1 | FUSB_SW0_PU_EN2 |
+		    FUSB_SW0_MEAS_CC1 | FUSB_SW0_MEAS_CC2 |
+		    FUSB_SW0_VCONN_CC1 | FUSB_SW0_VCONN_CC2, 0);
+		fusb302_start_state_timer(sc, 200);
+		sc->sub_state++;
+		break;
+	case 1:
+		if (evt & FUSB_EVT_TIMER_STATE) {
+			/* Reapply Rd on active CC; finish T_SRC_RECOVER. */
+			sc->attached_as_sink = true;
+			fusb302_set_polarity_locked(sc, sc->cc_polarity);
+			fusb302_start_state_timer(sc, 630);
+			sc->sub_state++;
+		}
+		break;
+	default:
+		if (evt & FUSB_EVT_TIMER_STATE)
+			fusb302_set_state_locked(sc, FUSB_ST_SNK_STARTUP);
+		break;
+	}
+}
+
+/* Translate role_pref into CONTROL2 mode/toggle bits. */
+static uint8_t
+fusb302_toggle_ctl2_locked(struct fusb302_softc *sc)
+{
+	uint8_t v = FUSB_CTL2_TOGGLE;
+
+	switch (sc->role_pref) {
+	case FUSB_ROLE_SRC:
+		v |= FUSB_CTL2_MODE_DFP | FUSB_CTL2_TOG_RD_ONLY;
+		break;
+	case FUSB_ROLE_SNK:
+		v |= FUSB_CTL2_MODE_UFP;
+		break;
+	case FUSB_ROLE_DRP:
+	default:
+		v |= FUSB_CTL2_MODE_DRP;
+		break;
+	}
+	return (v);
+}
+
 /* Detach: re-init CC toggle and reset everything */
 static void
 fusb302_set_state_unattached_locked(struct fusb302_softc *sc)
@@ -1468,26 +2101,39 @@ fusb302_set_state_unattached_locked(struct fusb302_softc *sc)
 	device_printf(sc->dev, "detached, restarting CC detection\n");
 
 	callout_stop(&sc->timer_state);
-	callout_stop(&sc->timer_mux);
 
 	sc->notify_is_cc = false;
 	sc->notify_is_pd = false;
 	sc->notify_is_enter_mode = false;
 	sc->is_pd_support = false;
+	sc->attached_as_sink = false;
 	memset(&sc->dp_altmode, 0, sizeof(sc->dp_altmode));
 	memset(sc->partner_cap, 0, sizeof(sc->partner_cap));
+
+	/* Disable our VBUS regulator so the partner-sources-VBUS detection
+	 * in ATTACHED_SRC is clean on next attach. */
+	if (sc->vbus_supply != NULL && sc->vbus_enabled) {
+		(void)regulator_disable(sc->vbus_supply);
+		sc->vbus_enabled = false;
+	}
 
 	(void)fusb302_write_reg(sc, FUSB_REG_RESET, FUSB_RESET_SW_RES);
 	DELAY(1000);
 	(void)fusb302_write_reg(sc, FUSB_REG_POWER, FUSB_POWER_ALL);
-	(void)fusb302_write_reg(sc, FUSB_REG_CONTROL0, FUSB_CTL0_HOST_CUR_DEF);
+	/* Keep INT_N masked until interrupt masks are written (SW_RES resets them). */
+	(void)fusb302_write_reg(sc, FUSB_REG_CONTROL0,
+	    FUSB_CTL0_HOST_CUR_DEF | FUSB_CTL0_INT_MASK);
 	(void)fusb302_write_reg(sc, FUSB_REG_MASK1, FUSB_MASK1_PD);
 	(void)fusb302_write_reg(sc, FUSB_REG_MASKA, FUSB_MASKA_PD);
 	(void)fusb302_write_reg(sc, FUSB_REG_MASKB, FUSB_MASKB_PD);
+	/* Clear any stale flags then re-enable INT_N output. */
+	{ uint8_t _t; fusb302_read_reg(sc, FUSB_REG_INTERRUPT, &_t);
+	  fusb302_read_reg(sc, FUSB_REG_INTERRUPTA, &_t);
+	  fusb302_read_reg(sc, FUSB_REG_INTERRUPTB, &_t); }
+	(void)fusb302_update_reg(sc, FUSB_REG_CONTROL0, FUSB_CTL0_INT_MASK, 0);
 
-	/* Re-enable toggle */
 	(void)fusb302_write_reg(sc, FUSB_REG_CONTROL2,
-	    FUSB_CTL2_TOG_RD_ONLY | FUSB_CTL2_MODE_DFP | FUSB_CTL2_TOGGLE);
+	    fusb302_toggle_ctl2_locked(sc));
 
 	sc->conn_state = FUSB_ST_UNATTACHED;
 	sc->work_continue = 0;
@@ -1548,14 +2194,24 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp)
 		fusb302_pd_reset_locked(sc);
 		sc->msg_id = 0;
 		sc->vdm_state = VDM_DISC_ID_ST;
-		fusb302_set_state_locked(sc, FUSB_ST_SRC_TRANSITION_DEFAULT);
+		/*
+		 * Partner-initiated reset means partner just woke up its PD
+		 * stack — give the discovery loop a fresh budget of retries
+		 * even if we previously gave up.
+		 */
+		sc->hardrst_count = 0;
+		fusb302_set_state_locked(sc, sc->attached_as_sink ?
+		    FUSB_ST_SNK_TRANSITION_DEFAULT :
+		    FUSB_ST_SRC_TRANSITION_DEFAULT);
 		*evtp |= FUSB_EVT_REC_RESET;
 	}
 
 	if (intra & FUSB_INTRA_HARDSENT) {
 		/* Hard reset transmitted; transition to default state */
 		fusb302_pd_reset_locked(sc);
-		fusb302_set_state_locked(sc, FUSB_ST_SRC_TRANSITION_DEFAULT);
+		fusb302_set_state_locked(sc, sc->attached_as_sink ?
+		    FUSB_ST_SNK_TRANSITION_DEFAULT :
+		    FUSB_ST_SRC_TRANSITION_DEFAULT);
 	}
 }
 
@@ -1566,19 +2222,57 @@ static void
 fusb302_run_state_locked(struct fusb302_softc *sc, uint32_t evt)
 {
 	switch (sc->conn_state) {
-	case FUSB_ST_DISABLED:
+	case FUSB_ST_DISABLED: {
+		uint8_t _t;
+		/*
+		 * Silence INT_N completely: mask all chip-side sources,
+		 * drain any stale flags, then disable INT_N output. CC
+		 * pulls are kept intact so the partner continues to see
+		 * us as electrically attached — required for the no-PD
+		 * DP-Alt-Mode bypass path where cdn_dp tries AUX via SBU.
+		 *
+		 * Detach detection in DISABLED is currently a known gap:
+		 * VBUSOK on this RockPro64 stays asserted regardless of
+		 * cable state (board-level signal — VBUS sense appears
+		 * to be tied to a 5V rail downstream of the connector),
+		 * so we can't trust it as an unplug edge. A polling
+		 * callout would be the right fix; deferred until the
+		 * real DFP+SRC PD path lands.
+		 */
+		(void)fusb302_write_reg(sc, FUSB_REG_MASK1, 0xff);
+		(void)fusb302_write_reg(sc, FUSB_REG_MASKA, 0xff);
+		(void)fusb302_write_reg(sc, FUSB_REG_MASKB, 0xff);
+		(void)fusb302_read_reg(sc, FUSB_REG_INTERRUPT, &_t);
+		(void)fusb302_read_reg(sc, FUSB_REG_INTERRUPTA, &_t);
+		(void)fusb302_read_reg(sc, FUSB_REG_INTERRUPTB, &_t);
+		(void)fusb302_update_reg(sc, FUSB_REG_CONTROL0,
+		    FUSB_CTL0_INT_MASK, FUSB_CTL0_INT_MASK);
 		break;
+	}
 	case FUSB_ST_ERROR_RECOVERY:
 		fusb302_set_state_unattached_locked(sc);
 		break;
 	case FUSB_ST_UNATTACHED:
 		/* Waiting for TOGDONE (EVENT_CC) */
 		if (evt & FUSB_EVT_CC) {
-			/* TOGSS: 1=src-cc1, 2=src-cc2 */
 			uint8_t ts = (sc->status1a & FUSB_ST1A_TOGSS_MASK)
 			    >> FUSB_ST1A_TOGSS_SHIFT;
-			if (ts == 1 || ts == 2)
-				fusb302_set_state_locked(sc, FUSB_ST_ATTACHED_SRC);
+			switch (ts) {
+			case FUSB_TOGSS_SRC_CC1:
+			case FUSB_TOGSS_SRC_CC2:
+				sc->attached_as_sink = false;
+				fusb302_set_state_locked(sc,
+				    FUSB_ST_ATTACHED_SRC);
+				break;
+			case FUSB_TOGSS_SNK_CC1:
+			case FUSB_TOGSS_SNK_CC2:
+				sc->attached_as_sink = true;
+				fusb302_set_state_locked(sc,
+				    FUSB_ST_ATTACHED_SNK);
+				break;
+			default:
+				break;
+			}
 		}
 		break;
 	case FUSB_ST_ATTACHED_SRC:
@@ -1624,6 +2318,33 @@ fusb302_run_state_locked(struct fusb302_softc *sc, uint32_t evt)
 		/* simple retry: just go back to send caps */
 		fusb302_set_state_locked(sc, FUSB_ST_SRC_SEND_CAPS);
 		break;
+	case FUSB_ST_ATTACHED_SNK:
+		fusb302_state_attached_sink_locked(sc, evt);
+		break;
+	case FUSB_ST_SNK_STARTUP:
+		fusb302_state_snk_startup_locked(sc, evt);
+		break;
+	case FUSB_ST_SNK_DISCOVERY:
+		fusb302_state_snk_discovery_locked(sc, evt);
+		break;
+	case FUSB_ST_SNK_EVALUATE_CAPS:
+		fusb302_state_snk_evaluate_caps_locked(sc, evt);
+		break;
+	case FUSB_ST_SNK_SELECT_CAP:
+		fusb302_state_snk_select_cap_locked(sc, evt);
+		break;
+	case FUSB_ST_SNK_TRANSITION_SINK:
+		fusb302_state_snk_transition_sink_locked(sc, evt);
+		break;
+	case FUSB_ST_SNK_READY:
+		fusb302_state_snk_ready_locked(sc, evt);
+		break;
+	case FUSB_ST_SNK_TRANSITION_DEFAULT:
+		fusb302_state_snk_transition_default_locked(sc, evt);
+		break;
+	case FUSB_ST_SNK_SEND_HARDRST:
+		fusb302_state_snk_send_hardrst_locked(sc, evt);
+		break;
 	default:
 		break;
 	}
@@ -1642,15 +2363,6 @@ fusb302_timer_state_cb(void *arg)
 	taskqueue_enqueue(taskqueue_thread, &sc->irq_task);
 }
 
-static void
-fusb302_timer_mux_cb(void *arg)
-{
-	struct fusb302_softc *sc;
-
-	sc = arg;
-	atomic_set_int(&sc->pending_events, FUSB_EVT_TIMER_MUX);
-	taskqueue_enqueue(taskqueue_thread, &sc->irq_task);
-}
 
 /* -----------------------------------------------------------------------
  * IRQ task (runs in taskqueue_thread)
@@ -1681,11 +2393,18 @@ fusb302_irq_task(void *context, int pending __unused)
 		return;
 	}
 
-	/* Detach detection when connected as source: CC open → detach */
+	/* Detach detection: source watches COMP, sink watches VBUSOK */
 	if (sc->notify_is_cc && (evt & FUSB_EVT_CC)) {
 		uint8_t st0;
 		fusb302_read_reg(sc, FUSB_REG_STATUS0, &st0);
-		if (st0 & 0x20 /* COMP bit */) {
+		if (sc->attached_as_sink) {
+			if ((st0 & FUSB_ST0_VBUSOK) == 0) {
+				device_printf(sc->dev,
+				    "VBUS lost, detaching (sink)\n");
+				fusb302_set_state_unattached_locked(sc);
+				goto out;
+			}
+		} else if (st0 & 0x20 /* COMP bit */) {
 			device_printf(sc->dev, "CC open, detaching\n");
 			fusb302_set_state_unattached_locked(sc);
 			goto out;
@@ -1696,7 +2415,10 @@ fusb302_irq_task(void *context, int pending __unused)
 	if (evt & FUSB_EVT_RX) {
 		if (fusb302_fifo_read_locked(sc) == 0) {
 			if (PD_IS_CTRL(sc->rec_head, PD_CMT_SOFTRESET))
-				fusb302_set_state_locked(sc, FUSB_ST_SRC_SOFTRST);
+				fusb302_set_state_locked(sc,
+				    sc->attached_as_sink ?
+				    FUSB_ST_SNK_STARTUP :
+				    FUSB_ST_SRC_SOFTRST);
 		}
 	}
 
@@ -1713,22 +2435,30 @@ fusb302_irq_task(void *context, int pending __unused)
 
 out:
 	mtx_unlock(&sc->mtx);
+
+	/* Re-enable the interrupt now that IRQ flags are cleared. */
+	if (sc->initialized && sc->irq_res != NULL)
+		bus_resume_intr(sc->dev, sc->irq_res);
 }
 
-static void
+static int
 fusb302_intr(void *context)
 {
 	struct fusb302_softc *sc;
 
 	sc = context;
+	/* Run as a filter (no ithread): mask at GIC to stop the level-triggered
+	 * storm, then hand off to the taskqueue for register I/O. */
+	bus_suspend_intr(sc->dev, sc->irq_res);
 	taskqueue_enqueue(taskqueue_thread, &sc->irq_task);
+	return (FILTER_HANDLED);
 }
 
 /* -----------------------------------------------------------------------
  * Initialization
  * ----------------------------------------------------------------------- */
 static int
-fusb302_init_locked(struct fusb302_softc *sc)
+fusb302_init(struct fusb302_softc *sc)
 {
 	uint8_t intr, intra, intrb;
 	int error;
@@ -1738,18 +2468,19 @@ fusb302_init_locked(struct fusb302_softc *sc)
 		return (error);
 	DELAY(1000);
 
-	if (sc->vbus_supply != NULL && !sc->vbus_enabled) {
-		error = regulator_enable(sc->vbus_supply);
-		if (error != 0)
-			return (error);
-		sc->vbus_enabled = true;
-	}
+	/*
+	 * Do NOT enable our VBUS regulator here. We don't yet know whether the
+	 * partner is a Source (will provide VBUS to us) or a Sink (we'd need
+	 * to provide VBUS). Enable the regulator only after ATTACHED_SRC is
+	 * confirmed below.
+	 */
 
 	error = fusb302_write_reg(sc, FUSB_REG_POWER, FUSB_POWER_ALL);
 	if (error != 0)
 		return (error);
+	/* Keep INT_N masked (INT_MASK=1) until interrupt masks are written. */
 	error = fusb302_write_reg(sc, FUSB_REG_CONTROL0,
-	    FUSB_CTL0_HOST_CUR_DEF);
+	    FUSB_CTL0_HOST_CUR_DEF | FUSB_CTL0_INT_MASK);
 	if (error != 0)
 		return (error);
 
@@ -1776,15 +2507,17 @@ fusb302_init_locked(struct fusb302_softc *sc)
 	fusb302_read_reg(sc, FUSB_REG_INTERRUPTA, &intra);
 	fusb302_read_reg(sc, FUSB_REG_INTERRUPTB, &intrb);
 
-	/* Enable the FUSB302 interrupt output pin (clear INT_MASK bit) */
-	error = fusb302_update_reg(sc, FUSB_REG_CONTROL0,
-	    FUSB_CTL0_INT_MASK, 0);
-	if (error != 0)
-		return (error);
+	/*
+	 * Leave INT_N output masked (CONTROL0.INT_MASK=1, set above) until
+	 * the parent has called bus_setup_intr in attach. Enabling INT_N
+	 * here would let the chip pull the GPIO low while no handler is
+	 * registered, producing the "gpio1: Interrupt pin=2 unhandled"
+	 * storm. fusb302_attach clears INT_MASK as the final attach step.
+	 */
 
-	/* Start CC toggle in DFP-only mode */
+	/* Start CC toggle per role preference (DRP default for any-monitor) */
 	error = fusb302_write_reg(sc, FUSB_REG_CONTROL2,
-	    FUSB_CTL2_TOG_RD_ONLY | FUSB_CTL2_MODE_DFP | FUSB_CTL2_TOGGLE);
+	    fusb302_toggle_ctl2_locked(sc));
 	if (error != 0)
 		return (error);
 	DELAY(1000);
@@ -1806,6 +2539,140 @@ fusb302_init_locked(struct fusb302_softc *sc)
 	    "st0=0x%02x st1=0x%02x st0a=0x%02x st1a=0x%02x\n",
 	    intr, intra, intrb,
 	    sc->status0, sc->status1, sc->status0a, sc->status1a);
+
+	/*
+	 * Hot-plug bootstrap for late-loaded modules.
+	 *
+	 * If fusb302, tcphy, and cdn-dp all probe during boot while the cable
+	 * is already present, the normal TOGDONE/PD/VDM sequence runs from
+	 * the start.  With kldload iteration that TOGDONE edge may have
+	 * happened while INT_N was still masked, leaving us parked in
+	 * UNATTACHED forever even though a partner is already connected.
+	 *
+	 * Direct CC measurement here:
+	 *  - sink-only: measure Rd on both CC pins to find partner Rp
+	 *  - source/DRP: measure Rp on both CC pins to find partner Rd
+	 *
+	 * If one side is already present, synthesize ATTACHED_* and let the
+	 * existing PD/VDM state machine continue from there.
+	 */
+	if (sc->role_pref == FUSB_ROLE_SNK &&
+	    (sc->status0 & FUSB_ST0_VBUSOK)) {
+		uint8_t st, cc1_max = 0, cc2_max = 0;
+		int polarity = -1, j;
+
+		(void)fusb302_update_reg(sc, FUSB_REG_CONTROL2,
+		    FUSB_CTL2_TOGGLE, 0);
+		DELAY(5000);
+
+		/* Sample CC1 over 50ms to ride past Samsung's DRP toggle */
+		(void)fusb302_write_reg(sc, FUSB_REG_SWITCHES0,
+		    FUSB_SW0_PDWN1 | FUSB_SW0_PDWN2 | FUSB_SW0_MEAS_CC1);
+		DELAY(2000);
+		for (j = 0; j < 50; j++) {
+			DELAY(1000);
+			if (fusb302_read_reg(sc, FUSB_REG_STATUS0,
+			    &st) == 0) {
+				uint8_t bc = st & FUSB_ST0_BC_LVL_MASK;
+				if (bc > cc1_max)
+					cc1_max = bc;
+			}
+		}
+
+		/* Sample CC2 over 50ms */
+		(void)fusb302_write_reg(sc, FUSB_REG_SWITCHES0,
+		    FUSB_SW0_PDWN1 | FUSB_SW0_PDWN2 | FUSB_SW0_MEAS_CC2);
+		DELAY(2000);
+		for (j = 0; j < 50; j++) {
+			DELAY(1000);
+			if (fusb302_read_reg(sc, FUSB_REG_STATUS0,
+			    &st) == 0) {
+				uint8_t bc = st & FUSB_ST0_BC_LVL_MASK;
+				if (bc > cc2_max)
+					cc2_max = bc;
+			}
+		}
+
+		device_printf(sc->dev,
+		    "manual probe: cc1_max_bc=%d cc2_max_bc=%d\n",
+		    cc1_max, cc2_max);
+
+		if (cc1_max > cc2_max && cc1_max != 0)
+			polarity = 0;
+		else if (cc2_max != 0)
+			polarity = 1;
+
+		if (polarity >= 0) {
+			device_printf(sc->dev,
+			    "manual probe: VBUSOK + Rp on CC%d, "
+			    "attaching as SNK\n", polarity + 1);
+			sc->cc_polarity = polarity;
+			sc->attached_as_sink = true;
+			sc->status1a = (uint8_t)(
+			    (polarity == 0 ? FUSB_TOGSS_SNK_CC1 :
+			    FUSB_TOGSS_SNK_CC2) <<
+			    FUSB_ST1A_TOGSS_SHIFT);
+			fusb302_set_state_locked(sc,
+			    FUSB_ST_ATTACHED_SNK);
+		} else {
+			/* No Rp on either CC — restore TOGGLE. */
+			(void)fusb302_update_reg(sc, FUSB_REG_CONTROL2,
+			    FUSB_CTL2_TOGGLE, FUSB_CTL2_TOGGLE);
+		}
+	} else if (sc->role_pref == FUSB_ROLE_SRC) {
+		int cc1_rd, cc2_rd, polarity;
+
+		cc1_rd = 0;
+		cc2_rd = 0;
+		polarity = -1;
+
+		(void)fusb302_update_reg(sc, FUSB_REG_CONTROL2,
+		    FUSB_CTL2_TOGGLE, 0);
+		DELAY(5000);
+
+		cc1_rd = fusb302_probe_cc_pull_up_locked(sc, 0);
+		cc2_rd = fusb302_probe_cc_pull_up_locked(sc, 1);
+
+		device_printf(sc->dev,
+		    "manual source probe: cc1_rd=%d cc2_rd=%d\n",
+		    cc1_rd, cc2_rd);
+
+		if (cc1_rd != 0 && cc2_rd == 0)
+			polarity = 0;
+		else if (cc2_rd != 0 && cc1_rd == 0)
+			polarity = 1;
+		else if (cc1_rd != 0 && cc2_rd != 0 &&
+		    fusb302_is_rockpro64(sc->dev)) {
+			/*
+			 * Late-loaded RockPro64 source probing can report Rd
+			 * on both CC pins even though only one orientation is
+			 * real.  Prefer CC1 as the bootstrap polarity so the
+			 * existing PD/VDM machine can start; if that proves
+			 * wrong, later retries can still revisit orientation.
+			 */
+			device_printf(sc->dev,
+			    "manual source probe: ambiguous dual-Rd, "
+			    "bootstrapping CC1 on RockPro64\n");
+			polarity = 0;
+		}
+
+		if (polarity >= 0) {
+			device_printf(sc->dev,
+			    "manual source probe: Rd on CC%d, "
+			    "attaching as SRC/DFP\n", polarity + 1);
+			sc->cc_polarity = polarity;
+			sc->attached_as_sink = false;
+			sc->status1a = (uint8_t)(
+			    (polarity == 0 ? FUSB_TOGSS_SRC_CC1 :
+			    FUSB_TOGSS_SRC_CC2) <<
+			    FUSB_ST1A_TOGSS_SHIFT);
+			fusb302_set_state_locked(sc, FUSB_ST_ATTACHED_SRC);
+		} else {
+			(void)fusb302_update_reg(sc, FUSB_REG_CONTROL2,
+			    FUSB_CTL2_TOGGLE, FUSB_CTL2_TOGGLE);
+		}
+	}
+
 	return (0);
 }
 
@@ -1821,7 +2688,17 @@ fusb302_get_typec_status(device_t dev, struct fusb302_typec_status *status)
 		return (EINVAL);
 
 	sc = device_get_softc(dev);
-	mtx_lock(&sc->mtx);
+	/*
+	 * Lock-free snapshot. Acquiring sc->mtx here was a panic-source:
+	 * the irq_task holds sc->mtx across I2C reads (which sleep), so any
+	 * caller that takes the mutex while irq_task is mid-I2C trips
+	 * propagate_priority's "sleeping thread holds non-sleepable lock"
+	 * check. Caller (rk_typec_phy_enable / cdn_dp) is happy with a
+	 * slightly stale snapshot — the fields we read here are word-sized
+	 * scalars updated atomically by the irq task, and a momentary
+	 * inconsistency between them is harmless for orientation/flip
+	 * derivation.
+	 */
 	status->attached = sc->notify_is_cc;
 	status->vbusok = (sc->status0 & FUSB_ST0_VBUSOK) != 0;
 	status->has_irq = (sc->irq_res != NULL);
@@ -1832,7 +2709,6 @@ fusb302_get_typec_status(device_t dev, struct fusb302_typec_status *status)
 	    FUSB302_TYPEC_ORIENT_CC1 : FUSB302_TYPEC_ORIENT_CC2;
 	status->role = sc->notify_is_cc ?
 	    FUSB302_TYPEC_ROLE_SOURCE : FUSB302_TYPEC_ROLE_NONE;
-	mtx_unlock(&sc->mtx);
 
 	return (sc->state_valid ? 0 : ENXIO);
 }
@@ -1851,9 +2727,15 @@ fusb302_get_dp_altmode_state(device_t dev,
 		return (EINVAL);
 
 	sc = device_get_softc(dev);
-	mtx_lock(&sc->mtx);
+	/*
+	 * Lock-free snapshot, same reason as fusb302_get_typec_status:
+	 * irq_task can be mid-I2C with sc->mtx held, and any caller (cdn_dp)
+	 * that blocks on the mutex while we're sleeping in I2C panics via
+	 * propagate_priority. The dp_altmode struct is small and a torn
+	 * read between fields is harmless — caller decides on a single
+	 * field at a time and re-queries periodically.
+	 */
 	*status = sc->dp_altmode;
-	mtx_unlock(&sc->mtx);
 
 	return (status->valid ? 0 : ENXIO);
 }
@@ -1911,6 +2793,21 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "switches1",
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
 	    FUSB_REG_SWITCHES1, fusb302_sysctl_reg, "I", "SWITCHES1");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "role_pref",
+	    CTLFLAG_RW, &sc->role_pref, 0,
+	    "Toggle role pref: 0=DRP 1=src-only 2=snk-only (effective on next detach)");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "skip_pd",
+	    CTLFLAG_RW, &sc->skip_pd, 0,
+	    "1=skip PD negotiation as sink, jump straight to passive DP defaults");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "conn_state",
+	    CTLFLAG_RD, (int *)&sc->conn_state, 0,
+	    "Current connection state (enum fusb302_conn_state)");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "attached_as_sink",
+	    CTLFLAG_RD, (int *)&sc->attached_as_sink, 0,
+	    "1 if currently attached as UFP/sink, 0 otherwise");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "pos_power",
+	    CTLFLAG_RD, &sc->pos_power, 0,
+	    "Selected partner-source PDO position (sink role)");
 }
 
 /* -----------------------------------------------------------------------
@@ -1980,7 +2877,6 @@ fusb302_attach(device_t dev)
 	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_DEF);
 	TASK_INIT(&sc->irq_task, 0, fusb302_irq_task, sc);
 	callout_init(&sc->timer_state, 1 /* MPSAFE */);
-	callout_init(&sc->timer_mux, 1);
 
 	error = regulator_get_by_ofw_property(dev, 0, "vbus-supply",
 	    &sc->vbus_supply);
@@ -1997,9 +2893,31 @@ fusb302_attach(device_t dev)
 	device_printf(dev, "device id 0x%02x at addr 0x%02x\n",
 	    sc->device_id, sc->addr);
 
-	mtx_lock(&sc->mtx);
-	error = fusb302_init_locked(sc);
-	mtx_unlock(&sc->mtx);
+	sc->role_pref = fusb302_is_rockpro64(dev) ? FUSB_ROLE_SRC :
+	    FUSB_ROLE_DRP;
+	TUNABLE_INT_FETCH("hw.fusb302.role_pref", &sc->role_pref);
+	if (sc->role_pref < 0 || sc->role_pref > FUSB_ROLE_SNK)
+		sc->role_pref = FUSB_ROLE_DRP;
+	device_printf(dev, "toggle role preference: %s\n",
+	    sc->role_pref == FUSB_ROLE_SRC ? "source-only" :
+	    sc->role_pref == FUSB_ROLE_SNK ? "sink-only" : "DRP");
+
+	sc->skip_pd = 0;
+	TUNABLE_INT_FETCH("hw.fusb302.skip_pd", &sc->skip_pd);
+	if (sc->skip_pd)
+		device_printf(dev, "skip_pd=1: passive DP defaults on SNK attach\n");
+
+	/*
+	 * Run init_locked WITHOUT taking sc->mtx. init_locked does ~100 I2C
+	 * transactions (and the manual SNK probe adds 100+ more), each of
+	 * which sleeps in rk_i2c_transfer. sc->mtx is MTX_DEF (non-sleepable
+	 * from _sleep's perspective): holding it across an I2C sleep
+	 * triggers WITNESS warnings and, if any other thread blocks waiting
+	 * on it, propagate_priority panics. Attach is single-threaded
+	 * relative to its own softc until bus_setup_intr connects the IRQ
+	 * filter, so the lock is unnecessary here.
+	 */
+	error = fusb302_init(sc);
 	if (error != 0) {
 		device_printf(dev, "init failed: %d\n", error);
 		goto fail;
@@ -2020,8 +2938,10 @@ fusb302_attach(device_t dev)
 			    &sc->irq_rid, RF_ACTIVE);
 	}
 	if (sc->irq_res != NULL) {
+		/* Filter-only: no ithread, avoids ithread lifecycle races on
+		 * hot-swap (kldunload/kldload). */
 		error = bus_setup_intr(dev, sc->irq_res,
-		    INTR_TYPE_MISC | INTR_MPSAFE, NULL, fusb302_intr, sc,
+		    INTR_TYPE_MISC | INTR_MPSAFE, fusb302_intr, NULL, sc,
 		    &sc->irq_cookie);
 		if (error != 0) {
 			device_printf(dev, "cannot setup irq: %d\n", error);
@@ -2031,8 +2951,38 @@ fusb302_attach(device_t dev)
 			sc->irq_cookie = NULL;
 		}
 	}
-	if (sc->irq_res == NULL)
-		device_printf(dev, "no irq, using poll/sysctl only\n");
+	if (sc->irq_res == NULL) {
+		device_printf(dev, "cannot allocate irq, aborting attach\n");
+		error = ENXIO;
+		goto fail;
+	}
+
+	/*
+	 * Now that the IRQ filter is registered, enable the chip's INT_N
+	 * output. Doing this earlier (in init_locked) leaves a window
+	 * where the chip pulls GPIO low with no handler, producing the
+	 * "gpio1: Interrupt pin=2 unhandled" storm at the rk_gpio level.
+	 */
+	/*
+	 * Clear the chip's INT_N output mask as the FINAL register access
+	 * before we expose ourselves to the IRQ task. Done unlocked: any
+	 * IRQ that fires after this point sees a fully-initialized softc
+	 * and contention on sc->mtx between attach and the IRQ task is
+	 * impossible because attach has no further work to do under the
+	 * lock. (Holding sc->mtx around this update_reg would resurrect
+	 * the same sleep-with-nosleep-lock panic that init_locked hit.)
+	 */
+	(void)fusb302_update_reg(sc, FUSB_REG_CONTROL0,
+	    FUSB_CTL0_INT_MASK, 0);
+
+	/*
+	 * If init_locked's manual SNK probe transitioned us into
+	 * ATTACHED_SNK, the state machine is parked with work_continue set
+	 * but no IRQ pending to drain it. Kick the task once so sub_state 0
+	 * runs and arms the T_ATTACH_WAIT timer.
+	 */
+	if (sc->conn_state != FUSB_ST_UNATTACHED)
+		taskqueue_enqueue(taskqueue_thread, &sc->irq_task);
 
 	fusb302_add_sysctls(sc);
 	OF_device_register_xref(OF_xref_from_node(ofw_bus_get_node(dev)), dev);
@@ -2040,7 +2990,6 @@ fusb302_attach(device_t dev)
 
 fail:
 	callout_drain(&sc->timer_state);
-	callout_drain(&sc->timer_mux);
 	if (sc->vbus_enabled)
 		regulator_disable(sc->vbus_supply);
 	if (sc->vbus_supply != NULL)
@@ -2056,14 +3005,59 @@ fusb302_detach(device_t dev)
 
 	sc = device_get_softc(dev);
 
-	if (sc->irq_cookie != NULL)
-		bus_teardown_intr(dev, sc->irq_res, sc->irq_cookie);
-	if (sc->irq_res != NULL)
-		bus_release_resource(dev, SYS_RES_IRQ, sc->irq_rid, sc->irq_res);
+	/*
+	 * Detach must NOT hold sc->mtx across any I2C transfer (rk_i2c
+	 * sleeps in _sleep). Holding the mutex while sleeping triggers
+	 * propagate_priority's "sleeping thread holds non-sleepable lock"
+	 * panic if the IRQ task wakes up and tries to grab sc->mtx.
+	 *
+	 * Safe order:
+	 *   1. Tear down the IRQ filter (waits for any in-flight handler).
+	 *   2. Drain the callout (stops any pending state timer).
+	 *   3. Drain the IRQ task (waits for any queued/in-flight task).
+	 *   4. Now no other thread can touch sc — do I2C unlocked.
+	 *   5. Release resources, destroy mutex.
+	 */
 
+	/* Signal in-flight task to bail quickly. Race-free even unlocked
+	 * because the task reads `initialized` after acquiring the mutex,
+	 * and any value it sees is followed by a quick exit. */
+	sc->initialized = false;
+	sc->work_continue = 0;
+
+	/*
+	 * Mask the chip's INT_N output FIRST, before tearing down the IRQ
+	 * handler. Otherwise GPIO1 sees the chip's level-triggered INT_N
+	 * still asserted with no consumer and floods the console with
+	 * "gpio1: Interrupt pin=2 unhandled". The chip's INT_MASK bit
+	 * suppresses the line itself, so once this write lands the GPIO
+	 * goes idle. Done unlocked: rk_i2c serializes transactions, and
+	 * any concurrent irq_task I2C just queues behind us.
+	 */
+	(void)fusb302_write_reg(sc, FUSB_REG_CONTROL0,
+	    FUSB_CTL0_HOST_CUR_DEF | FUSB_CTL0_INT_MASK);
+
+	if (sc->irq_cookie != NULL) {
+		bus_teardown_intr(dev, sc->irq_res, sc->irq_cookie);
+		sc->irq_cookie = NULL;
+	}
+
+	/* Drain order matters: callout BEFORE task so the timer can't
+	 * enqueue a fresh task between drains. */
 	callout_drain(&sc->timer_state);
-	callout_drain(&sc->timer_mux);
 	taskqueue_drain(taskqueue_thread, &sc->irq_task);
+
+	/* Now safe to do I2C unlocked — no other thread reaches sc. */
+	(void)fusb302_write_reg(sc, FUSB_REG_CONTROL0,
+	    FUSB_CTL0_HOST_CUR_DEF | FUSB_CTL0_INT_MASK);
+	(void)fusb302_write_reg(sc, FUSB_REG_RESET, FUSB_RESET_SW_RES);
+
+	if (sc->irq_res != NULL) {
+		bus_release_resource(dev, SYS_RES_IRQ, sc->irq_rid,
+		    sc->irq_res);
+		sc->irq_res = NULL;
+	}
+	bus_delete_resource(dev, SYS_RES_IRQ, sc->irq_rid);
 
 	if (sc->vbus_enabled && sc->vbus_supply != NULL)
 		regulator_disable(sc->vbus_supply);

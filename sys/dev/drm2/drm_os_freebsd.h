@@ -576,7 +576,7 @@ typedef struct drm_pci_id_list
 #define	CONFIG_COMPAT
 #endif
 
-#ifndef __arm__
+#if defined(__i386__) || defined(__amd64__) || defined(__ia64__)
 #define	CONFIG_AGP	1
 #define	CONFIG_MTRR	1
 #endif

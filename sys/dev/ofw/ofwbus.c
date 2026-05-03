@@ -36,6 +36,7 @@
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/rman.h>
 
@@ -57,6 +58,7 @@
 
 static device_probe_t ofwbus_probe;
 static device_attach_t ofwbus_attach;
+static bus_driver_added_t ofwbus_driver_added;
 static bus_alloc_resource_t ofwbus_alloc_resource;
 static bus_release_resource_t ofwbus_release_resource;
 
@@ -66,6 +68,7 @@ static device_method_t ofwbus_methods[] = {
 	DEVMETHOD(device_attach,	ofwbus_attach),
 
 	/* Bus interface */
+	DEVMETHOD(bus_driver_added,	ofwbus_driver_added),
 	DEVMETHOD(bus_alloc_resource,	ofwbus_alloc_resource),
 	DEVMETHOD(bus_adjust_resource,	bus_generic_adjust_resource),
 	DEVMETHOD(bus_release_resource,	ofwbus_release_resource),
@@ -79,6 +82,49 @@ EARLY_DRIVER_MODULE(ofwbus, nexus, ofwbus_driver, 0, 0,
     BUS_PASS_BUS + BUS_PASS_ORDER_MIDDLE);
 MODULE_VERSION(ofwbus, 1);
 
+/*
+ * ofwbus_driver_added
+ *
+ * FreeBSD preserves a child's existing devclass during reprobe.  That becomes
+ * a problem for OFW nodes that were materialized before their real driver was
+ * loaded: they can be left in the generic "unknown" class, and later
+ * driver_added notifications will only retry that same class.  Before handing
+ * control to the generic helper, clear any stale, non-fixed devclass on direct
+ * unattached children so the new driver gets a fair probe auction.
+ */
+static void
+ofwbus_driver_added(device_t dev, driver_t *driver)
+{
+	device_t *children, child;
+	devclass_t dc;
+	int count, i;
+
+	if (device_get_children(dev, &children, &count) != 0) {
+		bus_generic_driver_added(dev, driver);
+		return;
+	}
+	for (i = 0; i < count; i++) {
+		child = children[i];
+		if (device_get_state(child) != DS_NOTPRESENT)
+			continue;
+		if (device_is_devclass_fixed(child))
+			continue;
+		dc = device_get_devclass(child);
+		if (dc == NULL)
+			continue;
+		if (strcmp(devclass_get_name(dc), "unknown") != 0)
+			continue;
+		(void)device_set_devclass(child, NULL);
+	}
+	free(children, M_TEMP);
+
+	bus_generic_driver_added(dev, driver);
+}
+
+/*
+ * Attach only when an OFW root exists and this is the singleton ofwbus
+ * instance hanging directly off nexus.
+ */
 static int
 ofwbus_probe(device_t dev)
 {
@@ -95,6 +141,10 @@ ofwbus_probe(device_t dev)
 	return (BUS_PROBE_NOWILDCARD);
 }
 
+/*
+ * Initialize simplebus state from the OFW root and materialize the initial
+ * set of top-level children before probing them.
+ */
 static int
 ofwbus_attach(device_t dev)
 {
@@ -129,6 +179,11 @@ ofwbus_attach(device_t dev)
 	return (0);
 }
 
+/*
+ * Translate default OFW resources into explicit ranges and then delegate the
+ * actual allocation to nexus, preserving passthrough semantics for children
+ * below subordinate buses.
+ */
 static struct resource *
 ofwbus_alloc_resource(device_t bus, device_t child, int type, int *rid,
     rman_res_t start, rman_res_t end, rman_res_t count, u_int flags)
@@ -170,6 +225,10 @@ ofwbus_alloc_resource(device_t bus, device_t child, int type, int *rid,
 	return (rv);
 }
 
+/*
+ * Clear the cached resource list entry for direct children and then hand the
+ * release request to nexus.
+ */
 static int
 ofwbus_release_resource(device_t bus, device_t child, struct resource *r)
 {

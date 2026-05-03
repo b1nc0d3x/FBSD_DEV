@@ -34,8 +34,10 @@
 #include <sys/bus.h>
 #include <sys/rman.h>
 #include <sys/kernel.h>
+#include <sys/linker.h>
 #include <sys/module.h>
 #include <sys/gpio.h>
+#include <sys/sysctl.h>
 #include <machine/bus.h>
 
 #include <dev/fdt/fdt_common.h>
@@ -44,6 +46,7 @@
 #include <dev/ofw/ofw_subr.h>
 
 #include <dev/clk/clk.h>
+#include <dev/iicbus/usb/fusb302_var.h>
 #include <dev/phy/phy_usb.h>
 #include <dev/syscon/syscon.h>
 #include <dev/hwreset/hwreset.h>
@@ -87,7 +90,7 @@
 #define	CMN_PLL1_DSM_DIAG		(0x117 << 2)
 #define	CMN_PLL1_SS_CTRL1		(0x118 << 2)
 #define	CMN_PLL1_SS_CTRL2		(0x119 << 2)
-#define	CMN_PLLSM1_USER_DEF_CTRL	(0x11f << 2)
+#define	CMN_PLLSM1_USER_DEF_CTRL	(0x37 << 2)
 #define	CMN_DIAG_PLL1_FBH_OVRD		(0x1d0 << 2)
 #define	CMN_DIAG_PLL1_FBL_OVRD		(0x1d1 << 2)
 #define	CMN_DIAG_PLL1_OVRD		(0x1d2 << 2)
@@ -96,7 +99,7 @@
 #define	CMN_DIAG_PLL1_LF_PROG		(0x1d7 << 2)
 #define	CMN_DIAG_PLL1_PTATIS_TUNE1	(0x1d8 << 2)
 #define	CMN_DIAG_PLL1_PTATIS_TUNE2	(0x1d9 << 2)
-#define	CMN_DIAG_PLL1_INCLK_CTRL	(0x1dc << 2)
+#define	CMN_DIAG_PLL1_INCLK_CTRL	(0x1da << 2)
 #define	CMN_DIAG_HSCLK_SEL		(0x1e0 << 2)
 #define	 CMN_DIAG_HSCLK_SEL_PLL_CONFIG	0x30
 #define	 CMN_DIAG_HSCLK_SEL_PLL_MASK	0x33
@@ -141,12 +144,44 @@
 #define	PIN_ASSIGN_D_F			0x5100
 #define	PIPE_CMN_CTRL1			(0xc001 << 2)
 #define	DP_MODE_CTL			(0xc008 << 2)
+/*
+ * DP_MODE_CTL layout:
+ *   bits [3:0]   = mode select (1=A0, 4=A2, 8=A3)
+ *   bits [7:4]   = mode-ready ACKs (1=A0_ready, 4=A2_ready)
+ *   bit  [8]     = DP_LINK_RESET_DEASSERTED
+ *   bits [15:12] = PHY_DP_LANE_x_DISABLE (set bit = power down that DP lane)
+ *
+ * For 4-lane DP we MUST clear bits [15:12] so all four lanes are powered.
+ * Previous values 0xc104/0xc101 had bits 14+15 set, which disabled lanes 2+3
+ * — the PHY came up as 2-lane while we told the firmware lanes=4. The
+ * firmware then tried to drive a 4-lane link against a 2-lane-powered PHY,
+ * couldn't complete AUX, and crashed inside its own AUX engine. Symptom was
+ * "READ_DPCD mailbox_send accepted, then firmware never replied / KEEP_ALIVE
+ * frozen".  Read-modify-write only the mode bits [3:0] and leave 12-15
+ * cleared.
+ */
+#define	DP_LINK_RESET_DEASSERTED	(1U << 8)
 #define	DP_CLK_CTL			(0xc009 << 2)
 #define	 DP_PLL_CLOCK_ENABLE		(1U << 2)
+#define	 DP_PLL_CLOCK_DISABLE		(0U << 2)
+#define	 DP_PLL_CLOCK_ENABLE_MASK	(1U << 2)
+#define	 DP_PLL_CLOCK_ENABLE_ACK	(1U << 3)
 #define	 DP_PLL_ENABLE			(1U << 0)
+#define	 DP_PLL_DISABLE			(0U << 0)
+#define	 DP_PLL_ENABLE_MASK		(1U << 0)
+#define	 DP_PLL_READY			(1U << 1)
 #define	 DP_PLL_DATA_RATE_RBR		((2U << 12) | (4U << 8))
-#define	DP_MODE_ENTER_A2		0xc104
-#define	DP_MODE_ENTER_A0		0xc101
+/*
+ * Mode-select bits within DP_MODE_CTL[3:0]. Use these with a
+ * read-modify-write that preserves bits 4+ (especially 12-15, which on
+ * this RK3399 silicon are NOT host-controllable lane disable bits but
+ * functional reset-state bits the PMA needs preserved — clobbering them
+ * to zero leaves PMA_CMN_CTRL1.READY stuck at 0 and dp-init times out).
+ */
+#define	DP_MODE_MASK			0xf
+#define	DP_MODE_ENTER_A0_BITS		(1U << 0)
+#define	DP_MODE_ENTER_A2_BITS		(1U << 2)
+#define	DP_MODE_ENTER_A3_BITS		(1U << 3)
 #define	 DP_MODE_A0_READY		(1U << 4)
 #define	 DP_MODE_A2_READY		(1U << 6)
 #define	PMA_CMN_CTRL1			(0xc800 << 2)
@@ -169,6 +204,7 @@
 #define	AUX_CH_LANE			8
 #define	TXDA_DP_AUX_EN			(1U << 15)
 #define	TXDA_CAL_LATCH_EN		(1U << 13)
+#define	AUXDA_POLARITY			(1U << 12)
 #define	TXDA_BGREF_EN			(1U << 8)
 #define	TXDA_DRV_LDO_EN			(1U << 7)
 #define	TXDA_DECAP_EN_DEL		(1U << 6)
@@ -232,6 +268,75 @@ static const struct rk_typec_phy_reg rk3399_tcphy_dp_pll_cfg[] = {
 	{ 0x4,		CMN_DIAG_PLL1_INCLK_CTRL },
 };
 
+/*
+ * Link-rate-specific PLL configs (RBR/HBR/HBR2).
+ * rk_typec_phy_dp_set_link_rate writes one of these after gating clocks
+ * and disabling the PLL, then re-enables.
+ */
+static const struct rk_typec_phy_reg rk3399_tcphy_dp_pll_rbr_cfg[] = {
+	{ 0x00f0,	CMN_PLL1_VCOCAL_INIT },
+	{ 0x0018,	CMN_PLL1_VCOCAL_ITER },
+	{ 0x30b9,	CMN_PLL1_VCOCAL_START },
+	{ 0x0087,	CMN_PLL1_INTDIV },
+	{ 0x0000,	CMN_PLL1_FRACDIV },
+	{ 0x0022,	CMN_PLL1_HIGH_THR },
+	{ 0x8000,	CMN_PLL1_SS_CTRL1 },
+	{ 0x0000,	CMN_PLL1_SS_CTRL2 },
+	{ 0x0020,	CMN_PLL1_DSM_DIAG },
+	{ 0x0000,	CMN_PLLSM1_USER_DEF_CTRL },
+	{ 0x0000,	CMN_DIAG_PLL1_OVRD },
+	{ 0x0000,	CMN_DIAG_PLL1_FBH_OVRD },
+	{ 0x0000,	CMN_DIAG_PLL1_FBL_OVRD },
+	{ 0x0006,	CMN_DIAG_PLL1_V2I_TUNE },
+	{ 0x0045,	CMN_DIAG_PLL1_CP_TUNE },
+	{ 0x0008,	CMN_DIAG_PLL1_LF_PROG },
+	{ 0x0100,	CMN_DIAG_PLL1_PTATIS_TUNE1 },
+	{ 0x0007,	CMN_DIAG_PLL1_PTATIS_TUNE2 },
+	{ 0x0001,	CMN_DIAG_PLL1_INCLK_CTRL },
+};
+static const struct rk_typec_phy_reg rk3399_tcphy_dp_pll_hbr_cfg[] = {
+	{ 0x00f0,	CMN_PLL1_VCOCAL_INIT },
+	{ 0x0018,	CMN_PLL1_VCOCAL_ITER },
+	{ 0x30b4,	CMN_PLL1_VCOCAL_START },
+	{ 0x00e1,	CMN_PLL1_INTDIV },
+	{ 0x0000,	CMN_PLL1_FRACDIV },
+	{ 0x0005,	CMN_PLL1_HIGH_THR },
+	{ 0x8000,	CMN_PLL1_SS_CTRL1 },
+	{ 0x0000,	CMN_PLL1_SS_CTRL2 },
+	{ 0x0020,	CMN_PLL1_DSM_DIAG },
+	{ 0x1000,	CMN_PLLSM1_USER_DEF_CTRL },
+	{ 0x0000,	CMN_DIAG_PLL1_OVRD },
+	{ 0x0000,	CMN_DIAG_PLL1_FBH_OVRD },
+	{ 0x0000,	CMN_DIAG_PLL1_FBL_OVRD },
+	{ 0x0007,	CMN_DIAG_PLL1_V2I_TUNE },
+	{ 0x0045,	CMN_DIAG_PLL1_CP_TUNE },
+	{ 0x0008,	CMN_DIAG_PLL1_LF_PROG },
+	{ 0x0001,	CMN_DIAG_PLL1_PTATIS_TUNE1 },
+	{ 0x0001,	CMN_DIAG_PLL1_PTATIS_TUNE2 },
+	{ 0x0001,	CMN_DIAG_PLL1_INCLK_CTRL },
+};
+static const struct rk_typec_phy_reg rk3399_tcphy_dp_pll_hbr2_cfg[] = {
+	{ 0x00f0,	CMN_PLL1_VCOCAL_INIT },
+	{ 0x0018,	CMN_PLL1_VCOCAL_ITER },
+	{ 0x30b4,	CMN_PLL1_VCOCAL_START },
+	{ 0x00e1,	CMN_PLL1_INTDIV },
+	{ 0x0000,	CMN_PLL1_FRACDIV },
+	{ 0x0005,	CMN_PLL1_HIGH_THR },
+	{ 0x8000,	CMN_PLL1_SS_CTRL1 },
+	{ 0x0000,	CMN_PLL1_SS_CTRL2 },
+	{ 0x0020,	CMN_PLL1_DSM_DIAG },
+	{ 0x1000,	CMN_PLLSM1_USER_DEF_CTRL },
+	{ 0x0000,	CMN_DIAG_PLL1_OVRD },
+	{ 0x0000,	CMN_DIAG_PLL1_FBH_OVRD },
+	{ 0x0000,	CMN_DIAG_PLL1_FBL_OVRD },
+	{ 0x0007,	CMN_DIAG_PLL1_V2I_TUNE },
+	{ 0x0045,	CMN_DIAG_PLL1_CP_TUNE },
+	{ 0x0008,	CMN_DIAG_PLL1_LF_PROG },
+	{ 0x0001,	CMN_DIAG_PLL1_PTATIS_TUNE1 },
+	{ 0x0001,	CMN_DIAG_PLL1_PTATIS_TUNE2 },
+	{ 0x0001,	CMN_DIAG_PLL1_INCLK_CTRL },
+};
+
 static struct ofw_compat_data compat_data[] = {
 	{ "rockchip,rk3399-typec-phy",	1 },
 	{ NULL,				0 }
@@ -246,6 +351,7 @@ struct rk_typec_phy_softc {
 	device_t		dev;
 	struct resource		*res;
 	struct syscon		*grf;
+	device_t		typec_dev;
 	clk_t			tcpdcore;
 	clk_t			tcpdphy_ref;
 	hwreset_t		rst_uphy;
@@ -255,6 +361,10 @@ struct rk_typec_phy_softc {
 	phy_mode_t		dp_mode;
 	phy_submode_t		dp_submode;
 	int			phy_ctrl_id;
+	bool			flip;
+	int			flip_override; /* -1=auto, 0=CC1, 1=CC2 */
+	bool			init_done;
+	bool			init_flip;	/* sc->flip value at last full init */
 };
 
 #define	RK_TYPEC_PHY_READ(sc, reg)		bus_read_4(sc->res, (reg))
@@ -285,6 +395,56 @@ enum RK3399_USBPHY {
 };
 
 static int
+rk_typec_phy_lookup_typec_status_cb(linker_file_t lf, void *arg)
+{
+	caddr_t sym;
+
+	sym = linker_file_lookup_symbol(lf, "fusb302_get_typec_status", 0);
+	if (sym == 0)
+		return (0);
+
+	*(caddr_t *)arg = sym;
+	return (1);
+}
+
+static int
+(*rk_typec_phy_lookup_typec_status(void))(device_t, struct fusb302_typec_status *)
+{
+	caddr_t sym;
+
+	sym = 0;
+	(void)linker_file_foreach(rk_typec_phy_lookup_typec_status_cb, &sym);
+	return ((int (*)(device_t, struct fusb302_typec_status *))sym);
+}
+
+static bool
+rk_typec_phy_update_flip(struct rk_typec_phy_softc *sc)
+{
+	int (*get_status)(device_t, struct fusb302_typec_status *);
+	struct fusb302_typec_status status;
+	devclass_t dc;
+	device_t dev;
+
+	if (sc->typec_dev == NULL) {
+		dc = devclass_find("fusb302");
+		if (dc != NULL)
+			sc->typec_dev = devclass_get_device(dc, 0);
+	}
+	dev = sc->typec_dev;
+	if (dev == NULL)
+		return (false);
+
+	get_status = rk_typec_phy_lookup_typec_status();
+	if (get_status == NULL)
+		return (false);
+	if (get_status(dev, &status) != 0 || !status.state_valid)
+		return (false);
+
+	sc->flip = (status.orientation == FUSB302_TYPEC_ORIENT_CC2);
+	return (true);
+}
+
+static int
 rk_typec_phy_set_field(struct rk_typec_phy_softc *sc,
     const struct rk_typec_phy_grf_prop *prop, uint32_t value)
 {
@@ -301,7 +461,8 @@ rk_typec_phy_apply_dp_grf(struct rk_typec_phy_softc *sc)
 	if (sc->phy_ctrl_id != 0)
 		return (0);
 
-	return (rk_typec_phy_set_field(sc, &rk3399_tcphy0_conn_dir, 1));
+	return (rk_typec_phy_set_field(sc, &rk3399_tcphy0_conn_dir,
+	    sc->flip ? 1 : 0));
 }
 
 static int
@@ -311,6 +472,40 @@ rk_typec_phy_enable_dp_sel(struct rk_typec_phy_softc *sc)
 		return (0);
 
 	return (rk_typec_phy_set_field(sc, &rk3399_tcphy0_uphy_dp_sel, 1));
+}
+
+static void
+rk_typec_phy_dp_aux_set_flip(struct rk_typec_phy_softc *sc)
+{
+	uint32_t reg;
+	bool aux_flip;
+
+	/*
+	 * flip_override only controls AUXDA_POLARITY, not conn_dir.
+	 * Setting conn_dir=1 (for CC2) via rk_typec_phy_apply_dp_grf breaks
+	 * the A2 PSM sequence, so leave sc->flip/conn_dir at its auto-detected
+	 * value and only override the AUX signal polarity here.
+	 */
+	aux_flip = (sc->flip_override >= 0) ? (sc->flip_override != 0) : sc->flip;
+	reg = RK_TYPEC_PHY_READ(sc, TX_ANA_CTRL_REG_1);
+	/*
+	 * Empirically on this hardware: with AUX_SWAP_INVERSION_CONTROL=0x3
+	 * (RK_CDN_DP_AUX_HOST_INVERT) programmed by the firmware, the PHY's
+	 * AUXDA_POLARITY must be SET on CC2 (flip=1) and CLEAR on CC1.  This
+	 * is the OPPOSITE of what an upstream-style implementation would do:
+	 * with the firmware-side AUX_SWAP=0x3 also applied for CC2, the two
+	 * polarities compensate so the wire net-direction is correct only
+	 * with this combination.  Verified 2026-05-02: with this code
+	 * DPCD ACKs and EDID reads, with the inverse AUX times out.
+	 */
+	if (aux_flip)
+		reg |= AUXDA_POLARITY;
+	else
+		reg &= ~AUXDA_POLARITY;
+	device_printf(sc->dev, "dp-aux-flip: override=%d aux_flip=%s AUXDA_POLARITY=%s\n",
+	    sc->flip_override, aux_flip ? "CC2" : "CC1",
+	    aux_flip ? "set" : "cleared");
+	RK_TYPEC_PHY_WRITE(sc, TX_ANA_CTRL_REG_1, reg);
 }
 
 static void
@@ -331,8 +526,8 @@ rk_typec_phy_cfg_dp_lane(struct rk_typec_phy_softc *sc, u_int lane)
 	uint32_t reg;
 
 	RK_TYPEC_PHY_WRITE(sc, XCVR_PSM_RCTRL(lane), 0xbefc);
-	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A0(lane), 0x6799);
-	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A1(lane), 0x6798);
+	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A0(lane), 0x6799);	/* DP lane; USB3 uses 0x7799 */
+	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A1(lane), 0x6798);	/* DP lane; USB3 uses 0x7798 */
 	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A2(lane), 0x98);
 	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A3(lane), 0x98);
 
@@ -389,8 +584,8 @@ rk_typec_phy_set_usb2_only(struct rk_typec_phy_softc *sc, bool usb2only)
  * Programs the AUX channel analog section using values derived from the PHY's
  * built-in PU/PD calibration registers.  Must be called after the PMA PLL has
  * locked (PMA_CMN_CTRL1_READY) and before requesting the A0 state transition.
- * Mirrors the Linux tcphy_dp_aux_calibration() sequence from
- * phy-rockchip-typec.c.
+ * Programs CMN_TXPUCAL/PDCAL/PUADJ/PDADJ-derived analog calibration into
+ * the AUX TX channel.
  */
 static void
 rk_typec_phy_dp_aux_calibration(struct rk_typec_phy_softc *sc)
@@ -471,6 +666,439 @@ rk_typec_phy_dp_aux_calibration(struct rk_typec_phy_softc *sc)
 	RK_TYPEC_PHY_WRITE(sc, TX_DIG_CTRL_REG_2, val);
 }
 
+/*
+ * Per-lane TX signal-level table indexed [voltage_swing][pre_emphasis].
+ * 3 voltage-swing levels × 4 pre-emphasis levels.
+ * Slots with swing=0 pe=0 are unreachable combinations per DP spec.
+ */
+struct rk_typec_phy_signal_cfg {
+	uint16_t swing;
+	uint16_t pe;
+};
+static const struct rk_typec_phy_signal_cfg
+rk_typec_phy_signal_table[3][4] = {
+	{ { 0x2a, 0x00 }, { 0x1f, 0x15 }, { 0x14, 0x22 }, { 0x02, 0x2b } },
+	{ { 0x21, 0x00 }, { 0x12, 0x15 }, { 0x02, 0x22 }, { 0,    0    } },
+	{ { 0x15, 0x00 }, { 0x00, 0x15 }, { 0,    0    }, { 0,    0    } },
+};
+
+/*
+ * rk_typec_phy_dp_set_signal_levels
+ *
+ * Programs the per-lane TX swing/pre-emphasis registers from the table for the
+ * given voltage_swing/pre_emp levels.
+ * Called from rk_cdn_dp link training between DPCD writes when ADJUST_REQUEST
+ * asks for new levels.
+ *
+ * `dev`        : rk_typec_phy device (lookup via phynode_get_device).
+ * `link_rate`  : DP link rate in kHz (270000 = HBR, 540000 = HBR2).
+ * `lane_count` : 1, 2, or 4.
+ * `swing`      : voltage swing level, 0..2.
+ * `pre_emp`    : pre-emphasis level, 0..3.
+ *
+ * Exported (non-static) so rk_cdn_dp.ko can resolve via the kernel linker.
+ */
+int rk_typec_phy_dp_set_signal_levels(device_t dev, int link_rate,
+    int lane_count, uint8_t swing, uint8_t pre_emp);
+int rk_typec_phy_dp_set_signal_levels_first(int link_rate, int lane_count,
+    uint8_t swing, uint8_t pre_emp);
+int rk_typec_phy_dp_set_link_rate(device_t dev, int link_rate, bool ssc_on);
+int rk_typec_phy_dp_set_link_rate_first(int link_rate, bool ssc_on);
+int rk_typec_phy_dp_set_lane_count(device_t dev, int lane_count);
+int rk_typec_phy_dp_set_lane_count_first(int lane_count);
+int rk_typec_phy_dp_refresh_orientation_first(void);
+
+static struct rk_typec_phy_softc *rk_typec_phy_first_softc(void);
+
+/*
+ * tcphy_dp_set_power_state equivalent: drives DP_MODE_CTL to request
+ * A0/A2/A3 and waits for the corresponding READY bit to assert.
+ *  state encoding (DP_MODE_CTL[3:0]): 1=A0, 2=A1, 4=A2, 8=A3
+ *  ready bits  (DP_MODE_CTL[7:4]): 1=A0_ready, 2=A1, 4=A2_ready, 8=A3_ready
+ */
+static int
+rk_typec_phy_dp_set_power_state(struct rk_typec_phy_softc *sc,
+    int state)
+{
+	uint32_t reg, want_state, want_ack;
+	int retry;
+
+	switch (state) {
+	case 0: want_state = 1U << 0; break;	/* A0 */
+	case 2: want_state = 1U << 2; break;	/* A2 */
+	case 3: want_state = 1U << 3; break;	/* A3 */
+	default: return (EINVAL);
+	}
+	want_ack = want_state << 4;
+
+	reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
+	reg &= ~DP_MODE_MASK;
+	reg |= want_state | DP_LINK_RESET_DEASSERTED;
+	RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, reg);
+
+	for (retry = 10000; retry > 0; retry--) {
+		reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
+		if (reg & want_ack)
+			return (0);
+		DELAY(10);
+	}
+	device_printf(sc->dev,
+	    "set_power_state A%d timeout: DP_MODE_CTL=0x%x\n", state, reg);
+	return (ETIMEDOUT);
+}
+
+/*
+ * Switch the PHY's PLL to the requested DP link rate.
+ * Sequence: A3 → gate clocks → disable PLL → load rate-specific PLL
+ * table → enable PLL → enable clocks → A2 → A0.
+ *
+ * link_rate is in kHz: 162000 (RBR), 270000 (HBR), 540000 (HBR2).
+ * ssc_on is honored for table selection but currently we only carry
+ * non-SSC tables; pass false to avoid surprises.
+ */
+int
+rk_typec_phy_dp_set_link_rate(device_t dev, int link_rate, bool ssc_on)
+{
+	struct rk_typec_phy_softc *sc;
+	const struct rk_typec_phy_reg *cfg;
+	uint32_t cmn_diag_hsclk_sel, phy_dp_clk_ctl, reg;
+	size_t cfg_size, i;
+	int err, retry;
+
+	if (dev == NULL)
+		return (EINVAL);
+	sc = device_get_softc(dev);
+	if (sc == NULL)
+		return (EINVAL);
+
+	err = rk_typec_phy_dp_set_power_state(sc, 3);
+	if (err != 0)
+		return (err);
+
+	/* Gate the PLL clocks from PMA. */
+	reg = RK_TYPEC_PHY_READ(sc, DP_CLK_CTL);
+	reg &= ~DP_PLL_CLOCK_ENABLE_MASK;
+	reg |= DP_PLL_CLOCK_DISABLE;
+	RK_TYPEC_PHY_WRITE(sc, DP_CLK_CTL, reg);
+	for (retry = 10000; retry > 0; retry--) {
+		reg = RK_TYPEC_PHY_READ(sc, DP_CLK_CTL);
+		if (!(reg & DP_PLL_CLOCK_ENABLE_ACK))
+			break;
+		DELAY(10);
+	}
+	if (retry == 0) {
+		device_printf(sc->dev, "set_link_rate: gate clocks timeout\n");
+		return (ETIMEDOUT);
+	}
+
+	/* Disable the PLL. */
+	reg = RK_TYPEC_PHY_READ(sc, DP_CLK_CTL);
+	reg &= ~DP_PLL_ENABLE_MASK;
+	reg |= DP_PLL_DISABLE;
+	RK_TYPEC_PHY_WRITE(sc, DP_CLK_CTL, reg);
+	for (retry = 10000; retry > 0; retry--) {
+		reg = RK_TYPEC_PHY_READ(sc, DP_CLK_CTL);
+		if (!(reg & DP_PLL_READY))
+			break;
+		DELAY(10);
+	}
+	if (retry == 0) {
+		device_printf(sc->dev,
+		    "set_link_rate: PLL disable timeout\n");
+		return (ETIMEDOUT);
+	}
+
+	cmn_diag_hsclk_sel = RK_TYPEC_PHY_READ(sc, CMN_DIAG_HSCLK_SEL);
+	cmn_diag_hsclk_sel &= ~((0x3U << 4) | (0x3U << 0));
+
+	phy_dp_clk_ctl = RK_TYPEC_PHY_READ(sc, DP_CLK_CTL);
+	phy_dp_clk_ctl &= ~((0xfU << 12) | (0xfU << 8));
+
+	switch (link_rate) {
+	case 162000:
+		cmn_diag_hsclk_sel |= (3U << 4) | (0U << 0);
+		phy_dp_clk_ctl |= (2U << 12) | (4U << 8);
+		cfg = rk3399_tcphy_dp_pll_rbr_cfg;
+		cfg_size = nitems(rk3399_tcphy_dp_pll_rbr_cfg);
+		break;
+	case 270000:
+		cmn_diag_hsclk_sel |= (3U << 4) | (0U << 0);
+		phy_dp_clk_ctl |= (2U << 12) | (4U << 8);
+		cfg = rk3399_tcphy_dp_pll_hbr_cfg;
+		cfg_size = nitems(rk3399_tcphy_dp_pll_hbr_cfg);
+		break;
+	case 540000:
+		cmn_diag_hsclk_sel |= (2U << 4) | (0U << 0);
+		phy_dp_clk_ctl |= (1U << 12) | (2U << 8);
+		cfg = rk3399_tcphy_dp_pll_hbr2_cfg;
+		cfg_size = nitems(rk3399_tcphy_dp_pll_hbr2_cfg);
+		break;
+	default:
+		return (EINVAL);
+	}
+
+	RK_TYPEC_PHY_WRITE(sc, CMN_DIAG_HSCLK_SEL, cmn_diag_hsclk_sel);
+	RK_TYPEC_PHY_WRITE(sc, DP_CLK_CTL, phy_dp_clk_ctl);
+
+	for (i = 0; i < cfg_size; i++)
+		RK_TYPEC_PHY_WRITE(sc, cfg[i].addr, cfg[i].value);
+
+	/* Enable the PLL. */
+	reg = RK_TYPEC_PHY_READ(sc, DP_CLK_CTL);
+	reg &= ~DP_PLL_ENABLE_MASK;
+	reg |= DP_PLL_ENABLE;
+	RK_TYPEC_PHY_WRITE(sc, DP_CLK_CTL, reg);
+	for (retry = 10000; retry > 0; retry--) {
+		reg = RK_TYPEC_PHY_READ(sc, DP_CLK_CTL);
+		if (reg & DP_PLL_READY)
+			break;
+		DELAY(10);
+	}
+	if (retry == 0) {
+		device_printf(sc->dev,
+		    "set_link_rate: PLL enable timeout\n");
+		return (ETIMEDOUT);
+	}
+
+	/* Enable the PMA PLL clocks. */
+	reg = RK_TYPEC_PHY_READ(sc, DP_CLK_CTL);
+	reg &= ~DP_PLL_CLOCK_ENABLE_MASK;
+	reg |= DP_PLL_CLOCK_ENABLE;
+	RK_TYPEC_PHY_WRITE(sc, DP_CLK_CTL, reg);
+	for (retry = 10000; retry > 0; retry--) {
+		reg = RK_TYPEC_PHY_READ(sc, DP_CLK_CTL);
+		if (reg & DP_PLL_CLOCK_ENABLE_ACK)
+			break;
+		DELAY(10);
+	}
+	if (retry == 0) {
+		device_printf(sc->dev,
+		    "set_link_rate: clock enable timeout\n");
+		return (ETIMEDOUT);
+	}
+
+	/* PMA must traverse A2 on a data-rate change. */
+	err = rk_typec_phy_dp_set_power_state(sc, 2);
+	if (err != 0)
+		return (err);
+	err = rk_typec_phy_dp_set_power_state(sc, 0);
+	if (err != 0)
+		return (err);
+
+	device_printf(sc->dev,
+	    "set_link_rate: applied %d kHz (ssc=%d)\n", link_rate,
+	    ssc_on ? 1 : 0);
+	return (0);
+}
+
+/*
+ * Configure the PHY's DP lane disable bits (DP_MODE_CTL[15:12]) for the
+ * trained lane count.  Bits 12..15 = lane 0..3 disable.
+ */
+int
+rk_typec_phy_dp_set_lane_count(device_t dev, int lane_count)
+{
+	struct rk_typec_phy_softc *sc;
+	uint32_t reg, disable;
+
+	if (dev == NULL)
+		return (EINVAL);
+	sc = device_get_softc(dev);
+	if (sc == NULL)
+		return (EINVAL);
+
+	reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
+	reg |= 0xfU << 12;	/* set ALL lane-disable bits */
+	switch (lane_count) {
+	case 4:
+		disable = 0;	/* enable all 4 */
+		break;
+	case 2:
+		disable = (1U << 14) | (1U << 15);	/* keep lanes 2,3 disabled */
+		break;
+	case 1:
+		disable = (1U << 13) | (1U << 14) | (1U << 15);
+		break;
+	default:
+		return (EINVAL);
+	}
+	reg &= ~(0xfU << 12);
+	reg |= disable;
+	RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, reg);
+	device_printf(sc->dev,
+	    "set_lane_count: lanes=%d DP_MODE_CTL=0x%x\n", lane_count, reg);
+	return (0);
+}
+
+int
+rk_typec_phy_dp_set_link_rate_first(int link_rate, bool ssc_on)
+{
+	struct rk_typec_phy_softc *sc;
+
+	sc = rk_typec_phy_first_softc();
+	if (sc == NULL)
+		return (ENXIO);
+	return (rk_typec_phy_dp_set_link_rate(sc->dev, link_rate, ssc_on));
+}
+
+int
+rk_typec_phy_dp_set_lane_count_first(int lane_count)
+{
+	struct rk_typec_phy_softc *sc;
+
+	sc = rk_typec_phy_first_softc();
+	if (sc == NULL)
+		return (ENXIO);
+	return (rk_typec_phy_dp_set_lane_count(sc->dev, lane_count));
+}
+
+/*
+ * rk_typec_phy_dp_refresh_orientation_first
+ *
+ * Re-latch fusb302's current orientation (CC1/CC2) into sc->flip and force a
+ * full PHY re-init on the next phy_enable so conn_dir GRF and AUX polarity
+ * pick up the new orientation.  The caller (rk_cdn_dp at link-train start)
+ * should phy_disable + phy_enable after this to actually trigger the rebuild.
+ *
+ * Reason this exists: at first phy_enable (stage 5) fusb302 may not yet have
+ * negotiated the CC orientation, so apply_dp_grf locks conn_dir at sc->flip's
+ * default value (false).  Subsequent VDM updates change sc->flip but the GRF
+ * stays stale because no later phy_enable runs.  The flip-change-reinit logic
+ * in rk_typec_phy_enable triggers on init_flip != flip, so simply forcing the
+ * flip-aware path requires (a) refreshing sc->flip from fusb302 and (b)
+ * confirming init_flip captured a different value.
+ */
+int
+rk_typec_phy_dp_refresh_orientation_first(void)
+{
+	struct rk_typec_phy_softc *sc;
+	bool prev_flip;
+
+	sc = rk_typec_phy_first_softc();
+	if (sc == NULL)
+		return (ENXIO);
+
+	prev_flip = sc->flip;
+	(void)rk_typec_phy_update_flip(sc);
+	if (sc->flip == prev_flip && sc->flip == sc->init_flip) {
+		device_printf(sc->dev,
+		    "refresh_orientation: flip=%u unchanged, no reinit needed\n",
+		    sc->flip ? 1 : 0);
+		return (0);
+	}
+	device_printf(sc->dev,
+	    "refresh_orientation: flip %u->%u (init_flip=%u), tearing down PHY for reinit\n",
+	    prev_flip ? 1 : 0, sc->flip ? 1 : 0,
+	    sc->init_flip ? 1 : 0);
+	/*
+	 * Tear down the PMA so the next rk_typec_phy_enable observes
+	 * PMA_CMN_CTRL1.READY=0 and runs the full init path including
+	 * apply_dp_grf (which writes conn_dir from the current sc->flip).
+	 * Clearing init_done is also required so the skip-init guard
+	 * doesn't fire even after resets deassert.
+	 */
+	hwreset_assert(sc->rst_pipe);
+	hwreset_assert(sc->rst_uphy);
+	hwreset_assert(sc->rst_tcphy);
+	DELAY(10000);
+	sc->init_done = false;
+	return (0);
+}
+
+static struct rk_typec_phy_softc *
+rk_typec_phy_first_softc(void)
+{
+	devclass_t dc;
+	device_t dev;
+
+	dc = devclass_find("rk_typec_phy");
+	if (dc == NULL)
+		return (NULL);
+	dev = devclass_get_device(dc, 0);
+	if (dev == NULL)
+		return (NULL);
+	return (device_get_softc(dev));
+}
+
+int
+rk_typec_phy_dp_set_signal_levels(device_t dev, int link_rate, int lane_count,
+    uint8_t swing, uint8_t pre_emp)
+{
+	struct rk_typec_phy_softc *sc;
+	uint32_t val;
+	int i, j, lane;
+
+	if (dev == NULL)
+		return (EINVAL);
+	if (lane_count != 1 && lane_count != 2 && lane_count != 4)
+		return (EINVAL);
+	if (swing > 2 || pre_emp > 3)
+		return (EINVAL);
+	if (rk_typec_phy_signal_table[swing][pre_emp].swing == 0 &&
+	    rk_typec_phy_signal_table[swing][pre_emp].pe == 0 &&
+	    !(swing == 0 && pre_emp == 0))
+		return (EINVAL);
+
+	sc = device_get_softc(dev);
+	if (sc == NULL)
+		return (EINVAL);
+
+	if (lane_count == 4) {
+		i = 0;
+		j = 3;
+	} else if (sc->flip) {
+		i = 0;
+		j = lane_count - 1;
+	} else {
+		i = 4 - lane_count;
+		j = 3;
+	}
+
+	for (lane = i; lane <= j; lane++) {
+		RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_000(lane),
+		    rk_typec_phy_signal_table[swing][pre_emp].swing);
+		RK_TYPEC_PHY_WRITE(sc, TX_TXCC_CPOST_MULT_00(lane),
+		    rk_typec_phy_signal_table[swing][pre_emp].pe);
+
+		if (swing == 2 && pre_emp == 0 && link_rate != 540000) {
+			RK_TYPEC_PHY_WRITE(sc, TX_DIAG_TX_DRV(lane), 0x700);
+			RK_TYPEC_PHY_WRITE(sc, TX_TXCC_CAL_SCLR_MULT(lane),
+			    0x13c);
+		} else {
+			RK_TYPEC_PHY_WRITE(sc, TX_TXCC_CAL_SCLR_MULT(lane),
+			    0x128);
+			RK_TYPEC_PHY_WRITE(sc, TX_DIAG_TX_DRV(lane), 0x0400);
+		}
+
+		val = RK_TYPEC_PHY_READ(sc, XCVR_DIAG_PLLDRC_CTRL(lane));
+		val &= ~(0x7U << 12);
+		val |= ((link_rate == 540000) ? 0x5U : 0x6U) << 12;
+		RK_TYPEC_PHY_WRITE(sc, XCVR_DIAG_PLLDRC_CTRL(lane), val);
+	}
+
+	return (0);
+}
+
+/*
+ * rk_typec_phy_dp_set_signal_levels_first
+ *
+ * Convenience wrapper for rk_cdn_dp.ko: finds the first (and only on RockPro64)
+ * rk_typec_phy device and applies signal levels to it.  Avoids having to
+ * resolve a phy_t -> phynode -> device chain across module boundaries.
+ */
+int
+rk_typec_phy_dp_set_signal_levels_first(int link_rate, int lane_count,
+    uint8_t swing, uint8_t pre_emp)
+{
+	struct rk_typec_phy_softc *sc;
+
+	sc = rk_typec_phy_first_softc();
+	if (sc == NULL)
+		return (ENXIO);
+	return (rk_typec_phy_dp_set_signal_levels(sc->dev, link_rate,
+	    lane_count, swing, pre_emp));
+}
+
 static int
 rk_typec_phy_enable(struct phynode *phynode, bool enable)
 {
@@ -504,22 +1132,99 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 		return (ENXIO);
 	}
 
+	(void)rk_typec_phy_update_flip(sc);
+
+	/*
+	 * Tear down the PHY if it was left active from a previous enable call.
+	 * Writing DP_MODE_ENTER_A2 to a PHY already in A0 never asserts A2_READY
+	 * because the lane PSMs won't regress without a full reset.  A clean
+	 * cycle would assert all three resets before re-enabling.
+	 * For our staged bring-up path, assert the resets here if the PMA is
+	 * still running so the sequence starts from a clean slate.
+	 */
+	if (phy == RK3399_TYPEC_PHY_DP) {
+		uint32_t pma_rd = RK_TYPEC_PHY_READ(sc, PMA_CMN_CTRL1);
+		uint32_t dp_rd  = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
+
+		if ((pma_rd & PMA_CMN_CTRL1_READY) &&
+		    !(dp_rd & DP_MODE_A2_READY)) {
+			/*
+			 * PMA is active but PHY is NOT already in A2.  This happens
+			 * when the PHY was left in A0 (or USB3) by a prior run.
+			 * Assert all three resets without touching clocks so the
+			 * lane PSMs reset cleanly.  external_psm is re-latched by
+			 * the toggle below after rst_tcphy deasserts.
+			 */
+			device_printf(dev,
+			    "dp-init: PHY active non-A2 (dp=0x%x pma=0x%x), tearing down\n",
+			    dp_rd, pma_rd);
+			hwreset_assert(sc->rst_pipe);
+			hwreset_assert(sc->rst_uphy);
+			hwreset_assert(sc->rst_tcphy);
+			DELAY(10000);
+		} else if (pma_rd & PMA_CMN_CTRL1_READY) {
+			/*
+			 * PMA active and PHY already in A2_READY: skip init.
+			 * Re-running common 24M setup knocks PMA out of A2,
+			 * and asserting rst_uphy while the PLL runs leaves
+			 * PMA stuck.  conn_dir GRF can NOT be safely written
+			 * mid-flight either (breaks A2 PSM).
+			 *
+			 * If sc->flip differs from what was set at PHY startup,
+			 * conn_dir is now stale and lane 1 EQ will fail because
+			 * DP wires are routed for the wrong orientation.  We
+			 * have no good remediation from this state — see
+			 * project_rkdrm.md frontier notes.
+			 */
+			device_printf(dev,
+			    "dp-init: PHY already in A2 (dp=0x%x pma=0x%x), skip init (flip=%u init_flip=%u init_done=%u)\n",
+			    dp_rd, pma_rd, sc->flip ? 1 : 0,
+			    sc->init_flip ? 1 : 0, sc->init_done ? 1 : 0);
+			rk_typec_phy_dp_aux_set_flip(sc);
+			rk_typec_phy_dp_aux_calibration(sc);
+			return (0);
+		}
+	}
+
+	/*
+	 * Set external PSM clock and uphy_dp_sel before releasing tcphy reset.
+	 * Both must be set at probe with all resets held so the PHY comes
+	 * out of reset already knowing its PSM clock source and its routing
+	 * target.  uphy_dp_sel written after rst_tcphy deasserts means the
+	 * PHY PSM clock mux pointed at the wrong source when the PLL
+	 * started, which is why A2→A0 could stall.
+	 */
 	if (phy == RK3399_TYPEC_PHY_DP && sc->phy_ctrl_id == 0) {
-		/*
-		 * Select external PSM clock (CDN-DP SOURCE_PHY_CAR provides it
-		 * via rk_cdn_dp_clock_reset at stage 5).  The CDN-DP firmware
-		 * needs this clock to drive TC-PHY A-state transitions via PIPE
-		 * PowerDown signals after SET_HOST_CAPABILITIES processing.
-		 * Matches Linux tcphy_dp_phy_init: property_enable(external_psm,1).
-		 */
 		err = rk_typec_phy_set_field(sc, &rk3399_tcphy0_external_psm, 1);
 		if (err != 0) {
 			device_printf(dev, "cannot set external PSM clock\n");
 			return (err);
 		}
+		err = rk_typec_phy_enable_dp_sel(sc);
+		if (err != 0) {
+			device_printf(dev, "cannot enable DP sel GRF\n");
+			return (err);
+		}
 	}
 
 	hwreset_deassert(sc->rst_tcphy);
+
+	if (phy == RK3399_TYPEC_PHY_DP && sc->phy_ctrl_id == 0) {
+		/*
+		 * Force re-latch of external PSM clock source in the PHY after
+		 * tcphy_rst deasserts.  The PHY has an internal latch that captures
+		 * the GRF external_psm bit on the tcphy_rst deassert edge.
+		 * On re-enable (after teardown), tcphy_rst was briefly asserted which
+		 * resets the latch; writing the GRF before deassert is necessary but
+		 * not sufficient — the PHY samples the transition, not the level.
+		 * Toggle 0→1 here to guarantee the PHY re-latches the correct value.
+		 */
+		DELAY(10);
+		(void)rk_typec_phy_set_field(sc, &rk3399_tcphy0_external_psm, 0);
+		DELAY(10);
+		(void)rk_typec_phy_set_field(sc, &rk3399_tcphy0_external_psm, 1);
+		DELAY(10);
+	}
 
 	if (phy == RK3399_TYPEC_PHY_DP) {
 		err = rk_typec_phy_apply_dp_grf(sc);
@@ -527,8 +1232,9 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 			device_printf(dev, "cannot apply DP GRF routing\n");
 			return (err);
 		}
+		rk_typec_phy_dp_aux_set_flip(sc);
 
-		/* Common 24 MHz setup matches the helper and Linux tcphy path. */
+		/* Common 24 MHz setup. */
 		RK_TYPEC_PHY_WRITE(sc, PMA_CMN_CTRL1, 0x830);
 		for (int i = 0; i < 4; i++) {
 			RK_TYPEC_PHY_WRITE(sc, XCVR_DIAG_LANE_FCM_EN_MGN(i), 0x90);
@@ -543,8 +1249,36 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 		rk_typec_phy_cfg_dp_pll(sc);
 		for (int i = 0; i < 4; i++)
 			rk_typec_phy_cfg_dp_lane(sc, i);
-		RK_TYPEC_PHY_WRITE(sc, PMA_LANE_CFG, PIN_ASSIGN_C_E);
+		/*
+		 * CDN-DP is configured for 2-lane DP + USB3 (lanes=2 in host_cap).
+		 * PIN_ASSIGN_D_F (0x5100) matches that: lanes 0-1 carry DP, lanes 2-3
+		 * are USB3.  PIN_ASSIGN_C_E (0x51d9) is 4-lane DP-only and mismatches
+		 * CDN-DP's 2-lane mode, which causes AUX routing to fail.
+		 */
+		RK_TYPEC_PHY_WRITE(sc, PMA_LANE_CFG, PIN_ASSIGN_D_F);
 
+		device_printf(sc->dev,
+		    "dp-init: enter A2 dp_mode=0x%x pma_cmn=0x%x pma_lane=0x%x\n",
+		    RK_TYPEC_PHY_READ(sc, DP_MODE_CTL),
+		    RK_TYPEC_PHY_READ(sc, PMA_CMN_CTRL1),
+		    RK_TYPEC_PHY_READ(sc, PMA_LANE_CFG));
+		/*
+		 * Read-modify-write: clear the mode-select bits [3:0] and OR
+		 * in ENTER_A2 + LINK_RESET_DEASSERTED. Preserves bits 12-15
+		 * (functional reset-state, NOT lane disable on this silicon).
+		 * Read-modify-write only the mode bits.
+		 */
+		reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
+		reg &= ~DP_MODE_MASK;
+		reg |= DP_MODE_ENTER_A2_BITS | DP_LINK_RESET_DEASSERTED;
+		RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, reg);
+
+		device_printf(sc->dev,
+		    "dp-init: pre-uphy-deassert ext_psm=0x%x dp_sel=0x%x pma=0x%x dp_mode=0x%x\n",
+		    SYSCON_READ_4(sc->grf, rk3399_tcphy0_external_psm.reg),
+		    SYSCON_READ_4(sc->grf, rk3399_tcphy0_uphy_dp_sel.reg),
+		    RK_TYPEC_PHY_READ(sc, PMA_CMN_CTRL1),
+		    RK_TYPEC_PHY_READ(sc, DP_MODE_CTL));
 		hwreset_deassert(sc->rst_uphy);
 		for (retry = 10000; retry > 0; retry--) {
 			reg = RK_TYPEC_PHY_READ(sc, PMA_CMN_CTRL1);
@@ -557,63 +1291,65 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 			return (ENXIO);
 		}
 
-		/* Deassert pipe before A2 poll and enable uphy_dp_sel to
-		 * connect CDN-DP to the PHY (matches Linux tcphy_phy_init). */
-		hwreset_deassert(sc->rst_pipe);
-		err = rk_typec_phy_enable_dp_sel(sc);
-		if (err != 0) {
-			device_printf(dev, "cannot enable DP sel GRF\n");
-			return (err);
-		}
-
 		/*
-		 * If CDN-DP firmware is already driving PIPE P0 (A0 active),
-		 * the TC-PHY will show A0_READY without needing the A2→A0 dance.
-		 * Check the current DP_MODE_CTL: if A0 is already achieved, skip
-		 * the A2 request (which would break A0) and go straight to aux
-		 * calibration. This is the normal path when called after fw-active.
+		 * Stop here, deassert pipe_rst.  The next phase enables
+		 * dp_sel, runs AUX calibration, enters A0, requires A0_READY.
 		 */
-		reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
-		device_printf(dev, "DP_MODE_CTL after pipe/sel: 0x%x pipe_cmn=0x%x\n",
-		    reg, RK_TYPEC_PHY_READ(sc, PIPE_CMN_CTRL1));
+		hwreset_deassert(sc->rst_pipe);
 
-		if (reg & DP_MODE_A0_READY) {
-			device_printf(dev, "TC-PHY already in A0 (CDN-DP PIPE P0); skipping A2 sequence\n");
-			rk_typec_phy_dp_aux_calibration(sc);
-			return (0);
-		}
+		device_printf(sc->dev,
+		    "pre-A2-wait: dp_mode=0x%x ext_psm_grf=0x%x dp_sel_grf=0x%x\n",
+		    RK_TYPEC_PHY_READ(sc, DP_MODE_CTL),
+		    SYSCON_READ_4(sc->grf, rk3399_tcphy0_external_psm.reg),
+		    SYSCON_READ_4(sc->grf, rk3399_tcphy0_uphy_dp_sel.reg));
 
-		/* TC-PHY not in A0 yet; do the standard A2→A0 sequence. */
-		RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, DP_MODE_ENTER_A2);
 		for (retry = 10000; retry > 0; retry--) {
 			reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
 			if (reg & DP_MODE_A2_READY)
 				break;
 			DELAY(10);
 		}
+		device_printf(sc->dev,
+		    "post-rst_pipe: dp_mode=0x%x A2_ready=%d ext_psm=0x%x dp_sel=0x%x\n",
+		    RK_TYPEC_PHY_READ(sc, DP_MODE_CTL),
+		    retry != 0 ? 1 : 0,
+		    SYSCON_READ_4(sc->grf, rk3399_tcphy0_external_psm.reg),
+		    SYSCON_READ_4(sc->grf, rk3399_tcphy0_uphy_dp_sel.reg));
 		if (retry == 0)
 			device_printf(sc->dev,
-			    "Timeout waiting for DP A2: dp_mode=0x%x pma_cmn=0x%x "
-			    "xcvr_psm=0x%x tx_psc_a2=0x%x pma_lane=0x%x pipe_cmn=0x%x\n",
-			    RK_TYPEC_PHY_READ(sc, DP_MODE_CTL),
-			    RK_TYPEC_PHY_READ(sc, PMA_CMN_CTRL1),
-			    RK_TYPEC_PHY_READ(sc, XCVR_PSM_RCTRL(0)),
-			    RK_TYPEC_PHY_READ(sc, TX_PSC_A2(0)),
-			    RK_TYPEC_PHY_READ(sc, PMA_LANE_CFG),
-			    RK_TYPEC_PHY_READ(sc, PIPE_CMN_CTRL1));
+			    "Timeout waiting for DP A2: dp_mode=0x%x\n",
+			    RK_TYPEC_PHY_READ(sc, DP_MODE_CTL));
 
 		rk_typec_phy_dp_aux_calibration(sc);
 
-		RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, DP_MODE_ENTER_A0);
+		/* Read-modify-write A0 enter, preserving bits 12-15. */
+		reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
+		reg &= ~DP_MODE_MASK;
+		reg |= DP_MODE_ENTER_A0_BITS | DP_LINK_RESET_DEASSERTED;
+		RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, reg);
 		for (retry = 10000; retry > 0; retry--) {
 			reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
 			if (reg & DP_MODE_A0_READY)
 				break;
 			DELAY(10);
 		}
-		if (retry == 0)
-			device_printf(sc->dev, "Timeout waiting for DP A0 (dp_mode_ctl=0x%x)\n",
+		device_printf(sc->dev,
+		    "post-A0: dp_mode=0x%x A0_ready=%d\n",
+		    reg, retry != 0 ? 1 : 0);
+		if (retry == 0) {
+			/* Roll back to A2 on failure, preserving bits 12-15. */
+			reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
+			reg &= ~DP_MODE_MASK;
+			reg |= DP_MODE_ENTER_A2_BITS | DP_LINK_RESET_DEASSERTED;
+			RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, reg);
+			device_printf(sc->dev,
+			    "Timeout waiting for DP A0: dp_mode=0x%x\n",
 			    RK_TYPEC_PHY_READ(sc, DP_MODE_CTL));
+			return (ENXIO);
+		}
+
+		sc->init_done = true;
+		sc->init_flip = sc->flip;
 		return (0);
 	}
 
@@ -666,7 +1402,12 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 
 	RK_TYPEC_PHY_WRITE(sc, PMA_LANE_CFG, PIN_ASSIGN_D_F);
 
-	RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, DP_MODE_ENTER_A2);
+	{
+		uint32_t mreg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
+		mreg &= ~DP_MODE_MASK;
+		mreg |= DP_MODE_ENTER_A2_BITS | DP_LINK_RESET_DEASSERTED;
+		RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, mreg);
+	}
 
 	hwreset_deassert(sc->rst_uphy);
 
@@ -804,7 +1545,6 @@ rk_typec_phy_attach(device_t dev)
 		device_printf(dev, "Unknown address %x for typec-phy\n", reg_prop[1]);
 		return (ENXIO);
 	}
-
 	if (bus_alloc_resources(dev, rk_typec_phy_spec, &sc->res) != 0) {
 		device_printf(dev, "cannot allocate resources for device\n");
 		goto fail;
@@ -892,6 +1632,12 @@ rk_typec_phy_attach(device_t dev)
 	}
 
 	OF_device_register_xref(OF_xref_from_node(usb3), dev);
+
+	sc->flip_override = -1;
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "flip_override", CTLFLAG_RW, &sc->flip_override, -1,
+	    "AUX polarity flip override: -1=auto(FUSB302), 0=CC1, 1=CC2");
 
 	return (0);
 

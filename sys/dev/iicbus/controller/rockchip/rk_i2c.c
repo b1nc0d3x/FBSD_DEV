@@ -155,6 +155,14 @@ static struct resource_spec rk_i2c_spec[] = {
 static int rk_i2c_probe(device_t dev);
 static int rk_i2c_attach(device_t dev);
 static int rk_i2c_detach(device_t dev);
+static struct resource *rk_i2c_alloc_resource(device_t bus, device_t child,
+    int type, int *rid, rman_res_t start, rman_res_t end, rman_res_t count,
+    u_int flags);
+static int rk_i2c_activate_resource(device_t bus, device_t child,
+    struct resource *r);
+static int rk_i2c_setup_intr(device_t bus, device_t child, struct resource *irq,
+    int flags, driver_filter_t *filter, driver_intr_t *intr, void *arg,
+    void **cookiep);
 
 #define	RK_I2C_LOCK(sc)			mtx_lock(&(sc)->mtx)
 #define	RK_I2C_UNLOCK(sc)		mtx_unlock(&(sc)->mtx)
@@ -708,10 +716,118 @@ rk_i2c_get_node(device_t bus, device_t dev)
 	return ofw_bus_get_node(bus);
 }
 
+static struct resource *
+rk_i2c_alloc_resource(device_t bus, device_t child, int type, int *rid,
+    rman_res_t start, rman_res_t end, rman_res_t count, u_int flags)
+{
+	struct resource *res;
+
+	res = bus_generic_alloc_resource(bus, child, type, rid, start, end,
+	    count, flags);
+	if (type == SYS_RES_IRQ && child != NULL &&
+	    device_get_parent(child) != bus) {
+		device_printf(bus,
+		    "child irq alloc %s rid=%d start=%#jx end=%#jx "
+		    "count=%#jx flags=%#x -> %s\n",
+		    device_get_nameunit(child), rid != NULL ? *rid : -1,
+		    (uintmax_t)start, (uintmax_t)end, (uintmax_t)count, flags,
+		    res != NULL ? "ok" : "null");
+	}
+
+	return (res);
+}
+
+static int
+rk_i2c_activate_resource(device_t bus, device_t child, struct resource *r)
+{
+	int error;
+
+	error = bus_generic_activate_resource(bus, child, r);
+	if (rman_get_type(r) == SYS_RES_IRQ && child != NULL &&
+	    (rman_get_start(r) == 0x52 || rman_get_start(r) == 0x55)) {
+		device_printf(bus,
+		    "child irq activate %s start=%#jx end=%#jx "
+		    "rflags=%#x -> %d\n",
+		    device_get_nameunit(child), (uintmax_t)rman_get_start(r),
+		    (uintmax_t)rman_get_end(r), rman_get_flags(r), error);
+	}
+
+	return (error);
+}
+
+static int
+rk_i2c_setup_intr(device_t bus, device_t child, struct resource *irq,
+    int flags, driver_filter_t *filter, driver_intr_t *intr, void *arg,
+    void **cookiep)
+{
+	int error;
+
+	error = bus_generic_setup_intr(bus, child, irq, flags, filter, intr,
+	    arg, cookiep);
+	if (irq != NULL && rman_get_type(irq) == SYS_RES_IRQ && child != NULL &&
+	    (rman_get_start(irq) == 0x52 || rman_get_start(irq) == 0x55)) {
+		device_printf(bus,
+		    "child irq setup %s start=%#jx end=%#jx "
+		    "rflags=%#x flags=%#x -> %d\n",
+		    device_get_nameunit(child), (uintmax_t)rman_get_start(irq),
+		    (uintmax_t)rman_get_end(irq), rman_get_flags(irq), flags,
+		    error);
+	}
+
+	return (error);
+}
+
+static int
+rk_i2c_release_resource(device_t bus, device_t child, struct resource *r)
+{
+	int error;
+
+	error = bus_generic_release_resource(bus, child, r);
+	if (r != NULL && rman_get_type(r) == SYS_RES_IRQ && child != NULL &&
+	    (rman_get_start(r) == 0x52 || rman_get_start(r) == 0x55)) {
+		device_printf(bus,
+		    "child irq release %s start=%#jx end=%#jx -> %d\n",
+		    device_get_nameunit(child), (uintmax_t)rman_get_start(r),
+		    (uintmax_t)rman_get_end(r), error);
+	}
+	return (error);
+}
+
+static int
+rk_i2c_deactivate_resource(device_t bus, device_t child, struct resource *r)
+{
+
+	return (bus_generic_deactivate_resource(bus, child, r));
+}
+
+static int
+rk_i2c_teardown_intr(device_t bus, device_t child, struct resource *irq,
+    void *cookie)
+{
+	int error;
+
+	error = bus_generic_teardown_intr(bus, child, irq, cookie);
+	if (irq != NULL && rman_get_type(irq) == SYS_RES_IRQ && child != NULL &&
+	    (rman_get_start(irq) == 0x52 || rman_get_start(irq) == 0x55)) {
+		device_printf(bus,
+		    "child irq teardown %s start=%#jx -> %d\n",
+		    device_get_nameunit(child), (uintmax_t)rman_get_start(irq),
+		    error);
+	}
+	return (error);
+}
+
 static device_method_t rk_i2c_methods[] = {
 	DEVMETHOD(device_probe,		rk_i2c_probe),
 	DEVMETHOD(device_attach,	rk_i2c_attach),
 	DEVMETHOD(device_detach,	rk_i2c_detach),
+
+	DEVMETHOD(bus_alloc_resource,	rk_i2c_alloc_resource),
+	DEVMETHOD(bus_release_resource,	rk_i2c_release_resource),
+	DEVMETHOD(bus_activate_resource, rk_i2c_activate_resource),
+	DEVMETHOD(bus_deactivate_resource, rk_i2c_deactivate_resource),
+	DEVMETHOD(bus_setup_intr,	rk_i2c_setup_intr),
+	DEVMETHOD(bus_teardown_intr,	rk_i2c_teardown_intr),
 
 	/* OFW methods */
 	DEVMETHOD(ofw_bus_get_node,		rk_i2c_get_node),

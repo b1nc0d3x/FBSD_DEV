@@ -30,3 +30,7 @@ tags
 .ccls-cache
 sys/*/compile
 /src.conf
+
+# Local build artifacts (added 2026-05-02)
+/obj/
+/sys/arm64/rockchip/machine

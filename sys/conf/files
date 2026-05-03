@@ -1559,7 +1559,7 @@ dev/dcons/dcons_os.c		optional dcons
 dev/dialog/da9063/da9063_if.m	optional da9063_pmic
 dev/dialog/da9063/da9063_iic.c	optional da9063_pmic iicbus fdt
 dev/dialog/da9063/da9063_rtc.c	optional da9063_rtc fdt
-dev/drm2/drm_agpsupport.c	optional drm2
+dev/drm2/drm_agpsupport.c	optional drm2 agp
 dev/drm2/drm_auth.c		optional drm2
 dev/drm2/drm_bufs.c		optional drm2
 dev/drm2/drm_buffer.c		optional drm2
@@ -1578,6 +1578,7 @@ dev/drm2/drm_gem_names.c	optional drm2
 dev/drm2/drm_global.c		optional drm2
 dev/drm2/drm_hashtab.c		optional drm2
 dev/drm2/drm_ioctl.c		optional drm2
+dev/drm2/drm_ioc32.c		optional drm2 compat_freebsd32
 dev/drm2/drm_irq.c		optional drm2
 dev/drm2/drm_linux_list_sort.c	optional drm2
 dev/drm2/drm_lock.c		optional drm2
@@ -1591,7 +1592,7 @@ dev/drm2/drm_stub.c		optional drm2
 dev/drm2/drm_sysctl.c		optional drm2
 dev/drm2/drm_vm.c		optional drm2
 dev/drm2/drm_os_freebsd.c	optional drm2
-dev/drm2/ttm/ttm_agp_backend.c	optional drm2
+dev/drm2/ttm/ttm_agp_backend.c	optional drm2 agp
 dev/drm2/ttm/ttm_lock.c		optional drm2
 dev/drm2/ttm/ttm_object.c	optional drm2
 dev/drm2/ttm/ttm_tt.c		optional drm2
@@ -1825,6 +1826,7 @@ dev/iicbus/iicsmb.c		optional iicsmb				\
 dev/iicbus/adc/ad7418.c		optional ad7418
 dev/iicbus/adc/ads111x.c	optional ads111x
 dev/iicbus/adc/pcf8591.c	optional pcf8591
+dev/iicbus/usb/fusb302.c	optional fusb302 iicbus fdt regulator
 dev/iicbus/controller/opencores/iicoc.c	optional iicoc
 dev/iicbus/controller/opencores/iicoc_fdt.c	optional iicoc fdt
 dev/iicbus/controller/opencores/iicoc_pci.c	optional iicoc pci
