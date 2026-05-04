@@ -34,3 +34,14 @@ device		rk3399_power
 device		fbd
 device		drm2
 device		rk_drm
+
+# HDMI audio path (Stage 3): pcm framework + DAI binder + I2S2 + a
+# placeholder codec.  audio_soc binds the CPU-side DAI (rk_i2s on
+# i2s2 @ 0xff8a0000) to a dummy-codec on the boot DT's
+# simple-audio-card node, exposing /dev/dsp0 to userland.  Without
+# the simple-audio-card DT node this is harmless -- the framework
+# just doesn't bind anything.
+device		sound
+device		audio_soc
+device		dummy_codec
+device		rk_i2s

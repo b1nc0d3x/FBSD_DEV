@@ -1,0 +1,67 @@
+/*
+ * RockPro64 HDMI audio overlay.
+ *
+ * Wires the on-chip-only I2S2 audio output to a dummy codec so
+ * FreeBSD's audio_soc binder creates a /dev/dsp0 sound device.  The
+ * actual HDMI audio packetizer programming (CTS/N, AudioInfoFrame)
+ * lives in rk_drm_hw.c; this overlay only exists so audio_soc has
+ * both ends of the DAI link to bind.
+ *
+ * Build: included automatically by sys/dts/arm64/overlays/Makefile.
+ * Install: cp .dtbo to /boot/dtb/overlays/, then in /boot/loader.conf:
+ *     fdt_overlays="rk3399-rockpro64-hdmi-audio"
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "pine64,rockpro64";
+};
+
+/* Enable the I2S2 controller (it ships disabled in rk3399-base.dtsi). */
+&{/i2s@ff8a0000} {
+	status = "okay";
+};
+
+/*
+ * Add a dummy codec child of the root.  audio_soc references it via
+ * sound-dai = <&hdmi_audio_codec>, so it needs a phandle.  The
+ * dummy_codec driver simply registers an OFW xref and provides an
+ * empty audio_dai_init -- exactly what we want for a downstream sink
+ * (the HDMI TX) that we configure outside the codec abstraction.
+ */
+&{/} {
+	hdmi_audio_codec: hdmi-audio-codec {
+		compatible = "dummy-codec";
+		#sound-dai-cells = <0>;
+		status = "okay";
+	};
+
+	/*
+	 * simple-audio-card binding consumed by sys/dev/sound/fdt/audio_soc.c.
+	 * The CPU side is i2s2 (driven by rk_i2s.c), the codec side is the
+	 * placeholder above.  Format = i2s, BCLK = 64*LRCK, frame master
+	 * is the CPU side -- this matches what rk_drm_hdmi_configure_audio
+	 * already programmed for the HDMI TX.
+	 */
+	hdmi_sound: hdmi-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "RK3399-HDMI";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,frame-master = <&hdmi_sound_cpu>;
+		simple-audio-card,bitclock-master = <&hdmi_sound_cpu>;
+		status = "okay";
+
+		hdmi_sound_cpu: simple-audio-card,cpu {
+			sound-dai = <&{/i2s@ff8a0000}>;
+		};
+
+		hdmi_sound_codec: simple-audio-card,codec {
+			sound-dai = <&hdmi_audio_codec>;
+		};
+	};
+};
+
+/* vim: set ft=dts: */
