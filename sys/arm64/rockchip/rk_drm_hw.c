@@ -1411,12 +1411,45 @@ rk_drm_hdmi_phy_init(struct rk_drm_softc *sc,
 }
 
 /*
- * Stage 1 HDMI audio bring-up: program the audio CTS/N divider for
- * 48 kHz at the current pixel clock, select I2S as the input source,
- * configure the Audio InfoFrame (2-channel L+R), and ungate the audio
- * clock.  This brings the HDMI TX to "ready to accept I2S samples"
- * but does not yet feed any PCM data — that requires the I2S TX side
- * (rk_i2s) to be wired and the GRF mux to route I2S0 -> HDMI.
+ * rk_drm_hdmi_configure_audio
+ *
+ * HDMI audio block setup, called at the end of every modeset so the
+ * audio path tracks the active pixel clock.  Programs the Designware
+ * HDMI TX audio sub-block to receive 48 kHz / 16-bit / 2-channel I2S
+ * input and wrap each sample frame in a properly-CRCed Audio Sample
+ * Packet that's interleaved with the video data islands on TMDS.
+ *
+ * Six register groups get touched, in order:
+ *
+ *   1. AUD_N1/N2/N3 -- the N divider that, paired with hardware-
+ *      computed CTS, produces the audio recovery clock at the sink.
+ *      Spec table values vary per pixel clock; we cover the common
+ *      modes (25.17/27.02/74.17/148.5 MHz) and fall back to 6144 for
+ *      unknown clocks (the Designware default for 48 kHz).
+ *
+ *   2. AUD_CTS3 -- clears N_SHIFT/CTS_MANUAL so hardware computes CTS
+ *      automatically instead of expecting software to write it.
+ *
+ *   3. AUD_CONF0 -- selects I2S as input source (vs SPDIF) and enables
+ *      one I2S input pair (CH2 = stereo).
+ *
+ *   4. AUD_CONF1 -- I2S left-justified, 16-bit sample width.
+ *
+ *   5. AUD_INPUTCLKFS -- BCLK : LRCK ratio = 64fs (matches the I2S2
+ *      master we drive from rk_i2s).
+ *
+ *   6. FC_AUDICONF{0..3} + FC_AUDSV -- Audio InfoFrame: CC=1 (2 ch),
+ *      default speaker mapping, both subpackets valid.  This is what
+ *      the sink uses to detect "audio is present" and which channels
+ *      are live.
+ *
+ * Finally MC_CLKDIS bit 3 is cleared to ungate the audio domain.
+ *
+ * No PCM samples flow until the I2S2 side is driving BCLK/LRCK and a
+ * userland writer is producing samples to /dev/dsp0; that path is
+ * provided by rk_i2s + audio_soc + the sound framework.  This routine
+ * just makes the HDMI TX side ready to accept whatever shows up on
+ * its I2S input pins.
  */
 static void
 rk_drm_hdmi_configure_audio(struct rk_drm_softc *sc,

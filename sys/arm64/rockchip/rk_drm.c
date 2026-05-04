@@ -103,6 +103,15 @@ static bool rk_drm_hw_hpd_locked(struct rk_drm_softc *sc);
 static bool rk_drm_output_enabled_locked(struct rk_drm_softc *sc);
 static void rk_drm_lastclose(struct drm_device *drm_dev);
 
+/*
+ * rk_drm_mode_fill_default
+ *
+ * Stamp `mode` with our 1080p60 baseline (the same clock the HDMI PHY
+ * is initialized for at attach).  Used wherever we need to hand DRM a
+ * mode but don't have one from EDID yet -- the initial fb_helper
+ * setup, the scanout-not-ready fallback, etc.  Callers that have a
+ * real EDID-bounded mode should use that instead.
+ */
 static void
 rk_drm_mode_fill_default(struct drm_display_mode *mode)
 {
@@ -120,6 +129,14 @@ rk_drm_mode_fill_default(struct drm_display_mode *mode)
 	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
 }
 
+/*
+ * rk_drm_output_poll_changed
+ *
+ * DRM mode-config callback fired when the HPD poller decides the
+ * output state may have changed.  We forward the event into the
+ * fb_helper layer so the kernel framebuffer console resizes /
+ * redraws in response to a hot-plug event without userland help.
+ */
 static void
 rk_drm_output_poll_changed(struct drm_device *drm_dev)
 {
@@ -130,6 +147,14 @@ rk_drm_output_poll_changed(struct drm_device *drm_dev)
 		drm_fb_helper_hotplug_event(&sc->fbdev->fb_helper);
 }
 
+/*
+ * rk_drm_crtc_index
+ *
+ * Translate a drm_crtc pointer to its index in the device's CRTC
+ * list.  vblank APIs are pipe-indexed (0, 1, ...) rather than crtc-
+ * pointer-keyed, so we have to walk the list to convert.  Returns
+ * -1 if the crtc isn't on the list (defensive; shouldn't happen).
+ */
 static int
 rk_drm_crtc_index(struct drm_crtc *crtc)
 {
@@ -147,6 +172,15 @@ rk_drm_crtc_index(struct drm_crtc *crtc)
 	return (-1);
 }
 
+/*
+ * rk_drm_vblank_ticks_from_mode
+ *
+ * Compute the number of system ticks (1/hz seconds) per refresh frame
+ * for the given mode.  We use this to schedule the vblank task at the
+ * correct cadence: ticks = hz * (htotal * vtotal) / (pixel_clock_Hz).
+ * Returns at least 1 tick so the callout always advances; falls back
+ * to ~16.6 ms (60 Hz) if the mode is missing or has zero clock.
+ */
 static int
 rk_drm_vblank_ticks_from_mode(const struct drm_display_mode *mode)
 {
@@ -165,6 +199,14 @@ rk_drm_vblank_ticks_from_mode(const struct drm_display_mode *mode)
 	return ((int)MAX((numerator + denominator - 1) / denominator, 1ULL));
 }
 
+/*
+ * rk_drm_hw_modeset_locked
+ *
+ * Thin wrapper: take sc->hw_lock around rk_drm_hw_modeset() (the
+ * register-level routine), so callers in a non-locked context (sysctl
+ * handlers, DRM callbacks) can safely re-program the VOP/HDMI without
+ * racing concurrent register access.
+ */
 static int
 rk_drm_hw_modeset_locked(struct rk_drm_softc *sc,
     const struct drm_display_mode *mode)
@@ -177,6 +219,12 @@ rk_drm_hw_modeset_locked(struct rk_drm_softc *sc,
 	return (error);
 }
 
+/*
+ * rk_drm_hw_modeset_dp_locked
+ *
+ * As above, but for the eDP/USB-C-DP path (rk_drm_hw_modeset_dp).
+ * Keeps modeset_dp serialized with the rest of the HW operations.
+ */
 static int
 rk_drm_hw_modeset_dp_locked(struct rk_drm_softc *sc,
     const struct drm_display_mode *mode)
@@ -337,6 +385,21 @@ rk_drm_sysctl_audio_i2s_start(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/*
+ * --- Locked-state wrappers ---------------------------------------
+ *
+ * Below this point are a series of small functions that all share
+ * the same shape: take sc->hw_lock, read or update one piece of
+ * softc state (or call a non-locked HW routine), release the lock.
+ *
+ * They exist so the rest of the driver -- which often runs in
+ * non-locked contexts (DRM callbacks, sysctl handlers, vblank
+ * tasks) -- doesn't have to remember which fields require sc->hw_lock
+ * and which don't.  The "*_locked" suffix means "I take the lock for
+ * you", NOT "you must hold the lock when calling me".
+ */
+
+/* Disable scanout while holding hw_lock. */
 static void
 rk_drm_hw_disable_locked(struct rk_drm_softc *sc)
 {
@@ -345,6 +408,7 @@ rk_drm_hw_disable_locked(struct rk_drm_softc *sc)
 	mtx_unlock(&sc->hw_lock);
 }
 
+/* Re-point VOP scanout at a new framebuffer DMA address + stride. */
 static int
 rk_drm_hw_set_scanout_locked(struct rk_drm_softc *sc, vm_paddr_t paddr,
     uint32_t stride)
@@ -357,6 +421,7 @@ rk_drm_hw_set_scanout_locked(struct rk_drm_softc *sc, vm_paddr_t paddr,
 	return (error);
 }
 
+/* Sample HPD pin state under hw_lock. */
 static bool
 rk_drm_hw_hpd_locked(struct rk_drm_softc *sc)
 {
@@ -368,6 +433,7 @@ rk_drm_hw_hpd_locked(struct rk_drm_softc *sc)
 	return (hpd);
 }
 
+/* Read sc->output_enabled atomically (just a flag, but lock for memory order). */
 static bool
 rk_drm_output_enabled_locked(struct rk_drm_softc *sc)
 {
@@ -379,6 +445,11 @@ rk_drm_output_enabled_locked(struct rk_drm_softc *sc)
 	return (enabled);
 }
 
+/*
+ * Snapshot the three HPD state fields atomically so the caller sees
+ * a coherent view (e.g., not "valid && last_status" while squelch
+ * just changed underneath them).  Any of the out-pointers may be NULL.
+ */
 static void
 rk_drm_hpd_state_locked(struct rk_drm_softc *sc, bool *valid, bool *last_status,
     bool *squelch)
@@ -393,6 +464,7 @@ rk_drm_hpd_state_locked(struct rk_drm_softc *sc, bool *valid, bool *last_status,
 	mtx_unlock(&sc->hw_lock);
 }
 
+/* Atomic 3-tuple HPD state update -- mirror image of hpd_state_locked. */
 static void
 rk_drm_hpd_update_locked(struct rk_drm_softc *sc, bool valid, bool last_status,
     bool squelch)
@@ -404,6 +476,7 @@ rk_drm_hpd_update_locked(struct rk_drm_softc *sc, bool valid, bool last_status,
 	mtx_unlock(&sc->hw_lock);
 }
 
+/* Toggle HPD squelch (used to suppress events during deliberate disable). */
 static void
 rk_drm_hpd_set_squelch_locked(struct rk_drm_softc *sc, bool squelch)
 {
@@ -412,6 +485,7 @@ rk_drm_hpd_set_squelch_locked(struct rk_drm_softc *sc, bool squelch)
 	mtx_unlock(&sc->hw_lock);
 }
 
+/* True if the HPD poll task is currently scheduled. */
 static bool
 rk_drm_hpd_task_running_locked(struct rk_drm_softc *sc)
 {
@@ -423,6 +497,7 @@ rk_drm_hpd_task_running_locked(struct rk_drm_softc *sc)
 	return (running);
 }
 
+/* True if the vblank emulation task is currently scheduled. */
 static bool
 rk_drm_vblank_task_running_locked(struct rk_drm_softc *sc)
 {
@@ -434,6 +509,11 @@ rk_drm_vblank_task_running_locked(struct rk_drm_softc *sc)
 	return (running);
 }
 
+/*
+ * Test-and-set: arm the vblank task if it isn't already.  Returns
+ * true if the caller should actually enqueue (we transitioned
+ * 0 -> 1), false if it was already running (idempotent enable).
+ */
 static bool
 rk_drm_vblank_enable_locked(struct rk_drm_softc *sc)
 {
@@ -446,6 +526,7 @@ rk_drm_vblank_enable_locked(struct rk_drm_softc *sc)
 	return (start);
 }
 
+/* Mark the vblank task as no longer scheduled. */
 static void
 rk_drm_vblank_disable_locked(struct rk_drm_softc *sc)
 {
@@ -454,6 +535,7 @@ rk_drm_vblank_disable_locked(struct rk_drm_softc *sc)
 	mtx_unlock(&sc->hw_lock);
 }
 
+/* Initialize HPD task state at the start of polling. */
 static void
 rk_drm_hpd_start_locked(struct rk_drm_softc *sc, bool initial_hpd)
 {
@@ -465,6 +547,7 @@ rk_drm_hpd_start_locked(struct rk_drm_softc *sc, bool initial_hpd)
 	mtx_unlock(&sc->hw_lock);
 }
 
+/* Mark the HPD task as no longer scheduled (does not cancel the callout). */
 static void
 rk_drm_hpd_stop_locked(struct rk_drm_softc *sc)
 {
@@ -473,6 +556,7 @@ rk_drm_hpd_stop_locked(struct rk_drm_softc *sc)
 	mtx_unlock(&sc->hw_lock);
 }
 
+/* Cancel a pending page flip, freeing its event and dropping vblank ref. */
 static void
 rk_drm_cancel_page_flip(struct rk_drm_softc *sc, struct drm_file *file_priv)
 {
@@ -511,6 +595,7 @@ rk_drm_cancel_page_flip(struct rk_drm_softc *sc, struct drm_file *file_priv)
 	drm_vblank_put(&sc->drm_dev, pipe);
 }
 
+/* Periodic taskqueue body that emulates vblank: handles pending flips, fires events, reschedules. */
 static void
 rk_drm_vblank_task(void *arg, int pending)
 {
@@ -584,6 +669,7 @@ rk_drm_vblank_task(void *arg, int pending)
 		    sc->vblank_ticks);
 }
 
+/* DRM framebuffer .destroy hook for the boot-time "fixed" fb (no GEM ref). */
 static void
 rk_drm_fixedfb_destroy(struct drm_framebuffer *drm_fb)
 {
@@ -591,6 +677,7 @@ rk_drm_fixedfb_destroy(struct drm_framebuffer *drm_fb)
 	drm_framebuffer_cleanup(drm_fb);
 }
 
+/* No userland export for the fixed fb -- always returns -ENODEV. */
 static int
 rk_drm_fixedfb_create_handle(struct drm_framebuffer *drm_fb,
     struct drm_file *file_priv, unsigned int *handle)
@@ -606,6 +693,7 @@ static const struct drm_framebuffer_funcs rk_drm_fixedfb_funcs = {
 	.create_handle = rk_drm_fixedfb_create_handle,
 };
 
+/* Initialize the boot fb's drm_framebuffer struct in-place (no GEM backing). */
 static int
 rk_drm_fixedfb_alloc(struct drm_device *drm_dev,
     struct drm_mode_fb_cmd2 *mode_cmd, struct rk_drm_fbdev *fbdev)
