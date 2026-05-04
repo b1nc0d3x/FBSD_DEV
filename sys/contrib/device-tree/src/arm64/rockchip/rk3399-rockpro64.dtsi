@@ -99,6 +99,35 @@
 		dais = <&i2s1_p0>;
 	};
 
+	/*
+	 * HDMI audio binding consumed by FreeBSD's audio_soc.c
+	 * (sys/dev/sound/fdt/audio_soc.c).  Ties I2S2 -> HDMI TX path
+	 * through a placeholder dummy-codec so a /dev/dsp0 pcm device
+	 * is created.  The actual HDMI audio block (CTS/N, AudioInfoFrame,
+	 * audio clock) is programmed from rk_drm_hw.c during modeset.
+	 */
+	hdmi_audio_codec: hdmi-audio-codec {
+		compatible = "dummy-codec";
+		#sound-dai-cells = <0>;
+		status = "okay";
+	};
+
+	hdmi_sound: hdmi-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "RK3399-HDMI";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <256>;
+		status = "okay";
+
+		simple-audio-card,cpu {
+			sound-dai = <&i2s2>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&hdmi_audio_codec>;
+		};
+	};
+
 	sound-dit {
 		compatible = "audio-graph-card";
 		label = "SPDIF";
@@ -951,5 +980,10 @@
 };
 
 &vopl_mmu {
+	status = "okay";
+};
+
+/* Enable I2S2 for HDMI audio path -- see hdmi_sound node above. */
+&i2s2 {
 	status = "okay";
 };
