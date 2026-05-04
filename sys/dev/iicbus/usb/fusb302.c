@@ -378,6 +378,16 @@ struct fusb302_softc {
 	 * displays/dongles that don't implement a PD client. */
 	int			skip_pd;
 
+	/*
+	 * PD specification revision to advertise in the message header.
+	 * 1 = PD 2.0, 2 = PD 3.0+ (the chip's SPECREV field is 2 bits).
+	 * Some older sinks reject PD 3.0 headers and only respond to PD
+	 * 2.0; flipping this lets us A/B-test against an unresponsive
+	 * partner without rebuilding the kernel.  Default 2 (PD 3.0)
+	 * matches Linux 4.4 BSP and current spec usage.
+	 */
+	int			pd_spec_rev;
+
 	/* VDM */
 	enum fusb302_vdm_state	vdm_state;
 	int			vdm_send_state;
@@ -689,9 +699,14 @@ fusb302_set_msg_header_locked(struct fusb302_softc *sc)
 	    (sc->notify_data_role << 4));
 	(void)fusb302_update_reg(sc, FUSB_REG_SWITCHES1,
 	    FUSB_SW1_POWERROLE | FUSB_SW1_DATAROLE, val);
-	/* PD spec rev 1 */
+	/*
+	 * PD specification revision -- caller-controlled via sc->pd_spec_rev
+	 * (1 = PD 2.0, 2 = PD 3.0).  Default at attach is 2 (PD 3.0); a
+	 * sysctl can flip this when an unresponsive sink only acks PD 2.0.
+	 */
 	(void)fusb302_update_reg(sc, FUSB_REG_SWITCHES1,
-	    FUSB_SW1_SPECREV, 2u << 5);
+	    FUSB_SW1_SPECREV,
+	    (uint8_t)((sc->pd_spec_rev & 0x3) << 5));
 }
 
 /* Issue a PD layer reset (does not affect CC toggle). */
@@ -2826,6 +2841,9 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "skip_pd",
 	    CTLFLAG_RW, &sc->skip_pd, 0,
 	    "1=skip PD negotiation as sink, jump straight to passive DP defaults");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "pd_spec_rev",
+	    CTLFLAG_RW, &sc->pd_spec_rev, 0,
+	    "PD spec rev to advertise: 1=PD 2.0, 2=PD 3.0 (effective on next attach)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "conn_state",
 	    CTLFLAG_RD, (int *)&sc->conn_state, 0,
 	    "Current connection state (enum fusb302_conn_state)");
@@ -2933,6 +2951,13 @@ fusb302_attach(device_t dev)
 	device_printf(dev, "toggle role preference: %s\n",
 	    sc->role_pref == FUSB_ROLE_SRC ? "source-only" :
 	    sc->role_pref == FUSB_ROLE_SNK ? "sink-only" : "DRP");
+
+	sc->pd_spec_rev = 2;	/* default: PD 3.0 */
+	TUNABLE_INT_FETCH("hw.fusb302.pd_spec_rev", &sc->pd_spec_rev);
+	if (sc->pd_spec_rev < 1 || sc->pd_spec_rev > 2)
+		sc->pd_spec_rev = 2;
+	device_printf(dev, "PD spec rev advertise: PD %s\n",
+	    sc->pd_spec_rev == 1 ? "2.0" : "3.0");
 
 	sc->skip_pd = 0;
 	TUNABLE_INT_FETCH("hw.fusb302.skip_pd", &sc->skip_pd);
