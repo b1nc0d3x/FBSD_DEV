@@ -10,6 +10,7 @@
 
 #include <sys/mutex.h>
 #include <sys/taskqueue.h>
+#include <sys/callout.h>
 
 #define RK_DRM_DRIVER_NAME        "rk_drm"
 #define RK_DRM_DRIVER_DESC        "RK3399 DRM/KMS EDID-bounded modeset"
@@ -73,6 +74,10 @@ struct rk_drm_softc {
 	size_t			fb_size;
 	uint32_t		stride;
 
+	struct callout		audio_refill_co;
+	vm_offset_t		i2s2_va;
+	bool			audio_refill_running;
+
 	bus_space_handle_t	vop_bsh;
 	bus_space_handle_t	grf_bsh;
 	bus_space_handle_t	pmu_bsh;
@@ -103,9 +108,17 @@ void	rk_drm_hw_detach(struct rk_drm_softc *sc);
 bool	rk_drm_hw_mode_valid(const struct drm_display_mode *mode);
 int	rk_drm_hw_modeset(struct rk_drm_softc *sc,
 	    const struct drm_display_mode *mode);
+int	rk_drm_hw_modeset_dp(struct rk_drm_softc *sc,
+	    const struct drm_display_mode *mode);
+void	rk_drm_default_mode_fill(struct drm_display_mode *mode);
 void	rk_drm_hw_disable(struct rk_drm_softc *sc);
 int	rk_drm_hw_set_scanout(struct rk_drm_softc *sc, vm_paddr_t paddr,
 	    uint32_t stride);
 bool	rk_drm_hw_hpd(struct rk_drm_softc *sc);
+void	rk_drm_hw_audio_dump(struct rk_drm_softc *sc);
+void	rk_drm_hw_audio_i2s_probe(struct rk_drm_softc *sc);
+void	rk_drm_hw_audio_i2s_start(struct rk_drm_softc *sc);
+int	rk_drm_hw_audio_i2s_refill_start(struct rk_drm_softc *sc);
+void	rk_drm_hw_audio_i2s_refill_stop(struct rk_drm_softc *sc);
 
 #endif /* _ARM64_ROCKCHIP_RK_DRM_H_ */

@@ -25,8 +25,12 @@ options		ALT_BREAK_TO_DEBUGGER
 
 # rk3399_power must be compiled in: rk_cdn_dp resolves rk3399_power_enable_domain
 # as a direct kernel symbol (not through module dependency chain).
-# drm2/rk_drm/fbd are NOT compiled in: the Linux KPI SYSINIT chain hangs boot
-# on arm64 because linux_compat_init runs before the scheduler is live.
-# fusb302 is NOT compiled in: crashes on boot when compiled into the kernel;
-# load as a module post-boot instead (kld_list in rc.conf).
+# fusb302 left as module: had crashed when compiled in earlier; revisit later.
+# fbd / drm2 / rk_drm: re-enabled — armbsd board (.9) successfully boots
+# with these compiled in, contradicting the earlier SYSINIT-hang note.  If a
+# hang reappears with the cdn_dp work in place, recover via DDB / serial and
+# revert to the previous (drm2-disabled) variant.
 device		rk3399_power
+device		fbd
+device		drm2
+device		rk_drm

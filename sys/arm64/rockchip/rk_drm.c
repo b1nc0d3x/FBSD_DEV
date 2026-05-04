@@ -177,6 +177,166 @@ rk_drm_hw_modeset_locked(struct rk_drm_softc *sc,
 	return (error);
 }
 
+static int
+rk_drm_hw_modeset_dp_locked(struct rk_drm_softc *sc,
+    const struct drm_display_mode *mode)
+{
+	int error;
+
+	mtx_lock(&sc->hw_lock);
+	error = rk_drm_hw_modeset_dp(sc, mode);
+	mtx_unlock(&sc->hw_lock);
+	return (error);
+}
+
+/*
+ * Sysctl handler: write 1 to dev.rk_drm.0.dp_modeset_now to drive the
+ * VOP -> eDP path with a hardcoded 1080p60 timing. Caller is expected
+ * to have run rk_cdn_dp stages 1..19 first so the firmware framer is
+ * ready to consume pixels.
+ */
+static int
+rk_drm_sysctl_dp_modeset_now(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	struct drm_display_mode mode;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	rk_drm_default_mode_fill(&mode);	/* 1920x1080@60 baseline */
+	return (rk_drm_hw_modeset_dp_locked(sc, &mode));
+}
+
+/*
+ * rk_drm_sysctl_audio_dump
+ *
+ * Sysctl handler for `dev.rk_drm.<unit>.audio_dump`.  Writing 1 to
+ * the sysctl triggers a one-shot read-back of the HDMI audio block
+ * registers, with the result printed to dmesg via
+ * rk_drm_hw_audio_dump().  Reads return 0 with no side effect.  Any
+ * value other than 1 on write returns EINVAL so we do not overload
+ * the sysctl with future expansion semantics.
+ *
+ * Holds sc->hw_lock for the duration of the read so we do not race
+ * with a concurrent modeset that may be reprogramming the same
+ * registers.
+ */
+static int
+rk_drm_sysctl_audio_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	mtx_lock(&sc->hw_lock);
+	rk_drm_hw_audio_dump(sc);
+	mtx_unlock(&sc->hw_lock);
+	return (0);
+}
+
+/*
+ * rk_drm_sysctl_audio_i2s_probe
+ *
+ * Sysctl handler for `dev.rk_drm.<unit>.audio_i2s_probe`.  Stage 2
+ * reconnaissance: writing 1 transiently maps the I2S2 controller and
+ * reads its register file to determine whether the block is reachable
+ * (clock gates ungated) or dormant.  Output goes to dmesg.
+ *
+ * No locking required — the probe touches I2S2 registers only, not
+ * shared rk_drm state.  Used to decide whether subsequent Stage 2
+ * code needs to do CRU work or can program I2S2 directly.
+ */
+static int
+rk_drm_sysctl_audio_i2s_probe(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	rk_drm_hw_audio_i2s_probe(sc);
+	return (0);
+}
+
+/*
+ * rk_drm_sysctl_audio_refill
+ *
+ * Sysctl handler for `dev.rk_drm.<unit>.audio_refill`.  Writing 1
+ * begins continuous-silence refill of I2S2 (a callout reseeds the TX
+ * FIFO with zeros every 500us so the HDMI TX gets a stable BCLK /
+ * LRCK / SDATA stream forever).  Writing 0 stops the callout and
+ * clears XFER.  Reads return the current running state.
+ *
+ * Used to give the HDMI sink stable audio frames so it can detect
+ * audio activity without us needing a full PCM source path.
+ */
+static int
+rk_drm_sysctl_audio_refill(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val;
+
+	sc = arg1;
+	val = sc->audio_refill_running ? 1 : 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val == 1)
+		return (rk_drm_hw_audio_i2s_refill_start(sc));
+	if (val == 0) {
+		rk_drm_hw_audio_i2s_refill_stop(sc);
+		return (0);
+	}
+	return (EINVAL);
+}
+
+/*
+ * rk_drm_sysctl_audio_i2s_start
+ *
+ * Sysctl handler for `dev.rk_drm.<unit>.audio_i2s_start`.  Writing 1
+ * pre-seeds the I2S2 TX FIFO with zero samples and toggles XFER to
+ * begin clocking.  This drives the HDMI TX's audio input with real
+ * BCLK / LRCK / SDATA for ~666 us (one FIFO depth at 48 kHz stereo
+ * 16-bit) so the sink observes audio activity.  After the brief
+ * burst the FIFO underruns and clocks stop — sustained playback is
+ * out of scope and requires DMA refill.
+ *
+ * No locking required — touches I2S2 registers only.
+ */
+static int
+rk_drm_sysctl_audio_i2s_start(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	rk_drm_hw_audio_i2s_start(sc);
+	return (0);
+}
+
 static void
 rk_drm_hw_disable_locked(struct rk_drm_softc *sc)
 {
@@ -1557,6 +1717,7 @@ rk_drm_drm_load(struct drm_device *drm_dev, unsigned long flags)
 	    rk_drm_vblank_task, sc);
 	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->hpd_task, 0, rk_drm_hpd_task,
 	    sc);
+	callout_init(&sc->audio_refill_co, 1);
 	rk_drm_hpd_start_locked(sc, rk_drm_hw_hpd_locked(sc));
 	taskqueue_enqueue_timeout(taskqueue_thread, &sc->hpd_task, hz);
 	return (0);
@@ -1654,6 +1815,41 @@ rk_drm_attach(device_t dev)
 	sc->drm_registered = true;
 	device_printf(dev, "registered DRM device with EDID-bounded modeset\n");
 
+	{
+		struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(dev);
+		struct sysctl_oid *tree = device_get_sysctl_tree(dev);
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "dp_modeset_now",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_dp_modeset_now, "I",
+		    "Write 1 to drive VOP -> eDP path with 1080p60 (run rk_cdn_dp stages 1..19 first)");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "audio_dump",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_audio_dump, "I",
+		    "Write 1 to dump HDMI audio register state to dmesg");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "audio_i2s_probe",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_audio_i2s_probe, "I",
+		    "Write 1 to probe I2S2 (HDMI audio source) register state");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "audio_i2s_start",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_audio_i2s_start, "I",
+		    "Write 1 to seed I2S2 FIFO and start TX (brief silence burst)");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "audio_refill",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_audio_refill, "I",
+		    "Write 1 to start continuous I2S2 silence refill, 0 to stop");
+	}
+
 	return (0);
 }
 
@@ -1667,6 +1863,7 @@ rk_drm_detach(device_t dev)
 		drm_put_dev(&sc->drm_dev);
 		sc->drm_registered = false;
 	}
+	rk_drm_hw_audio_i2s_refill_stop(sc);
 	rk_drm_hw_detach(sc);
 	mtx_destroy(&sc->hw_lock);
 	return (0);

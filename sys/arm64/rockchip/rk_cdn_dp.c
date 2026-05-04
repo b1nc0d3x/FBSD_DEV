@@ -1660,6 +1660,119 @@ rk_cdn_dp_sysctl_aux_status(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_int(oidp, &val, 0, req));
 }
 
+/*
+ * Pulse HPD low for 500ms then back high, forcing the sink's DP RX to
+ * re-detect us.  Useful when the display's AUX channel has gone deaf —
+ * a fresh HPD edge often resets its receiver state.
+ *
+ * Uses mailbox WRITE_REGISTER instead of direct MMIO: when this sysctl
+ * runs out of band (after stages 1..12 have completed and idle time
+ * has elapsed), the APB clock that backs SYS_CTL_3 is gated by the
+ * firmware and a direct bus_read_4 panics with an external data abort.
+ * Routing through the mailbox lets the firmware ungate the APB itself.
+ */
+static int
+rk_cdn_dp_hpd_pulse(struct rk_cdn_dp_softc *sc)
+{
+	uint32_t base = RK_CDN_DP_SYS_CTL_3_HPD_CTRL;	/* SW-controlled HPD */
+	int error;
+
+	error = rk_cdn_dp_mailbox_reg_write(sc, RK_CDN_DP_SYS_CTL_3, base);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "hpd_pulse: mailbox write SYS_CTL_3 (HPD low) failed (%d)\n",
+		    error);
+		return (error);
+	}
+	device_printf(sc->dev, "hpd_pulse: HPD low (SYS_CTL_3=0x%08x)\n",
+	    base);
+
+	DELAY(500000);	/* 500ms */
+
+	error = rk_cdn_dp_mailbox_reg_write(sc, RK_CDN_DP_SYS_CTL_3,
+	    base | RK_CDN_DP_SYS_CTL_3_F_HPD);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "hpd_pulse: mailbox write SYS_CTL_3 (HPD high) failed (%d)\n",
+		    error);
+		return (error);
+	}
+	device_printf(sc->dev, "hpd_pulse: HPD high (SYS_CTL_3=0x%08x)\n",
+	    base | RK_CDN_DP_SYS_CTL_3_F_HPD);
+
+	DELAY(100000);	/* 100ms settle before any AUX */
+	return (0);
+}
+
+static int
+rk_cdn_dp_sysctl_hpd_pulse(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	error = rk_cdn_dp_hpd_pulse(sc);
+	sx_sunlock(&sc->detach_sx);
+	return (error);
+}
+
+/*
+ * Try to wake the sink via DPCD SET_POWER (0x600): write D3 (sleep),
+ * brief delay, write D0 (active).  Uses the AUX channel itself, so it
+ * only helps in the (uncommon) case where the sink ACKs writes but
+ * NACKs reads.
+ */
+static int
+rk_cdn_dp_aux_wake(struct rk_cdn_dp_softc *sc)
+{
+	uint8_t d3 = 0x02, d0 = 0x01;
+	int error;
+
+	error = rk_cdn_dp_mailbox_dpcd_write(sc, 0x600, &d3, 1);
+	device_printf(sc->dev, "aux_wake: DPCD 0x600 <- D3 result=%d\n",
+	    error);
+	DELAY(50000);	/* 50ms */
+	error = rk_cdn_dp_mailbox_dpcd_write(sc, 0x600, &d0, 1);
+	device_printf(sc->dev, "aux_wake: DPCD 0x600 <- D0 result=%d\n",
+	    error);
+	DELAY(50000);
+	return (error);
+}
+
+static int
+rk_cdn_dp_sysctl_aux_wake(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	error = rk_cdn_dp_aux_wake(sc);
+	sx_sunlock(&sc->detach_sx);
+	return (error);
+}
+
 static int
 rk_cdn_dp_sysctl_edid_now(SYSCTL_HANDLER_ARGS)
 {
@@ -4550,6 +4663,14 @@ rk_cdn_dp_attach(device_t dev)
 	    "edid_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_edid_now, "I",
 	    "Write 1 to read EDID block 0 via DPTX_GET_EDID mailbox without going through the stage walker");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "hpd_pulse_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_hpd_pulse, "I",
+	    "Write 1 to drive HPD low for 500ms then high, forcing sink DP RX re-detect");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "aux_wake_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_aux_wake, "I",
+	    "Write 1 to attempt DPCD SET_POWER D3 -> D0 to wake the sink");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "dp_altmode_valid", CTLFLAG_RD, &sc->dp_altmode_valid, 0,
 	    "Last observed DP Alt Mode helper presence");

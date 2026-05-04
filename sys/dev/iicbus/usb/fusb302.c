@@ -107,7 +107,7 @@
 #define	FUSB_SW1_POWERROLE	0x80
 
 /* CONTROL0 bits */
-#define	FUSB_CTL0_HOST_CUR_DEF	0x04
+#define	FUSB_CTL0_HOST_CUR_DEF	0x02	/* bits[2:1]=01 = USB-default 80uA Rp */
 #define	FUSB_CTL0_INT_MASK	0x20
 
 /* CONTROL1 bits */
@@ -1333,7 +1333,7 @@ fusb302_auto_vdm_machine_locked(struct fusb302_softc *sc, uint32_t evt)
  * several src_caps transmissions get RETRYFAIL even though the sink is
  * PD-capable.
  */
-#define	T_ATTACH_WAIT_MS	400
+#define	T_ATTACH_WAIT_MS	1500
 
 static void
 fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
@@ -1418,10 +1418,11 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 			}
 		}
 
+		sc->vconn_enabled = true;
 		fusb302_set_polarity_locked(sc, polarity);
-		device_printf(sc->dev, "attached as DFP on CC%d, "
+		device_printf(sc->dev, "attached as DFP on CC%d, VCONN on CC%d, "
 		    "waiting %dms for sink PD init\n",
-		    polarity + 1, T_ATTACH_WAIT_MS);
+		    polarity + 1, (polarity == 0) ? 2 : 1, T_ATTACH_WAIT_MS);
 		fusb302_start_state_timer(sc, T_ATTACH_WAIT_MS);
 		sc->sub_state++;
 		break;
@@ -1478,23 +1479,18 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 			    sc->caps_counter);
 			if (sc->caps_counter >= 50) {
 				/*
-				 * No GoodCRC after 50 attempts: passive USB-C
-				 * cable/adapter with no PD controller (e.g. a
-				 * direct USB-C-to-display cable using a signal
-				 * mux like HD3SS3220).  CC orientation is known
-				 * from TOGDONE; publish a true DP-only fallback
-				 * so rk_cdn_dp sees 4-lane semantics
-				 * (usb_ss=0) without waiting for VDM
-				 * negotiation.
+				 * No GoodCRC from partner after N_CAPS_COUNT
+				 * attempts.  Per USB-PD, give up and leave the
+				 * DP altmode state untouched: a USB-C display
+				 * only enters DP altmode after a real VDM
+				 * exchange, and synthesizing fake altmode here
+				 * would mislead the DP TX driver into driving
+				 * AUX into an unswitched port.
 				 */
-				sc->notify_is_enter_mode = true;
-				sc->notify_pin_def = DP_PIN_E;
-				sc->notify_dp_status = (1u << 7); /* HPD high */
-				fusb302_notify_dp_locked(sc);
 				device_printf(sc->dev,
-				    "send_caps: passive cable on CC%d, "
-				    "exporting 4-lane DP defaults\n",
-				    sc->cc_polarity + 1);
+				    "send_caps: giving up after %d attempts on "
+				    "CC%d (no PD partner)\n",
+				    sc->caps_counter, sc->cc_polarity + 1);
 				fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
 			}
 			else {
@@ -1841,12 +1837,9 @@ fusb302_state_snk_discovery_locked(struct fusb302_softc *sc, uint32_t evt)
 	if (evt & FUSB_EVT_TIMER_STATE) {
 		if (sc->skip_pd) {
 			device_printf(sc->dev,
-			    "snk: skip_pd=1, no PD; exporting 4-lane DP "
-			    "defaults on CC%d\n", sc->cc_polarity + 1);
-			sc->notify_is_enter_mode = true;
-			sc->notify_pin_def = DP_PIN_E;
-			sc->notify_dp_status = (1u << 7);
-			fusb302_notify_dp_locked(sc);
+			    "snk: skip_pd=1, no PD on CC%d; going DISABLED "
+			    "(no DP altmode without real VDM)\n",
+			    sc->cc_polarity + 1);
 			fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
 		} else if (sc->hardrst_count <= N_SNK_HARDRESET_RETRY) {
 			device_printf(sc->dev,
@@ -1858,21 +1851,9 @@ fusb302_state_snk_discovery_locked(struct fusb302_softc *sc, uint32_t evt)
 			    FUSB_ST_SNK_SEND_HARDRST);
 		} else {
 			device_printf(sc->dev,
-			    "snk: partner not PD-capable after %d retries; "
-			    "exporting 4-lane DP defaults on CC%d, going "
-			    "DISABLED\n",
+			    "snk: partner not PD-capable after %d retries on "
+			    "CC%d; going DISABLED\n",
 			    N_SNK_HARDRESET_RETRY + 1, sc->cc_polarity + 1);
-			/*
-			 * Hand cdn_dp a best-guess Alt Mode state so it can
-			 * still try to bring DP up without a PD contract.
-			 * Use a true DP-only pin assignment so the exported
-			 * usb_ss state is internally consistent with the
-			 * intended 4-lane fallback.
-			 */
-			sc->notify_is_enter_mode = true;
-			sc->notify_pin_def = DP_PIN_E;
-			sc->notify_dp_status = (1u << 7); /* HPD high */
-			fusb302_notify_dp_locked(sc);
 			fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
 		}
 	}
@@ -2753,14 +2734,60 @@ fusb302_sysctl_reg(SYSCTL_HANDLER_ARGS)
 	sc = arg1;
 	reg = (uint8_t)arg2;
 
-	mtx_lock(&sc->mtx);
+	/*
+	 * Do NOT hold sc->mtx across the I2C read.  fusb302_read_reg ->
+	 * iicdev_readfrom -> rk_i2c_transfer -> _sleep, and sc->mtx is
+	 * MTX_DEF (non-sleepable).  If irq_task races us on sc->mtx while
+	 * we're sleeping, propagate_priority panics with
+	 * "sleeping thread holds fusb3020".
+	 */
 	error = fusb302_read_reg(sc, reg, &val);
-	mtx_unlock(&sc->mtx);
 	if (error != 0)
 		return (error);
 
 	ival = val;
 	return (sysctl_handle_int(oidp, &ival, 0, req));
+}
+
+/*
+ * vbus_cycle_now: drop the USB-C VBUS regulator (SY6280AAC on RockPro64)
+ * for 1.5s then re-enable, forcing the attached USB-C display through a
+ * full power-cycle.  Used to recover from a sink whose DP RX has gone
+ * deaf to AUX without responding to HPD pulses.
+ */
+static int
+fusb302_sysctl_vbus_cycle(SYSCTL_HANDLER_ARGS)
+{
+	struct fusb302_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	if (sc->vbus_supply == NULL) {
+		device_printf(sc->dev,
+		    "vbus_cycle: no regulator handle, nothing to do\n");
+		return (ENXIO);
+	}
+
+	device_printf(sc->dev, "vbus_cycle: dropping VBUS\n");
+	if (sc->vbus_enabled) {
+		(void)regulator_disable(sc->vbus_supply);
+		sc->vbus_enabled = false;
+	}
+	pause("vbusoff", hz * 3 / 2);	/* 1.5s */
+	device_printf(sc->dev, "vbus_cycle: restoring VBUS\n");
+	error = regulator_enable(sc->vbus_supply);
+	if (error == 0)
+		sc->vbus_enabled = true;
+	else
+		device_printf(sc->dev,
+		    "vbus_cycle: regulator_enable failed (%d)\n", error);
+	return (error);
 }
 
 static void
@@ -2808,6 +2835,11 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "pos_power",
 	    CTLFLAG_RD, &sc->pos_power, 0,
 	    "Selected partner-source PDO position (sink role)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "vbus_cycle_now",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    fusb302_sysctl_vbus_cycle, "I",
+	    "Write 1 to drop VBUS for 1.5s then re-enable, forcing the attached USB-C display through a power-cycle");
 }
 
 /* -----------------------------------------------------------------------
@@ -3069,10 +3101,40 @@ fusb302_detach(device_t dev)
 	return (0);
 }
 
+/*
+ * fusb302_shutdown
+ *
+ * device_shutdown method, fired during `shutdown -p` / `reboot` while
+ * the kernel is still up and able to do I2C transactions.  Its sole
+ * job is to keep the FUSB302's INT_N output from continuing to fire
+ * after the kernel has begun tearing down GPIO interrupt plumbing.
+ *
+ * Background: FUSB302 drives INT_N as a level-triggered open-drain
+ * pulled by GPIO1 on RockPro64.  After kernel teardown removes our
+ * IRQ handler but the chip is still asserting INT_N, the bare GPIO
+ * controller raises an unhandled-interrupt warning every PD event,
+ * flooding the serial console with `gpio1: Interrupt pin=2 unhandled`
+ * for the rest of the shutdown.  Setting INT_MASK in CONTROL0 makes
+ * the chip stop driving INT_N regardless of internal state, so the
+ * shutdown sequence is silent.  Returns 0 unconditionally — failure
+ * to write the register is harmless (we just get the storm).
+ */
+static int
+fusb302_shutdown(device_t dev)
+{
+	struct fusb302_softc *sc;
+
+	sc = device_get_softc(dev);
+	(void)fusb302_write_reg(sc, FUSB_REG_CONTROL0,
+	    FUSB_CTL0_HOST_CUR_DEF | FUSB_CTL0_INT_MASK);
+	return (0);
+}
+
 static device_method_t fusb302_methods[] = {
 	DEVMETHOD(device_probe,		fusb302_probe),
 	DEVMETHOD(device_attach,	fusb302_attach),
 	DEVMETHOD(device_detach,	fusb302_detach),
+	DEVMETHOD(device_shutdown,	fusb302_shutdown),
 	DEVMETHOD_END
 };
 
