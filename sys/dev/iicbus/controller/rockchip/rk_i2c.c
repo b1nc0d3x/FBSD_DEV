@@ -119,6 +119,45 @@ enum rk_i2c_state {
 	STATE_STOP
 };
 
+/*
+ * I2C-bus specification (NXP UM10204) timing parameters per mode.
+ * All values in nanoseconds.  These define minimum (or maximum, for
+ * max_data_hold) hold/setup times that must be met regardless of the
+ * SCL clock rate, so any controller running near the speed limit must
+ * stretch SCL HIGH/LOW to satisfy them.
+ */
+struct rk_i2c_spec_values {
+	unsigned long min_hold_start_ns;	/* tHD;STA */
+	unsigned long min_low_ns;		/* tLOW    */
+	unsigned long min_high_ns;		/* tHIGH   */
+	unsigned long min_setup_start_ns;	/* tSU;STA */
+	unsigned long max_data_hold_ns;		/* tHD;DAT max */
+	unsigned long min_data_setup_ns;	/* tSU;DAT */
+	unsigned long min_setup_stop_ns;	/* tSU;STO */
+	unsigned long min_hold_buffer_ns;	/* tBUF    */
+};
+
+static const struct rk_i2c_spec_values rk_i2c_standard_mode = {
+	.min_hold_start_ns = 4000, .min_low_ns = 4700, .min_high_ns = 4000,
+	.min_setup_start_ns = 4700, .max_data_hold_ns = 3450,
+	.min_data_setup_ns = 250, .min_setup_stop_ns = 4000,
+	.min_hold_buffer_ns = 4700,
+};
+
+static const struct rk_i2c_spec_values rk_i2c_fast_mode = {
+	.min_hold_start_ns = 600, .min_low_ns = 1300, .min_high_ns = 600,
+	.min_setup_start_ns = 600, .max_data_hold_ns = 900,
+	.min_data_setup_ns = 100, .min_setup_stop_ns = 600,
+	.min_hold_buffer_ns = 1300,
+};
+
+static const struct rk_i2c_spec_values rk_i2c_fast_mode_plus = {
+	.min_hold_start_ns = 260, .min_low_ns = 500, .min_high_ns = 260,
+	.min_setup_start_ns = 260, .max_data_hold_ns = 400,
+	.min_data_setup_ns = 50, .min_setup_stop_ns = 260,
+	.min_hold_buffer_ns = 500,
+};
+
 struct rk_i2c_softc {
 	device_t	dev;
 	struct resource	*res[2];
@@ -136,6 +175,11 @@ struct rk_i2c_softc {
 	bool		tx_slave_addr;
 	uint8_t		mode;
 	uint8_t		state;
+
+	/* DT-supplied SCL rise/fall times for tSU;STA + duty cycle calc. */
+	uint32_t	scl_rise_ns;
+	uint32_t	scl_fall_ns;
+	uint32_t	sda_fall_ns;
 
 	device_t	iicbus;
 };
@@ -171,23 +215,125 @@ static int rk_i2c_setup_intr(device_t bus, device_t child, struct resource *irq,
 #define	RK_I2C_READ(sc, reg)		bus_read_4((sc)->res[0], (reg))
 #define	RK_I2C_WRITE(sc, reg, val)	bus_write_4((sc)->res[0], (reg), (val))
 
+static const struct rk_i2c_spec_values *
+rk_i2c_get_spec(uint32_t bus_freq_hz)
+{
+	if (bus_freq_hz <= 100000)
+		return (&rk_i2c_standard_mode);
+	if (bus_freq_hz <= 400000)
+		return (&rk_i2c_fast_mode);
+	return (&rk_i2c_fast_mode_plus);
+}
+
+/*
+ * Compute SCL HIGH/LOW dividers that satisfy the I2C-bus specification
+ * (NXP UM10204) for the requested bus_freq_hz given the controller's
+ * sclk_freq.  Ported from Linux's rk3x_i2c_v0_calc_timings.
+ *
+ * RK3399's I2C controller derives:
+ *   SCL_LOW  = (div_low  + 1) * 8 * (1 / sclk)
+ *   SCL_HIGH = (div_high + 1) * 8 * (1 / sclk)
+ * Plus controller behaviors observed in Linux:
+ *   tSU;STA = 7/8 * SCL_HIGH (controller drops SDA at .875 of clk-high)
+ *   tHD;STA = 2 * SCL_HIGH   (controller keeps SCL high 2x clk-high)
+ *
+ * Spec constraints we satisfy:
+ *   - SCL_LOW  >= max(spec->min_low_ns,  scl_fall_ns + spec->min_low_ns)
+ *   - SCL_HIGH >= max(spec->min_high_ns, scl_rise_ns + spec->min_high_ns)
+ *   - SCL_HIGH * 7/8 >= scl_rise_ns + spec->min_setup_start_ns (tSU;STA)
+ *
+ * Naive (sclk / speed / 16) - 1 with equal HIGH/LOW used to
+ * under-meet tSU;STA at higher SCL rates.
+ */
 static uint32_t
-rk_i2c_get_clkdiv(struct rk_i2c_softc *sc, uint32_t speed)
+rk_i2c_get_clkdiv(struct rk_i2c_softc *sc, uint32_t bus_freq_hz)
 {
 	uint64_t sclk_freq;
-	uint32_t clkdiv;
+	const struct rk_i2c_spec_values *spec;
+	unsigned long min_low_ns, min_high_ns, min_total_ns;
+	unsigned long min_total_div, min_low_div, min_high_div;
+	unsigned long min_div_for_hold, extra_div, ideal_low_div;
+	unsigned long extra_low_div, max_low_div, max_low_ns;
+	unsigned long div_low, div_high;
+	unsigned long clk_rate_khz, scl_rate_khz;
+	const unsigned long data_hold_buffer_ns = 50;
 	int err;
 
 	err = clk_get_freq(sc->sclk, &sclk_freq);
 	if (err != 0)
-		return (err);
+		return (0);
 
-	clkdiv = (sclk_freq / speed / RK_I2C_CLKDIV_MUL / 2) - 1;
-	clkdiv &= RK_I2C_CLKDIVL_MASK;
+	if (bus_freq_hz < 1000)
+		bus_freq_hz = 1000;
+	if (bus_freq_hz > 1000000)
+		bus_freq_hz = 1000000;
 
-	clkdiv = clkdiv << RK_I2C_CLKDIVH_SHIFT | clkdiv;
+	spec = rk_i2c_get_spec(bus_freq_hz);
 
-	return (clkdiv);
+	min_high_ns = sc->scl_rise_ns + spec->min_high_ns;
+	/*
+	 * Two more SCL-HIGH constraints from the controller's tSU;STA
+	 * behavior (drops SDA at 7/8 of clk-high): pick whichever yields
+	 * the longest required min_high_ns.
+	 */
+	{
+		unsigned long a = ((sc->scl_rise_ns + spec->min_setup_start_ns)
+		    * 1000 + 874) / 875;
+		unsigned long b = ((sc->scl_rise_ns + spec->min_setup_start_ns
+		    + sc->sda_fall_ns + spec->min_high_ns) + 1) / 2;
+		if (a > min_high_ns)
+			min_high_ns = a;
+		if (b > min_high_ns)
+			min_high_ns = b;
+	}
+
+	min_low_ns = sc->scl_fall_ns + spec->min_low_ns;
+	max_low_ns = spec->max_data_hold_ns * 2 - data_hold_buffer_ns;
+	min_total_ns = min_low_ns + min_high_ns;
+
+	clk_rate_khz = (sclk_freq + 999) / 1000;
+	scl_rate_khz = bus_freq_hz / 1000;
+
+	min_total_div = (clk_rate_khz + (scl_rate_khz * 8 - 1)) /
+	    (scl_rate_khz * 8);
+
+	min_low_div = (clk_rate_khz * min_low_ns + 8000000 - 1) / 8000000;
+	min_high_div = (clk_rate_khz * min_high_ns + 8000000 - 1) / 8000000;
+	min_div_for_hold = min_low_div + min_high_div;
+
+	max_low_div = clk_rate_khz * max_low_ns / 8000000;
+	if (min_low_div > max_low_div)
+		max_low_div = min_low_div;
+
+	if (min_div_for_hold > min_total_div) {
+		div_low = min_low_div;
+		div_high = min_high_div;
+	} else {
+		extra_div = min_total_div - min_div_for_hold;
+		ideal_low_div = (clk_rate_khz * min_low_ns +
+		    (scl_rate_khz * 8 * min_total_ns - 1)) /
+		    (scl_rate_khz * 8 * min_total_ns);
+		if (ideal_low_div > max_low_div)
+			ideal_low_div = max_low_div;
+		if (ideal_low_div > min_low_div + extra_div)
+			ideal_low_div = min_low_div + extra_div;
+		extra_low_div = ideal_low_div - min_low_div;
+		div_low = ideal_low_div;
+		div_high = min_high_div + (extra_div - extra_low_div);
+	}
+
+	/* The HW has an implicit "+1" so subtract before encoding. */
+	if (div_low > 0)
+		div_low--;
+	if (div_high > 0)
+		div_high--;
+	if (div_low > 0xffff)
+		div_low = 0xffff;
+	if (div_high > 0xffff)
+		div_high = 0xffff;
+
+	return ((div_high << RK_I2C_CLKDIVH_SHIFT) |
+	    (div_low & RK_I2C_CLKDIVL_MASK));
 }
 
 static int
@@ -643,6 +789,23 @@ rk_i2c_attach(device_t dev)
 	sc->dev = dev;
 
 	mtx_init(&sc->mtx, device_get_nameunit(dev), "rk_i2c", MTX_DEF);
+
+	/*
+	 * Read SCL/SDA edge times from FDT.  They reflect PCB layout
+	 * (trace capacitance, pull-up resistance) and feed into the
+	 * spec-compliant SCL HIGH/LOW divider calc.  Defaults are the
+	 * I2C-bus spec assumptions (UM10204 §6) when the DT doesn't
+	 * specify: 1us rise, 300ns fall.
+	 */
+	if (OF_getencprop(ofw_bus_get_node(dev), "i2c-scl-rising-time-ns",
+	    &sc->scl_rise_ns, sizeof(sc->scl_rise_ns)) <= 0)
+		sc->scl_rise_ns = 1000;
+	if (OF_getencprop(ofw_bus_get_node(dev), "i2c-scl-falling-time-ns",
+	    &sc->scl_fall_ns, sizeof(sc->scl_fall_ns)) <= 0)
+		sc->scl_fall_ns = 300;
+	if (OF_getencprop(ofw_bus_get_node(dev), "i2c-sda-falling-time-ns",
+	    &sc->sda_fall_ns, sizeof(sc->sda_fall_ns)) <= 0)
+		sc->sda_fall_ns = sc->scl_fall_ns;
 
 	if (bus_alloc_resources(dev, rk_i2c_spec, sc->res) != 0) {
 		device_printf(dev, "cannot allocate resources for device\n");
