@@ -2255,7 +2255,16 @@ fusb302_toggle_ctl2_locked(struct fusb302_softc *sc)
 		break;
 	case FUSB_ROLE_DRP:
 	default:
-		v |= FUSB_CTL2_MODE_DRP;
+		/*
+		 * TOG_RD_ONLY tells the chip's toggle state machine to only
+		 * stop when it sees Rd (i.e., a partner SNK).  Without it,
+		 * the chip can settle on either Rd or Rp, and on RockPro64
+		 * the partner's DRP toggle phase consistently locked us into
+		 * SNK_CC2.  Linux's i2c-rk3x sets TOG_RD_ONLY for DRP for
+		 * the same reason -- bias the chip toward landing as SRC,
+		 * which is the working configuration on this hardware.
+		 */
+		v |= FUSB_CTL2_MODE_DRP | FUSB_CTL2_TOG_RD_ONLY;
 		break;
 	}
 	return (v);
