@@ -109,6 +109,7 @@
 
 /* 8 data registers, 4 bytes each. */
 #define	RK_I2C_MAX_RXTX_LEN	32
+#define	RK_I2C_RETRIES		3	/* match Linux i2c-rk3x adap.retries */
 
 enum rk_i2c_state {
 	STATE_IDLE = 0,
@@ -486,7 +487,7 @@ rk_i2c_transfer(device_t dev, struct iic_msg *msgs, uint32_t nmsgs)
 	struct rk_i2c_softc *sc;
 	uint32_t reg;
 	bool last_msg;
-	int i, j, timeout, err;
+	int i, j, timeout, err, attempt;
 
 	sc = device_get_softc(dev);
 
@@ -496,6 +497,17 @@ rk_i2c_transfer(device_t dev, struct iic_msg *msgs, uint32_t nmsgs)
 		mtx_sleep(sc, &sc->mtx, 0, "i2cbuswait", 0);
 	sc->busy = 1;
 
+	/*
+	 * Retry the entire transfer up to RK_I2C_RETRIES times on
+	 * IIC_ENOACK (NAK).  Slaves like FUSB302 occasionally NAK
+	 * mid-stream when their internal logic is busy; a fresh
+	 * start with bus arbitration usually succeeds.  Linux's
+	 * i2c-rk3x sets adap.retries=3 to drive the same behavior
+	 * from the I2C core.  Other errors (timeout, bus error) do
+	 * not retry -- they indicate something more serious.
+	 */
+	attempt = 0;
+retry:
 	/* Disable the module and interrupts */
 	RK_I2C_WRITE(sc, RK_I2C_CON, 0);
 	RK_I2C_WRITE(sc, RK_I2C_IEN, 0);
@@ -503,6 +515,7 @@ rk_i2c_transfer(device_t dev, struct iic_msg *msgs, uint32_t nmsgs)
 	/* Clean stale interrupts */
 	RK_I2C_WRITE(sc, RK_I2C_IPD, RK_I2C_IPD_ALL);
 
+	sc->nak_recv = false;
 	err = 0;
 	for (i = 0; i < nmsgs; i++) {
 		/* Validate parameters. */
@@ -592,10 +605,16 @@ rk_i2c_transfer(device_t dev, struct iic_msg *msgs, uint32_t nmsgs)
 	RK_I2C_WRITE(sc, RK_I2C_CON, 0);
 	RK_I2C_WRITE(sc, RK_I2C_IEN, 0);
 
-	sc->busy = 0;
-
 	if (sc->nak_recv)
 		err = IIC_ENOACK;
+
+	if (err == IIC_ENOACK && attempt < RK_I2C_RETRIES) {
+		attempt++;
+		DELAY(200);	/* let the bus settle */
+		goto retry;
+	}
+
+	sc->busy = 0;
 
 	RK_I2C_UNLOCK(sc);
 	return (err);
