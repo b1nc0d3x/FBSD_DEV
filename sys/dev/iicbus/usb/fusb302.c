@@ -2953,10 +2953,30 @@ fusb302_try_ofw_irq(struct fusb302_softc *sc)
 static int
 fusb302_probe(device_t dev)
 {
+	uint8_t buf;
+
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
 	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
 		return (ENXIO);
+
+	/*
+	 * Silence the chip's INT_N output as the very first thing we do.
+	 * The chip remembers CONTROL0 across kernel reboots; if a previous
+	 * run cleared INT_MASK and we crash/reboot before detach silences
+	 * it, the chip keeps pulling its INT_N (open-drain to gpio1) low.
+	 * gpio1 then floods the console with "Interrupt pin=2 unhandled"
+	 * for the entire window between rk_gpio attach and fusb302 attach
+	 * registering an IRQ filter.
+	 *
+	 * Probe is the earliest place we have an I2C path to the chip, so
+	 * write CONTROL0 = HOST_CUR_DEF | INT_MASK here.  The chip-side
+	 * INT_N goes high (de-asserted) as soon as this write lands; the
+	 * GPIO controller never sees a stuck pin.  Failure is harmless --
+	 * if the I2C transaction fails attach will retry the write.
+	 */
+	buf = FUSB_CTL0_HOST_CUR_DEF | FUSB_CTL0_INT_MASK;
+	(void)iicdev_writeto(dev, FUSB_REG_CONTROL0, &buf, 1, IIC_WAIT);
 
 	device_set_desc(dev, "Fairchild FUSB302 Type-C PD controller");
 	return (BUS_PROBE_DEFAULT);

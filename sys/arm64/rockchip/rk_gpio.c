@@ -227,8 +227,22 @@ rk_gpio_intr(void *arg)
 
 		status &= ~(1 << pin);
 		if (intr_isrc_dispatch(RK_GPIO_ISRC(sc, pin), tf)) {
-			device_printf(sc->sc_dev, "Interrupt pin=%d unhandled\n",
-			    pin);
+			/*
+			 * Pin asserted but no consumer is registered for it
+			 * yet (or anymore).  Level-triggered sources keep
+			 * firing on every interrupt cycle, so a single stuck
+			 * pin floods the console with thousands of these
+			 * messages per second.  Mask the pin's IRQ at the
+			 * controller and disable further dispatches; if a
+			 * consumer attaches later it will re-enable through
+			 * pic_enable_intr / rk_gpio_pic_enable_intr.
+			 */
+			RK_GPIO_LOCK(sc);
+			rk_gpio_write_bit(sc, RK_GPIO_INTMASK, pin, 1);
+			rk_gpio_write_bit(sc, RK_GPIO_INTEN, pin, 0);
+			RK_GPIO_UNLOCK(sc);
+			device_printf(sc->sc_dev,
+			    "Interrupt pin=%d unhandled — masked\n", pin);
 			continue;
 		}
 
