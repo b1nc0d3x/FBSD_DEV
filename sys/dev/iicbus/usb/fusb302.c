@@ -72,6 +72,9 @@
 #define	FUSB_REG_SWITCHES0	0x02
 #define	FUSB_REG_SWITCHES1	0x03
 #define	FUSB_REG_MEASURE	0x04
+#define	FUSB_REG_SLICE		0x05	/* BMC slicer threshold; bits 5:0 SDAC,
+					 * LSB ~42mV.  Default 0x60 = SDAC=0x20
+					 * (~840mV) + 1-bit hysteresis. */
 #define	FUSB_REG_CONTROL0	0x06
 #define	FUSB_REG_CONTROL1	0x07
 #define	FUSB_REG_CONTROL2	0x08
@@ -179,7 +182,13 @@
 #define	FUSB_INTRB_GCRCSENT	0x01
 
 /* Interrupt mask register initial values for PD operation */
-#define	FUSB_MASK1_PD		0x75	/* unmask COLLISION, ALERT, VBUSOK */
+#define	FUSB_MASK1_PD		0x25	/* unmask COLLISION, ALERT, VBUSOK,
+					   ACTIVITY, CRC_CHK -- need ACTIVITY +
+					   CRC_CHK to see whether the partner
+					   ever drives the wire / replies with
+					   a decodable packet, otherwise we
+					   have no visibility into why
+					   RETRYFAIL keeps firing */
 #define	FUSB_MASKA_PD		0xa2	/* unmask TOGDONE,TXSENT,HARDSENT,RETRYFAIL,HARDRST */
 #define	FUSB_MASKB_PD		0xfe	/* unmask GCRCSENT */
 
@@ -391,6 +400,18 @@ struct fusb302_softc {
 	 */
 	int			pd_spec_rev;
 
+	/*
+	 * BMC slicer DAC value (SLICE register bits 5:0).  Sets the
+	 * threshold the chip's BMC receiver uses to slice incoming CC
+	 * voltage edges into ones and zeros.  Default 0x20 (~840 mV)
+	 * matches the chip reset value.  Lower values = more sensitive
+	 * to weaker incoming pulses; useful when ACTIVITY fires on the
+	 * wire but no CRC_CHK ever validates (cable signal-integrity
+	 * margin issue).  Tunable via hw.fusb302.slice_sdac and the
+	 * dev.fusb302.0.slice_sdac sysctl.
+	 */
+	int			slice_sdac;
+
 	/* VDM */
 	enum fusb302_vdm_state	vdm_state;
 	int			vdm_send_state;
@@ -453,6 +474,7 @@ static void	fusb302_irq_task(void *context, int pending);
 static int	fusb302_intr(void *context);
 static void	fusb302_timer_state_cb(void *arg);
 extern const struct usbc_tcpc_ops fusb302_tcpc_ops;
+static int	fusb302_sysctl_slice_sdac(SYSCTL_HANDLER_ARGS);
 int		fusb302_get_typec_status(device_t dev,
 		    struct fusb302_typec_status *status);
 int		fusb302_get_dp_altmode_state(device_t dev,
@@ -627,6 +649,19 @@ fusb302_fifo_write_locked(struct fusb302_softc *sc)
 	senddata[pos++] = FUSB_TKN_EOP;
 	senddata[pos++] = FUSB_TKN_TXOFF;
 	senddata[pos++] = FUSB_TKN_TXON;
+
+	{
+		char hex[3 * 40 + 1];
+		int i, n;
+
+		n = 0;
+		for (i = 0; i < pos && i < 40; i++)
+			n += snprintf(hex + n, sizeof(hex) - n,
+			    "%s%02x", i ? " " : "", senddata[i]);
+		device_printf(sc->dev,
+		    "fifo TX [%d B] hdr=0x%04x ndo=%d: %s\n",
+		    pos, sc->send_head, PD_HDR_CNT(sc->send_head), hex);
+	}
 
 	error = iicdev_writeto(sc->dev, FUSB_REG_FIFO, senddata, pos,
 	    IIC_WAIT);
@@ -1504,10 +1539,23 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
 			sc->sub_state++;
 		} else if (tmp == FUSB_TX_FAILED) {
+			uint8_t intr, intra, intrb, st0, st1, ctl3, sw0, sw1;
+
 			sc->caps_counter++;
+			(void)fusb302_read_reg(sc, FUSB_REG_INTERRUPT, &intr);
+			(void)fusb302_read_reg(sc, FUSB_REG_INTERRUPTA, &intra);
+			(void)fusb302_read_reg(sc, FUSB_REG_INTERRUPTB, &intrb);
+			(void)fusb302_read_reg(sc, FUSB_REG_STATUS0, &st0);
+			(void)fusb302_read_reg(sc, FUSB_REG_STATUS1, &st1);
+			(void)fusb302_read_reg(sc, FUSB_REG_CONTROL3, &ctl3);
+			(void)fusb302_read_reg(sc, FUSB_REG_SWITCHES0, &sw0);
+			(void)fusb302_read_reg(sc, FUSB_REG_SWITCHES1, &sw1);
 			device_printf(sc->dev,
-			    "send_caps: RETRYFAIL caps_counter=%d\n",
-			    sc->caps_counter);
+			    "send_caps: RETRYFAIL caps_counter=%d "
+			    "intr=%02x intra=%02x intrb=%02x "
+			    "st0=%02x st1=%02x ctl3=%02x sw0=%02x sw1=%02x\n",
+			    sc->caps_counter, intr, intra, intrb,
+			    st0, st1, ctl3, sw0, sw1);
 			if (sc->caps_counter >= 50) {
 				/*
 				 * No GoodCRC from partner after N_CAPS_COUNT
@@ -2175,6 +2223,16 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp,
 	if (error != 0)
 		return;
 
+	/*
+	 * Diagnostic: surface every ACTIVITY (0x40) and CRC_CHK (0x10)
+	 * event so we can tell whether the partner is electrically alive
+	 * during the post-TX GoodCRC window.  Quiet for normal events.
+	 */
+	if (intr & (0x40u | 0x10u))
+		device_printf(sc->dev,
+		    "alert: intr=%02x intra=%02x intrb=%02x (ACT/CRC)\n",
+		    intr, intra, intrb);
+
 	/* Refresh legacy status for sysctl */
 	fusb302_read_reg(sc, FUSB_REG_STATUS0, &sc->status0);
 	fusb302_read_reg(sc, FUSB_REG_STATUS1, &sc->status1);
@@ -2520,9 +2578,18 @@ fusb302_init(struct fusb302_softc *sc)
 	 * confirmed below.
 	 */
 
-	error = fusb302_write_reg(sc, FUSB_REG_POWER, FUSB_POWER_ALL);
+	/*
+	 * Reset the PD logic separately after the global SW reset.  Linux 4.4
+	 * does both -- the PD_RESET re-initializes the BMC encoder/decoder
+	 * state machines beyond what SW_RES alone touches.  Without this,
+	 * Source_Capabilities goes out the wire but the partner never replies
+	 * with GoodCRC; observed on RockPro64 + USB-C displays where Armbian
+	 * gets PD-3.0 contract on the same hardware.
+	 */
+	error = fusb302_write_reg(sc, FUSB_REG_RESET, FUSB_RESET_PD_RESET);
 	if (error != 0)
 		return (error);
+
 	/* Keep INT_N masked (INT_MASK=1) until interrupt masks are written. */
 	error = fusb302_write_reg(sc, FUSB_REG_CONTROL0,
 	    FUSB_CTL0_HOST_CUR_DEF | FUSB_CTL0_INT_MASK);
@@ -2536,6 +2603,16 @@ fusb302_init(struct fusb302_softc *sc)
 	if (error != 0)
 		return (error);
 
+	/*
+	 * Program the BMC slicer threshold.  Default 0x20 matches the
+	 * chip reset value; lower values increase RX sensitivity for
+	 * marginal cables.  Top two bits 01 keep the 1-bit hysteresis
+	 * the chip ships with.
+	 */
+	if (sc->slice_sdac >= 0 && sc->slice_sdac <= 0x3f)
+		(void)fusb302_write_reg(sc, FUSB_REG_SLICE,
+		    0x40u | (uint8_t)(sc->slice_sdac & 0x3fu));
+
 	/* Set interrupt masks for full PD operation */
 	error = fusb302_write_reg(sc, FUSB_REG_MASK1, FUSB_MASK1_PD);
 	if (error != 0)
@@ -2544,6 +2621,17 @@ fusb302_init(struct fusb302_softc *sc)
 	if (error != 0)
 		return (error);
 	error = fusb302_write_reg(sc, FUSB_REG_MASKB, FUSB_MASKB_PD);
+	if (error != 0)
+		return (error);
+
+	/*
+	 * Power-on internal blocks LAST, after masks + control bits are
+	 * programmed.  Linux 4.4 does it in this order; powering on with
+	 * default masks (everything masked) lets internal state machines
+	 * run briefly with our events suppressed and could leave some
+	 * sub-blocks (BMC encoder?) in a stale state.
+	 */
+	error = fusb302_write_reg(sc, FUSB_REG_POWER, FUSB_POWER_ALL);
 	if (error != 0)
 		return (error);
 
@@ -2814,6 +2902,34 @@ fusb302_sysctl_reg(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * Live-tunable BMC slicer threshold.  Reads sc->slice_sdac for the
+ * current logical value; on a write, validates the range, updates
+ * the field, and writes the SLICE register so the change takes
+ * effect on the very next BMC frame.  No mutex needed: the chip
+ * tolerates SLICE updates outside of TX/RX, and we hand off through
+ * a single I2C write.
+ */
+static int
+fusb302_sysctl_slice_sdac(SYSCTL_HANDLER_ARGS)
+{
+	struct fusb302_softc *sc = arg1;
+	int val, error;
+
+	val = sc->slice_sdac;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val < 0 || val > 0x3f)
+		return (EINVAL);
+	sc->slice_sdac = val;
+	(void)fusb302_write_reg(sc, FUSB_REG_SLICE,
+	    0x40u | (uint8_t)(val & 0x3fu));
+	device_printf(sc->dev, "BMC slice SDAC -> 0x%02x (~%d mV)\n",
+	    val, val * 42);
+	return (0);
+}
+
+/*
  * vbus_cycle_now: drop the USB-C VBUS regulator (SY6280AAC on RockPro64)
  * for 1.5s then re-enable, forcing the attached USB-C display through a
  * full power-cycle.  Used to recover from a sink whose DP RX has gone
@@ -2890,6 +3006,10 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "skip_pd",
 	    CTLFLAG_RW, &sc->skip_pd, 0,
 	    "1=skip PD negotiation as sink, jump straight to passive DP defaults");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "slice_sdac",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    fusb302_sysctl_slice_sdac, "I",
+	    "BMC slicer SDAC (0..0x3f, LSB ~42 mV); writes SLICE register live");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "pd_spec_rev",
 	    CTLFLAG_RW, &sc->pd_spec_rev, 0,
 	    "PD spec rev to advertise: 1=PD 2.0, 2=PD 3.0 (effective on next attach)");
@@ -3025,6 +3145,13 @@ fusb302_attach(device_t dev)
 	TUNABLE_INT_FETCH("hw.fusb302.pd_spec_rev", &sc->pd_spec_rev);
 	if (sc->pd_spec_rev < 1 || sc->pd_spec_rev > 2)
 		sc->pd_spec_rev = 2;
+
+	sc->slice_sdac = 0x20;	/* chip default ~840 mV slice threshold */
+	TUNABLE_INT_FETCH("hw.fusb302.slice_sdac", &sc->slice_sdac);
+	if (sc->slice_sdac < 0 || sc->slice_sdac > 0x3f)
+		sc->slice_sdac = 0x20;
+	device_printf(dev, "BMC slice SDAC: 0x%02x (~%d mV)\n",
+	    sc->slice_sdac, sc->slice_sdac * 42);
 	device_printf(dev, "PD spec rev advertise: PD %s\n",
 	    sc->pd_spec_rev == 1 ? "2.0" : "3.0");
 
