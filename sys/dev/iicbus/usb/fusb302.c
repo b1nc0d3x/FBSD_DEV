@@ -319,6 +319,7 @@ enum fusb302_conn_state {
 	FUSB_ST_SNK_READY,
 	FUSB_ST_SNK_TRANSITION_DEFAULT,
 	FUSB_ST_SNK_SEND_HARDRST,
+	FUSB_ST_ROLE_DISCOVERY_SRC,
 };
 
 /* VDM state (signed: -1 = error) */
@@ -384,6 +385,18 @@ struct fusb302_softc {
 	/* Toggle role preference (FUSB_ROLE_*) and current attach role */
 	int			role_pref;
 	bool			attached_as_sink;
+
+	/*
+	 * Role-discovery arbitration: when DRP-toggle settles us as SNK
+	 * with a partner that doesn't fulfill SRC role (no
+	 * Source_Capabilities even after hard-resets), drop terminations
+	 * and re-toggle to roll the dice again.
+	 *   role_discovery_complete: latches when we give up so we
+	 *                            don't infinite-loop.
+	 *   role_discovery_tries:    how many TOGSS rerolls we've used.
+	 */
+	bool			role_discovery_complete;
+	int			role_discovery_tries;
 
 	/* hw.fusb302.skip_pd: skip PD negotiation when attached as SNK and
 	 * jump straight to passive 4-lane DP defaults. For passive USB-C→DP
@@ -1934,10 +1947,17 @@ fusb302_state_snk_discovery_locked(struct fusb302_softc *sc, uint32_t evt)
 			    N_SNK_HARDRESET_RETRY + 1);
 			fusb302_set_state_locked(sc,
 			    FUSB_ST_SNK_SEND_HARDRST);
+		} else if (!sc->role_discovery_complete) {
+			device_printf(sc->dev,
+			    "snk: partner not PD-capable after %d retries on "
+			    "CC%d; flipping to forced SRC (role discovery)\n",
+			    N_SNK_HARDRESET_RETRY + 1, sc->cc_polarity + 1);
+			fusb302_set_state_locked(sc,
+			    FUSB_ST_ROLE_DISCOVERY_SRC);
 		} else {
 			device_printf(sc->dev,
 			    "snk: partner not PD-capable after %d retries on "
-			    "CC%d; going DISABLED\n",
+			    "CC%d and SRC flip already tried; going DISABLED\n",
 			    N_SNK_HARDRESET_RETRY + 1, sc->cc_polarity + 1);
 			fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
 		}
@@ -1971,6 +1991,87 @@ fusb302_state_snk_send_hardrst_locked(struct fusb302_softc *sc, uint32_t evt)
 			    FUSB_ST_SNK_TRANSITION_DEFAULT);
 		break;
 	}
+}
+
+/*
+ * Role-discovery via re-toggle.
+ *
+ * Entered from SNK_STARTUP when the partner doesn't honor SRC role
+ * (no Source_Capabilities even after hard-reset retries).  When two
+ * DRP devices each toggle independently, the side that happens to
+ * present Rp during the other's measurement window wins SRC.  The
+ * outcome is essentially random.  Linux on identical hardware lands
+ * as SRC and works; we landed as SNK and got stuck.
+ *
+ * Strategy: drop our terminations to release the chip's settled
+ * TOGSS state, re-enable DRP TOGGLE, and let the next TOGDONE roll
+ * the dice again.  Up to ROLE_DISCOVERY_MAX_TOGGLES attempts; if
+ * TOGSS keeps landing on SNK, give up.
+ *
+ *   sub_state 0: drop CC terminations + cancel TOGGLE, arm 300 ms
+ *                so the partner sees electrical detach and our
+ *                chip exits its previous TOGSS state.
+ *   sub_state 1: re-enable DRP MODE + TOGGLE, then return to the
+ *                normal IRQ-driven TOGDONE flow.  fusb302_irq_task
+ *                routes new TOGDONE through fusb302_state_attached_*
+ *                exactly like a fresh attach -- if it lands SRC,
+ *                normal SRC bring-up runs; if it lands SNK again,
+ *                snk_startup fires and on its next giveup we'll
+ *                end up here again, incrementing the attempt count.
+ */
+#define	ROLE_DISCOVERY_MAX_TOGGLES	5
+
+static void
+fusb302_state_role_discovery_src_locked(struct fusb302_softc *sc,
+    uint32_t evt)
+{
+
+	switch (sc->sub_state) {
+	case 0:
+		/* Electrical detach: drop pulls, MEAS, VCONN, cancel TOGGLE. */
+		(void)fusb302_update_reg(sc, FUSB_REG_SWITCHES0,
+		    FUSB_SW0_PDWN1 | FUSB_SW0_PDWN2 |
+		    FUSB_SW0_PU_EN1 | FUSB_SW0_PU_EN2 |
+		    FUSB_SW0_MEAS_CC1 | FUSB_SW0_MEAS_CC2 |
+		    FUSB_SW0_VCONN_CC1 | FUSB_SW0_VCONN_CC2, 0);
+		(void)fusb302_update_reg(sc, FUSB_REG_CONTROL2,
+		    FUSB_CTL2_TOGGLE, 0);
+		sc->role_discovery_tries++;
+		device_printf(sc->dev,
+		    "role-discovery: detach + re-toggle (attempt %d/%d)\n",
+		    sc->role_discovery_tries, ROLE_DISCOVERY_MAX_TOGGLES);
+		sc->sub_state = 1;
+		fusb302_start_state_timer(sc, 300);
+		break;
+	case 1:
+		if ((evt & FUSB_EVT_TIMER_STATE) == 0)
+			break;
+		/*
+		 * Re-enable DRP TOGGLE.  Chip will run another toggle cycle
+		 * and fire TOGDONE when it settles.  fusb302_irq_task routes
+		 * that through the normal attach path: if SRC, we run SRC
+		 * bring-up; if SNK, snk_startup retries and on its giveup
+		 * comes back here for another attempt.
+		 */
+		(void)fusb302_update_reg(sc, FUSB_REG_CONTROL2,
+		    FUSB_CTL2_MODE_MASK | FUSB_CTL2_TOG_RD_ONLY |
+		    FUSB_CTL2_TOGGLE,
+		    FUSB_CTL2_MODE_DRP | FUSB_CTL2_TOG_RD_ONLY |
+		    FUSB_CTL2_TOGGLE);
+		device_printf(sc->dev,
+		    "role-discovery: TOGGLE re-enabled in DRP mode, awaiting "
+		    "TOGDONE\n");
+		sc->conn_state = FUSB_ST_UNATTACHED;
+		break;
+	}
+
+	/*
+	 * If we've exhausted attempts (next snk_startup giveup will
+	 * see this), the SNK path falls through to DISABLED via the
+	 * role_discovery_complete latch.
+	 */
+	if (sc->role_discovery_tries >= ROLE_DISCOVERY_MAX_TOGGLES)
+		sc->role_discovery_complete = true;
 }
 
 static void
@@ -2173,6 +2274,8 @@ fusb302_set_state_unattached_locked(struct fusb302_softc *sc)
 	sc->notify_is_enter_mode = false;
 	sc->is_pd_support = false;
 	sc->attached_as_sink = false;
+	sc->role_discovery_complete = false;
+	sc->role_discovery_tries = 0;
 	memset(&sc->dp_altmode, 0, sizeof(sc->dp_altmode));
 	memset(sc->partner_cap, 0, sizeof(sc->partner_cap));
 
@@ -2435,6 +2538,9 @@ fusb302_run_state_locked(struct fusb302_softc *sc, uint32_t evt)
 		break;
 	case FUSB_ST_SNK_SEND_HARDRST:
 		fusb302_state_snk_send_hardrst_locked(sc, evt);
+		break;
+	case FUSB_ST_ROLE_DISCOVERY_SRC:
+		fusb302_state_role_discovery_src_locked(sc, evt);
 		break;
 	default:
 		break;
