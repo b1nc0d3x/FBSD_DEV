@@ -113,7 +113,26 @@
 #define	FUSB_SW1_POWERROLE	0x80
 
 /* CONTROL0 bits */
-#define	FUSB_CTL0_HOST_CUR_DEF	0x02	/* bits[2:1]=01 = USB-default 80uA Rp */
+/*
+ * CONTROL0 bit layout per FUSB302B datasheet Table 22:
+ *   bit 7    reserved
+ *   bit 6    TX_FLUSH (W/C)
+ *   bit 5    INT_MASK
+ *   bit 4    reserved
+ *   bits 3:2 HOST_CUR[1:0] (00=off, 01=USB-default 80uA, 10=1.5A, 11=3A)
+ *   bit 1    AUTO_PRE
+ *   bit 0    TX_START
+ *
+ * Earlier this file had FUSB_CTL0_HOST_CUR_DEF = 0x02 with comment
+ * "bits[2:1]=01" -- that was wrong (bit 1 is AUTO_PRE!) and meant
+ * the chip ran with HOST_CUR=00 (no Rp current at all) and
+ * AUTO_PRE=1 (chip auto-starts TX 170ms after every CRC_CHK).
+ * Result: when we presented "Rp" the partner saw nothing electrically
+ * and never reciprocated.  Linux's CONTROL0_HOST_CUR_USB = (1 << 2)
+ * = 0x04 sets USB-default 80uA Rp, which is what we want at attach.
+ */
+#define	FUSB_CTL0_HOST_CUR_USB	0x04	/* bits[3:2]=01 = USB-default 80uA Rp */
+#define	FUSB_CTL0_HOST_CUR_DEF	FUSB_CTL0_HOST_CUR_USB
 #define	FUSB_CTL0_INT_MASK	0x20
 
 /* CONTROL1 bits */
