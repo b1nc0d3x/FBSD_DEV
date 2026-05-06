@@ -1508,7 +1508,13 @@ fusb302_state_src_startup_locked(struct fusb302_softc *sc,
 	fusb302_reset_pd_params_locked(sc);
 	memset(sc->partner_cap, 0, sizeof(sc->partner_cap));
 
-	fusb302_pd_reset_locked(sc);
+	/*
+	 * Match Linux 4.4 fusb_state_src_startup exactly: no PD_RESET
+	 * here.  Linux only PD_RESETs in tcpm_init (boot) and on hard
+	 * reset.  We previously did an extra reset here which may have
+	 * been wiping BMC decoder state right before we expected to RX
+	 * GoodCRC.
+	 */
 	fusb302_set_msg_header_locked(sc);
 	fusb302_set_polarity_locked(sc, sc->cc_polarity);
 	fusb302_enable_rx_locked(sc, true);
