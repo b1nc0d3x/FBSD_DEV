@@ -1,6 +1,7 @@
 # Build modules specific to RockChip.
 
 SUBDIR = \
+	../usbc \
 	../fusb302 \
 	rk_cdn_dp \
 	rk_drm \

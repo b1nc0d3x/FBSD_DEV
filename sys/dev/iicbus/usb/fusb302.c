@@ -3291,6 +3291,7 @@ static driver_t fusb302_driver = {
 
 DRIVER_MODULE(fusb302, iicbus, fusb302_driver, 0, 0);
 MODULE_DEPEND(fusb302, iicbus, IICBUS_MINVER, IICBUS_PREFVER, IICBUS_MAXVER);
+MODULE_DEPEND(fusb302, usbc, 1, 1, 1);
 MODULE_VERSION(fusb302, 2);
 
 /* -----------------------------------------------------------------------

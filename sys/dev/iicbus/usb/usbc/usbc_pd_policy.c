@@ -56,6 +56,24 @@ struct usbc_pd_policy {
 	 */
 	enum usbc_pd_state	pre_reset_state;
 
+	/*
+	 * VDM / DP Alt Mode state.  Tracks discovery responses from the
+	 * partner and the latest DP_Status VDO.  dp_object_position is
+	 * the 1-based mode index we Enter_Mode'd into; dp_status is the
+	 * most recent DP_Status response (HPD bit etc.).  dp_ready is
+	 * set after Enter_Mode ACK and goes false on detach.
+	 */
+	bool			dp_ready;
+	uint8_t			dp_object_position;
+	uint16_t		dp_partner_svids[8];
+	uint8_t			dp_partner_svid_count;
+	uint32_t		dp_partner_modes[6];
+	uint8_t			dp_partner_mode_count;
+	uint32_t		dp_status;
+	uint32_t		dp_partner_id_hdr;
+	uint32_t		dp_partner_cert_stat;
+	uint32_t		dp_partner_product;
+
 	/* Pending events folded together until run() consumes them. */
 	uint32_t		pending_events;
 
@@ -136,6 +154,25 @@ static void	usbc_pd_state_soft_reset(struct usbc_pd_policy *p,
 		    uint32_t events);
 static void	usbc_pd_state_soft_reset_send(struct usbc_pd_policy *p,
 		    uint32_t events);
+static void	usbc_pd_state_vdm_discover_identity(struct usbc_pd_policy *p,
+		    uint32_t events);
+static void	usbc_pd_state_vdm_discover_svids(struct usbc_pd_policy *p,
+		    uint32_t events);
+static void	usbc_pd_state_vdm_discover_modes(struct usbc_pd_policy *p,
+		    uint32_t events);
+static void	usbc_pd_state_vdm_enter_mode(struct usbc_pd_policy *p,
+		    uint32_t events);
+static void	usbc_pd_state_vdm_dp_status(struct usbc_pd_policy *p,
+		    uint32_t events);
+static void	usbc_pd_state_vdm_dp_configure(struct usbc_pd_policy *p,
+		    uint32_t events);
+static void	usbc_pd_state_vdm_dp_ready(struct usbc_pd_policy *p,
+		    uint32_t events);
+static int	usbc_pd_send_vdm(struct usbc_pd_policy *p, uint16_t svid,
+		    uint8_t cmd, uint8_t obj_pos,
+		    const uint32_t *vdos, uint8_t vdo_count);
+static void	usbc_pd_handle_attention(struct usbc_pd_policy *p,
+		    const struct usbc_pd_msg *rx);
 static int	usbc_pd_send_ctrl(struct usbc_pd_policy *p, uint8_t ctrl_type);
 static int	usbc_pd_drain_rx(struct usbc_pd_policy *p,
 		    struct usbc_pd_msg *out, enum usbc_pd_sop *sop_out);
@@ -354,6 +391,27 @@ usbc_pd_policy_run_locked(struct usbc_pd_policy *p)
 			break;
 		case USBC_PD_S_SOFT_RESET_SEND:
 			usbc_pd_state_soft_reset_send(p, events);
+			break;
+		case USBC_PD_S_VDM_SEND_DISCOVER_IDENTITY:
+			usbc_pd_state_vdm_discover_identity(p, events);
+			break;
+		case USBC_PD_S_VDM_SEND_DISCOVER_SVIDS:
+			usbc_pd_state_vdm_discover_svids(p, events);
+			break;
+		case USBC_PD_S_VDM_SEND_DISCOVER_MODES:
+			usbc_pd_state_vdm_discover_modes(p, events);
+			break;
+		case USBC_PD_S_VDM_SEND_ENTER_MODE:
+			usbc_pd_state_vdm_enter_mode(p, events);
+			break;
+		case USBC_PD_S_VDM_SEND_DP_STATUS:
+			usbc_pd_state_vdm_dp_status(p, events);
+			break;
+		case USBC_PD_S_VDM_SEND_DP_CONFIGURE:
+			usbc_pd_state_vdm_dp_configure(p, events);
+			break;
+		case USBC_PD_S_VDM_DP_READY:
+			usbc_pd_state_vdm_dp_ready(p, events);
 			break;
 		case USBC_PD_S_DISABLED:
 			/*
@@ -728,9 +786,12 @@ usbc_pd_state_src_transition_supply(struct usbc_pd_policy *p, uint32_t events)
 }
 
 /*
- * SRC_READY: contract established.  Stay here until something
- * changes (CC change, hard reset received, swap requested, etc).
- * In the minimal implementation we just sink events.
+ * SRC_READY: contract established.  Once we land here, kick off VDM
+ * Discover_Identity to learn whether the partner supports DisplayPort
+ * Alt Mode.  This matches Linux's tcpm: after the PD contract,
+ * immediately discover the partner identity, SVIDs, and modes; if DP
+ * is offered, Enter_Mode and start polling DP_Status.  Without this
+ * the display sees us as "PD-only" and won't fully wake its DP RX.
  */
 static void
 usbc_pd_state_src_ready(struct usbc_pd_policy *p, uint32_t events)
@@ -739,8 +800,18 @@ usbc_pd_state_src_ready(struct usbc_pd_policy *p, uint32_t events)
 	POLICY_ASSERT_LOCKED(p);
 
 	(void)events;
-	if (p->prev_state != USBC_PD_S_SRC_READY)
-		p->prev_state = USBC_PD_S_SRC_READY;
+	if (p->prev_state == USBC_PD_S_SRC_READY)
+		return;
+	p->prev_state = USBC_PD_S_SRC_READY;
+
+	/* Reset partner-discovery state on each fresh attach. */
+	p->dp_partner_svid_count = 0;
+	p->dp_partner_mode_count = 0;
+	p->dp_object_position = 0;
+	p->dp_status = 0;
+	p->dp_ready = false;
+
+	usbc_pd_policy_set_state(p, USBC_PD_S_VDM_SEND_DISCOVER_IDENTITY);
 }
 
 /*
@@ -1226,6 +1297,64 @@ usbc_pd_state_snk_hard_reset_sink_on(struct usbc_pd_policy *p, uint32_t events)
 }
 
 /*
+ * Build and transmit a Structured VDM as a Vendor data message.
+ * Always sent SOP (port-to-port).  The chip's TX engine handles
+ * GoodCRC; the policy waits for TX_OK / TX_FAIL events.
+ */
+static int
+usbc_pd_send_vdm(struct usbc_pd_policy *p, uint16_t svid, uint8_t cmd,
+    uint8_t obj_pos, const uint32_t *vdos, uint8_t vdo_count)
+{
+	enum usbc_pd_power_role pr;
+	enum usbc_pd_data_role dr;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	if (p->tcpc->ops->transmit == NULL)
+		return (ENXIO);
+
+	/* DFP/SRC for our typical RP64 flow; if we're SNK, use UFP. */
+	pr = (p->state >= USBC_PD_S_SRC_ATTACHED &&
+	    p->state <= USBC_PD_S_SRC_WAIT_NEW_CAPABILITIES) ?
+	    USBC_PD_ROLE_SOURCE : USBC_PD_ROLE_SINK;
+	dr = (pr == USBC_PD_ROLE_SOURCE) ? USBC_PD_DATA_DFP : USBC_PD_DATA_UFP;
+
+	if (!usbc_pd_msg_vdm(&p->tx, svid, cmd, USBC_VDM_CMDTYPE_REQ,
+	    obj_pos, vdos, vdo_count, p->msg_id, pr, dr,
+	    p->caps.advertise_rev))
+		return (EINVAL);
+	return (p->tcpc->ops->transmit(p->tcpc, USBC_PD_SOP, &p->tx));
+}
+
+/*
+ * Handle an unsolicited Attention VDM received outside of any
+ * specific Discover/Enter state.  The DP partner uses Attention
+ * (cmd=0x06 with a DP_Status VDO payload) to tell us "HPD changed"
+ * or "USB/DP preference changed".  We just store the fresh status
+ * and stay in DP_READY; consumers (cdn_dp) read dp_status via
+ * usbc_pd_policy_dp_status().
+ */
+static void
+usbc_pd_handle_attention(struct usbc_pd_policy *p,
+    const struct usbc_pd_msg *rx)
+{
+	uint16_t svid;
+	uint8_t cmd, ndo;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	ndo = USBC_PD_HDR_GET_NDO(rx->hdr);
+	if (ndo < 1)
+		return;
+	svid = USBC_VDM_HDR_SVID(rx->data[0]);
+	cmd = USBC_VDM_HDR_GET_CMD(rx->data[0]);
+	if (svid != USBC_VDM_SVID_DP || cmd != USBC_VDM_CMD_ATTENTION)
+		return;
+	if (ndo >= 2)
+		p->dp_status = rx->data[1];
+}
+
+/*
  * Pick the caps-phase state appropriate for our current role.  Used
  * by both SOFT_RESET branches to decide where to land after the
  * reset exchange completes.  Falls back to HARD_RESET_SEND if the
@@ -1359,6 +1488,476 @@ usbc_pd_state_soft_reset_send(struct usbc_pd_policy *p, uint32_t events)
 		usbc_pd_policy_set_state(p, USBC_PD_S_HARD_RESET_SEND);
 }
 
+/*
+ * Common VDM-response receive path.  Drains one RX, validates it as
+ * the expected (svid, cmd) ACK/NAK/BUSY response.  Returns:
+ *   1  = ACK received, vdo_out filled with data[1..ndo-1]
+ *   0  = NAK or unexpected/non-VDM message; caller should advance to
+ *        a degraded state (DP_READY without DP)
+ *  -1  = no message available yet (caller should keep waiting)
+ *  -2  = BUSY response; caller may retry after a short delay
+ *
+ * Attention messages received during a discover sequence are
+ * processed (dp_status updated) and reported as "no message yet" so
+ * the original wait continues.
+ */
+static int
+usbc_pd_recv_vdm_response(struct usbc_pd_policy *p, uint16_t expect_svid,
+    uint8_t expect_cmd, uint32_t *vdo_out, uint8_t *vdo_count_out)
+{
+	struct usbc_pd_msg rx;
+	enum usbc_pd_sop sop;
+	uint16_t got_svid;
+	uint8_t got_cmd, cmd_type, ndo, i;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	if (usbc_pd_drain_rx(p, &rx, &sop) != 0)
+		return (-1);
+	if (usbc_pd_check_soft_reset_rx(p, &rx, sop))
+		return (-1);
+	if (sop != USBC_PD_SOP)
+		return (-1);
+	ndo = USBC_PD_HDR_GET_NDO(rx.hdr);
+	if (ndo < 1)
+		return (-1);
+	if (USBC_PD_HDR_GET_TYPE(rx.hdr) != USBC_PD_DATA_VENDOR)
+		return (-1);
+
+	got_svid = USBC_VDM_HDR_SVID(rx.data[0]);
+	got_cmd = USBC_VDM_HDR_GET_CMD(rx.data[0]);
+	cmd_type = USBC_VDM_HDR_GET_CMDTYPE(rx.data[0]);
+
+	/* Attention can arrive at any time; handle it inline and keep
+	 * waiting for our actual response. */
+	if (got_svid == USBC_VDM_SVID_DP &&
+	    got_cmd == USBC_VDM_CMD_ATTENTION) {
+		usbc_pd_handle_attention(p, &rx);
+		return (-1);
+	}
+
+	if (got_svid != expect_svid || got_cmd != expect_cmd)
+		return (-1);
+
+	if (cmd_type == USBC_VDM_CMDTYPE_BUSY)
+		return (-2);
+	if (cmd_type != USBC_VDM_CMDTYPE_ACK)
+		return (0);
+
+	if (vdo_out != NULL && vdo_count_out != NULL) {
+		uint8_t n = (ndo > 1) ? ndo - 1 : 0;
+		if (n > 6)
+			n = 6;
+		for (i = 0; i < n; i++)
+			vdo_out[i] = rx.data[i + 1];
+		*vdo_count_out = n;
+	}
+	return (1);
+}
+
+/*
+ * VDM_SEND_DISCOVER_IDENTITY: send Discover_Identity REQ to SOP, wait
+ * for ACK.  On ACK, the response contains 4 VDOs: ID Header, Cert
+ * Stat, Product VDO, AMA VDO (or Product Type VDO).  We just store
+ * them and advance to DISCOVER_SVIDS.  On NAK or timeout, give up on
+ * Alt Mode and sit in DP_READY (without DP) — the partner is PD-only.
+ */
+static void
+usbc_pd_state_vdm_discover_identity(struct usbc_pd_policy *p, uint32_t events)
+{
+	uint32_t vdos[6];
+	uint8_t vdo_count;
+	int rc;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	if (p->prev_state != USBC_PD_S_VDM_SEND_DISCOVER_IDENTITY) {
+		p->prev_state = USBC_PD_S_VDM_SEND_DISCOVER_IDENTITY;
+		if (usbc_pd_send_vdm(p, USBC_VDM_SVID_PD,
+		    USBC_VDM_CMD_DISCOVER_IDENTITY, 0, NULL, 0) != 0) {
+			usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		return;
+	}
+	if (events & USBC_PD_E_TX_OK) {
+		p->msg_id = (p->msg_id + 1) & 0x7;
+		usbc_pd_policy_arm_timer(p, USBC_PD_T_VDM_SENDER_RESPONSE,
+		    USBC_PD_T_SENDER_RESPONSE_MS);
+		return;
+	}
+	if (events & USBC_PD_E_TX_FAIL) {
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+		return;
+	}
+	if (events & USBC_PD_E_RX) {
+		rc = usbc_pd_recv_vdm_response(p, USBC_VDM_SVID_PD,
+		    USBC_VDM_CMD_DISCOVER_IDENTITY, vdos, &vdo_count);
+		if (rc == -1)
+			return;	/* keep waiting */
+		if (rc <= 0) {
+			usbc_pd_policy_set_state(p,
+			    USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		if (vdo_count >= 1)
+			p->dp_partner_id_hdr = vdos[0];
+		if (vdo_count >= 2)
+			p->dp_partner_cert_stat = vdos[1];
+		if (vdo_count >= 3)
+			p->dp_partner_product = vdos[2];
+		usbc_pd_policy_set_state(p,
+		    USBC_PD_S_VDM_SEND_DISCOVER_SVIDS);
+		return;
+	}
+	if (events & USBC_PD_E_TIMER)
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+}
+
+/*
+ * VDM_SEND_DISCOVER_SVIDS: send Discover_SVIDs REQ.  ACK contains up
+ * to 6 VDOs, each holding two 16-bit SVIDs (high then low half).
+ * Walk them looking for the DisplayPort SVID 0xff01; when found,
+ * remember it and advance to DISCOVER_MODES.  If we get an ACK with
+ * no DP SVID present, give up cleanly.
+ */
+static void
+usbc_pd_state_vdm_discover_svids(struct usbc_pd_policy *p, uint32_t events)
+{
+	uint32_t vdos[6];
+	uint8_t vdo_count, i;
+	uint16_t hi, lo;
+	bool dp_found;
+	int rc;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	if (p->prev_state != USBC_PD_S_VDM_SEND_DISCOVER_SVIDS) {
+		p->prev_state = USBC_PD_S_VDM_SEND_DISCOVER_SVIDS;
+		if (usbc_pd_send_vdm(p, USBC_VDM_SVID_PD,
+		    USBC_VDM_CMD_DISCOVER_SVIDS, 0, NULL, 0) != 0) {
+			usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		return;
+	}
+	if (events & USBC_PD_E_TX_OK) {
+		p->msg_id = (p->msg_id + 1) & 0x7;
+		usbc_pd_policy_arm_timer(p, USBC_PD_T_VDM_SENDER_RESPONSE,
+		    USBC_PD_T_SENDER_RESPONSE_MS);
+		return;
+	}
+	if (events & USBC_PD_E_TX_FAIL) {
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+		return;
+	}
+	if (events & USBC_PD_E_RX) {
+		rc = usbc_pd_recv_vdm_response(p, USBC_VDM_SVID_PD,
+		    USBC_VDM_CMD_DISCOVER_SVIDS, vdos, &vdo_count);
+		if (rc == -1)
+			return;
+		if (rc <= 0) {
+			usbc_pd_policy_set_state(p,
+			    USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		dp_found = false;
+		p->dp_partner_svid_count = 0;
+		for (i = 0; i < vdo_count; i++) {
+			hi = (uint16_t)(vdos[i] >> 16);
+			lo = (uint16_t)(vdos[i] & 0xffff);
+			if (hi != 0 && p->dp_partner_svid_count <
+			    nitems(p->dp_partner_svids))
+				p->dp_partner_svids[p->dp_partner_svid_count++]
+				    = hi;
+			if (lo != 0 && p->dp_partner_svid_count <
+			    nitems(p->dp_partner_svids))
+				p->dp_partner_svids[p->dp_partner_svid_count++]
+				    = lo;
+			if (hi == USBC_VDM_SVID_DP || lo == USBC_VDM_SVID_DP)
+				dp_found = true;
+		}
+		if (!dp_found) {
+			usbc_pd_policy_set_state(p,
+			    USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		usbc_pd_policy_set_state(p,
+		    USBC_PD_S_VDM_SEND_DISCOVER_MODES);
+		return;
+	}
+	if (events & USBC_PD_E_TIMER)
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+}
+
+/*
+ * VDM_SEND_DISCOVER_MODES: send Discover_Modes REQ for SVID 0xff01.
+ * ACK contains 1..6 32-bit DP Mode VDOs.  We pick the first one (its
+ * 1-based object position is index+1) and advance to ENTER_MODE.
+ */
+static void
+usbc_pd_state_vdm_discover_modes(struct usbc_pd_policy *p, uint32_t events)
+{
+	uint32_t vdos[6];
+	uint8_t vdo_count, i;
+	int rc;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	if (p->prev_state != USBC_PD_S_VDM_SEND_DISCOVER_MODES) {
+		p->prev_state = USBC_PD_S_VDM_SEND_DISCOVER_MODES;
+		if (usbc_pd_send_vdm(p, USBC_VDM_SVID_DP,
+		    USBC_VDM_CMD_DISCOVER_MODES, 0, NULL, 0) != 0) {
+			usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		return;
+	}
+	if (events & USBC_PD_E_TX_OK) {
+		p->msg_id = (p->msg_id + 1) & 0x7;
+		usbc_pd_policy_arm_timer(p, USBC_PD_T_VDM_SENDER_RESPONSE,
+		    USBC_PD_T_SENDER_RESPONSE_MS);
+		return;
+	}
+	if (events & USBC_PD_E_TX_FAIL) {
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+		return;
+	}
+	if (events & USBC_PD_E_RX) {
+		rc = usbc_pd_recv_vdm_response(p, USBC_VDM_SVID_DP,
+		    USBC_VDM_CMD_DISCOVER_MODES, vdos, &vdo_count);
+		if (rc == -1)
+			return;
+		if (rc <= 0 || vdo_count == 0) {
+			usbc_pd_policy_set_state(p,
+			    USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		p->dp_partner_mode_count = vdo_count;
+		for (i = 0; i < vdo_count; i++)
+			p->dp_partner_modes[i] = vdos[i];
+		p->dp_object_position = 1;	/* first mode */
+		usbc_pd_policy_set_state(p,
+		    USBC_PD_S_VDM_SEND_ENTER_MODE);
+		return;
+	}
+	if (events & USBC_PD_E_TIMER)
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+}
+
+/*
+ * VDM_SEND_ENTER_MODE: send Enter_Mode REQ for SVID 0xff01 with the
+ * chosen object position.  On ACK, the partner has entered DP Alt
+ * Mode; advance to DP_STATUS to query the runtime DP state.
+ */
+static void
+usbc_pd_state_vdm_enter_mode(struct usbc_pd_policy *p, uint32_t events)
+{
+	int rc;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	if (p->prev_state != USBC_PD_S_VDM_SEND_ENTER_MODE) {
+		p->prev_state = USBC_PD_S_VDM_SEND_ENTER_MODE;
+		if (usbc_pd_send_vdm(p, USBC_VDM_SVID_DP,
+		    USBC_VDM_CMD_ENTER_MODE,
+		    p->dp_object_position, NULL, 0) != 0) {
+			usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		return;
+	}
+	if (events & USBC_PD_E_TX_OK) {
+		p->msg_id = (p->msg_id + 1) & 0x7;
+		usbc_pd_policy_arm_timer(p, USBC_PD_T_VDM_SENDER_RESPONSE,
+		    USBC_PD_T_SENDER_RESPONSE_MS);
+		return;
+	}
+	if (events & USBC_PD_E_TX_FAIL) {
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+		return;
+	}
+	if (events & USBC_PD_E_RX) {
+		rc = usbc_pd_recv_vdm_response(p, USBC_VDM_SVID_DP,
+		    USBC_VDM_CMD_ENTER_MODE, NULL, NULL);
+		if (rc == -1)
+			return;
+		if (rc <= 0) {
+			usbc_pd_policy_set_state(p,
+			    USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		p->dp_ready = true;
+		usbc_pd_policy_set_state(p,
+		    USBC_PD_S_VDM_SEND_DP_STATUS);
+		return;
+	}
+	if (events & USBC_PD_E_TIMER)
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+}
+
+/*
+ * VDM_SEND_DP_STATUS: send DP_Status_Update REQ.  ACK carries one
+ * DP_Status VDO with the HPD bit and other receiver-state info.  We
+ * stash it in p->dp_status and advance to DP_CONFIGURE the first
+ * time, or back to DP_READY thereafter.
+ */
+static void
+usbc_pd_state_vdm_dp_status(struct usbc_pd_policy *p, uint32_t events)
+{
+	uint32_t vdos[6];
+	uint8_t vdo_count;
+	bool first_time;
+	int rc;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	if (p->prev_state != USBC_PD_S_VDM_SEND_DP_STATUS) {
+		p->prev_state = USBC_PD_S_VDM_SEND_DP_STATUS;
+		/* Status_Update REQ payload: one VDO with our DP-side
+		 * status bits.  PD DP Alt Mode 2.0: bits 1,3 = "DFP_D
+		 * Connected" + "Enabled" — the source telling the sink
+		 * that we're acting as a DP source. */
+		vdos[0] = USBC_DP_STATUS_DFP_D_CONN | USBC_DP_STATUS_ENABLED;
+		if (usbc_pd_send_vdm(p, USBC_VDM_SVID_DP,
+		    USBC_DP_CMD_STATUS_UPDATE, 0, vdos, 1) != 0) {
+			usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		return;
+	}
+	if (events & USBC_PD_E_TX_OK) {
+		p->msg_id = (p->msg_id + 1) & 0x7;
+		usbc_pd_policy_arm_timer(p, USBC_PD_T_VDM_SENDER_RESPONSE,
+		    USBC_PD_T_SENDER_RESPONSE_MS);
+		return;
+	}
+	if (events & USBC_PD_E_TX_FAIL) {
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+		return;
+	}
+	if (events & USBC_PD_E_RX) {
+		rc = usbc_pd_recv_vdm_response(p, USBC_VDM_SVID_DP,
+		    USBC_DP_CMD_STATUS_UPDATE, vdos, &vdo_count);
+		if (rc == -1)
+			return;
+		first_time = (p->dp_status == 0);
+		if (rc > 0 && vdo_count >= 1)
+			p->dp_status = vdos[0];
+		if (first_time) {
+			usbc_pd_policy_set_state(p,
+			    USBC_PD_S_VDM_SEND_DP_CONFIGURE);
+		} else {
+			usbc_pd_policy_set_state(p,
+			    USBC_PD_S_VDM_DP_READY);
+		}
+		return;
+	}
+	if (events & USBC_PD_E_TIMER)
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+}
+
+/*
+ * VDM_SEND_DP_CONFIGURE: send DP_Configure REQ with our chosen pin
+ * assignment.  Default to "C" (4-lane DP, no USB SS) which the RK3399
+ * DP TX is wired for; future commits can pick a pin assignment based
+ * on partner capabilities + USB-SS preference.
+ */
+static void
+usbc_pd_state_vdm_dp_configure(struct usbc_pd_policy *p, uint32_t events)
+{
+	uint32_t vdos[1];
+	int rc;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	if (p->prev_state != USBC_PD_S_VDM_SEND_DP_CONFIGURE) {
+		p->prev_state = USBC_PD_S_VDM_SEND_DP_CONFIGURE;
+		/*
+		 * DP_Configure VDO bits:
+		 *   1:0  Configure (1 = UFP_U as DFP_D, 2 = as UFP_D)
+		 *   7:2  reserved
+		 *  15:8  DFP_D Pin Assignment (bit set = pin A..F)
+		 * 23:16  UFP_D Pin Assignment
+		 *  We're DFP_D, requesting Pin C (bit 2 in the DFP_D
+		 *  field = 0x04).
+		 */
+		vdos[0] = (1u << 0) /* UFP_U as DFP_D */ |
+		    (0x04u << 8) /* DFP_D Pin C */;
+		if (usbc_pd_send_vdm(p, USBC_VDM_SVID_DP,
+		    USBC_DP_CMD_CONFIGURE, 0, vdos, 1) != 0) {
+			usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+			return;
+		}
+		return;
+	}
+	if (events & USBC_PD_E_TX_OK) {
+		p->msg_id = (p->msg_id + 1) & 0x7;
+		usbc_pd_policy_arm_timer(p, USBC_PD_T_VDM_SENDER_RESPONSE,
+		    USBC_PD_T_SENDER_RESPONSE_MS);
+		return;
+	}
+	if (events & USBC_PD_E_TX_FAIL) {
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+		return;
+	}
+	if (events & USBC_PD_E_RX) {
+		rc = usbc_pd_recv_vdm_response(p, USBC_VDM_SVID_DP,
+		    USBC_DP_CMD_CONFIGURE, NULL, NULL);
+		if (rc == -1)
+			return;
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+		return;
+	}
+	if (events & USBC_PD_E_TIMER)
+		usbc_pd_policy_set_state(p, USBC_PD_S_VDM_DP_READY);
+}
+
+/*
+ * VDM_DP_READY: terminal state for the DP discovery chain.  Whether
+ * we got here cleanly (Enter_Mode + DP_Configure ACK'd, dp_ready=true)
+ * or via a degraded path (NAK / partner doesn't speak DP, dp_ready=
+ * false), the policy sits here handling Attention messages and
+ * occasionally re-polling DP_Status_Update.
+ *
+ * Re-poll cadence: 1s tick.  Keeps the partner's PD/DP stack alive
+ * (Linux's tcpm does similar).
+ */
+static void
+usbc_pd_state_vdm_dp_ready(struct usbc_pd_policy *p, uint32_t events)
+{
+	struct usbc_pd_msg rx;
+	enum usbc_pd_sop sop;
+
+	POLICY_ASSERT_LOCKED(p);
+
+	if (p->prev_state != USBC_PD_S_VDM_DP_READY) {
+		p->prev_state = USBC_PD_S_VDM_DP_READY;
+		if (p->dp_ready) {
+			/* Arm a 1s polling timer for periodic DP_Status. */
+			usbc_pd_policy_arm_timer(p,
+			    USBC_PD_T_VDM_SENDER_RESPONSE, 1000);
+		}
+		return;
+	}
+	if (events & USBC_PD_E_RX) {
+		if (usbc_pd_drain_rx(p, &rx, &sop) != 0)
+			return;
+		if (usbc_pd_check_soft_reset_rx(p, &rx, sop))
+			return;
+		usbc_pd_handle_attention(p, &rx);
+		return;
+	}
+	if (events & USBC_PD_E_TIMER) {
+		if (p->dp_ready) {
+			/* Force re-entry into DP_STATUS by clearing
+			 * prev_state and bouncing through. */
+			usbc_pd_policy_set_state(p,
+			    USBC_PD_S_VDM_SEND_DP_STATUS);
+		}
+	}
+}
+
 /* Build and submit a control message of the given type. */
 static int
 usbc_pd_send_ctrl(struct usbc_pd_policy *p, uint8_t ctrl_type)
@@ -1390,4 +1989,4 @@ usbc_pd_drain_rx(struct usbc_pd_policy *p, struct usbc_pd_msg *out,
 	return (p->tcpc->ops->receive(p->tcpc, sop_out, out));
 }
 
-MODULE_VERSION(usbc_pd_policy, 1);
+MODULE_VERSION(usbc, 1);

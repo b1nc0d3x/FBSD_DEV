@@ -158,3 +158,54 @@ usbc_pd_msg_data(struct usbc_pd_msg *msg, uint8_t data_type,
 	memcpy(msg->data, data, ndo * sizeof(uint32_t));
 	return (true);
 }
+
+/*
+ * usbc_pd_build_vdm_header
+ *
+ * Build the 32-bit Structured VDM header per PD 6.4.4.2.1.  Caller
+ * supplies the SVID, command, command type (REQ/ACK/NAK/BUSY), and
+ * object position (1..7 for Enter/Exit Mode, 0 elsewhere).  Always
+ * sets the Structured VDM flag and Version=2.0.
+ */
+uint32_t
+usbc_pd_build_vdm_header(uint16_t svid, uint8_t cmd, uint8_t cmd_type,
+    uint8_t obj_pos)
+{
+	uint32_t h;
+
+	h = (uint32_t)svid << 16;
+	h |= USBC_VDM_HDR_STRUCTURED;
+	h |= (1u << USBC_VDM_HDR_VER_SHIFT);	/* Version 2.0 */
+	h |= ((uint32_t)(obj_pos & 0x7u)) << USBC_VDM_HDR_OBJPOS_SHIFT;
+	h |= ((uint32_t)(cmd_type & 0x3u)) << USBC_VDM_HDR_CMDTYPE_SHIFT;
+	h |= cmd & 0x1fu;
+	return (h);
+}
+
+/*
+ * usbc_pd_msg_vdm
+ *
+ * Compose a Structured VDM as a Vendor data message.  Payload is
+ * [VDM_header, vdo[0], vdo[1], ...]; vdo_count is the number of VDOs
+ * after the header (1 + vdo_count must fit in 7 data objects).
+ */
+bool
+usbc_pd_msg_vdm(struct usbc_pd_msg *msg, uint16_t svid, uint8_t cmd,
+    uint8_t cmd_type, uint8_t obj_pos, const uint32_t *vdos,
+    uint8_t vdo_count, uint8_t msg_id, enum usbc_pd_power_role pr,
+    enum usbc_pd_data_role dr, enum usbc_pd_rev rev)
+{
+	uint32_t payload[7];
+	uint8_t i;
+
+	if (msg == NULL || vdo_count > 6 ||
+	    (vdo_count > 0 && vdos == NULL))
+		return (false);
+
+	payload[0] = usbc_pd_build_vdm_header(svid, cmd, cmd_type, obj_pos);
+	for (i = 0; i < vdo_count; i++)
+		payload[i + 1] = vdos[i];
+
+	return (usbc_pd_msg_data(msg, USBC_PD_DATA_VENDOR, payload,
+	    1 + vdo_count, msg_id, pr, dr, rev));
+}

@@ -1813,12 +1813,37 @@ rk_cdn_dp_aux_probe(struct rk_cdn_dp_softc *sc)
 
 	rerr = rk_cdn_dp_mailbox_dpcd_read(sc, 0x000, dpcd, sizeof(dpcd));
 	device_printf(sc->dev,
-	    "aux_probe: READ 0x000 result=%d\n", rerr);
+	    "aux_probe: READ 0x000 (DPCD_REV) result=%d\n", rerr);
 	if (rerr == 0)
 		device_printf(sc->dev,
 		    "aux_probe: DPCD[0..7]= %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		    dpcd[0], dpcd[1], dpcd[2], dpcd[3],
 		    dpcd[4], dpcd[5], dpcd[6], dpcd[7]);
+
+	/* Try a 1-byte read of the same address we just wrote (0x600).
+	 * Many displays make SET_POWER readable as well as writable -- if
+	 * 0x600 reads back D0 that proves general DPCD reads work.  */
+	{
+		uint8_t one;
+		int err;
+
+		err = rk_cdn_dp_mailbox_dpcd_read(sc, 0x600, &one, 1);
+		device_printf(sc->dev,
+		    "aux_probe: READ 0x600 (SET_POWER) result=%d val=0x%02x\n",
+		    err, err == 0 ? one : 0xff);
+	}
+
+	/* Try DPCD 0x68000 (SINK_OUI / branch-device-ID, alternate
+	 * receiver-cap region used by some receivers).  */
+	{
+		uint8_t one;
+		int err;
+
+		err = rk_cdn_dp_mailbox_dpcd_read(sc, 0x68000, &one, 1);
+		device_printf(sc->dev,
+		    "aux_probe: READ 0x68000 result=%d val=0x%02x\n",
+		    err, err == 0 ? one : 0xff);
+	}
 
 	if (werr != 0)
 		return (werr);
