@@ -59,6 +59,9 @@
 
 #include <arm64/rockchip/rk3399_typec_altmode_var.h>
 
+#include <dev/iicbus/usb/usbc/usbc_tcpc.h>
+#include <dev/iicbus/usb/usbc/usbc_pd_policy.h>
+
 #include "iicbus_if.h"
 #include "fusb302_var.h"
 
@@ -420,6 +423,18 @@ struct fusb302_softc {
 
 	/* DP Alt Mode result exported to rk_cdn_dp */
 	struct rk3399_typec_dp_altmode_status	dp_altmode;
+
+	/*
+	 * TCPC abstraction + USB-PD policy state machine.  Lives alongside
+	 * the embedded SM during the Phase 3 transition: the irq_task drives
+	 * the embedded SM under sc->mtx and accumulates an event mask that
+	 * gets delivered to sc->policy after sc->mtx is dropped (the policy
+	 * takes its own lock and would deadlock if entered with sc->mtx held,
+	 * since policy state handlers call back into TCPC ops that re-acquire
+	 * sc->mtx).
+	 */
+	struct usbc_tcpc		tcpc;
+	struct usbc_pd_policy		*policy;
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -437,6 +452,7 @@ static int	fusb302_detach(device_t dev);
 static void	fusb302_irq_task(void *context, int pending);
 static int	fusb302_intr(void *context);
 static void	fusb302_timer_state_cb(void *arg);
+extern const struct usbc_tcpc_ops fusb302_tcpc_ops;
 int		fusb302_get_typec_status(device_t dev,
 		    struct fusb302_typec_status *status);
 int		fusb302_get_dp_altmode_state(device_t dev,
@@ -2137,9 +2153,14 @@ fusb302_set_state_unattached_locked(struct fusb302_softc *sc)
 
 /* -----------------------------------------------------------------------
  * Hardware alert → event bits
+ *
+ * Two parallel out-params: evtp gets the legacy FUSB_EVT_* bits the
+ * embedded SM consumes; pd_evtp gets USBC_PD_E_* bits delivered to the
+ * policy SM after sc->mtx is dropped.
  * ----------------------------------------------------------------------- */
 static void
-fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp)
+fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp,
+    uint32_t *pd_evtp)
 {
 	uint8_t intr, intra, intrb, status1a;
 	int error;
@@ -2162,6 +2183,7 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp)
 
 	if (intra & FUSB_INTRA_TOGDONE) {
 		*evtp |= FUSB_EVT_CC;
+		*pd_evtp |= USBC_PD_E_CC_CHANGE;
 		status1a = sc->status1a;
 		/* Stop toggle; PD code takes manual control of CC */
 		(void)fusb302_update_reg(sc, FUSB_REG_CONTROL2,
@@ -2169,21 +2191,28 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp)
 		device_printf(sc->dev, "TOGDONE status1a=0x%02x\n", status1a);
 	}
 
-	if ((intr & 0x80) /* VBUSOK */ && sc->notify_is_cc)
-		*evtp |= FUSB_EVT_CC;
+	if (intr & 0x80 /* VBUSOK */) {
+		*pd_evtp |= USBC_PD_E_VBUS_CHANGE;
+		if (sc->notify_is_cc)
+			*evtp |= FUSB_EVT_CC;
+	}
 
 	if (intra & FUSB_INTRA_TXSENT) {
 		*evtp |= FUSB_EVT_TX;
+		*pd_evtp |= USBC_PD_E_TX_OK;
 		sc->tx_state = FUSB_TX_SUCCESS;
 	}
 
 	if (intra & FUSB_INTRA_RETRYFAIL) {
 		*evtp |= FUSB_EVT_TX;
+		*pd_evtp |= USBC_PD_E_TX_FAIL;
 		sc->tx_state = FUSB_TX_FAILED;
 	}
 
-	if (intrb & FUSB_INTRB_GCRCSENT)
+	if (intrb & FUSB_INTRB_GCRCSENT) {
 		*evtp |= FUSB_EVT_RX;
+		*pd_evtp |= USBC_PD_E_RX;
+	}
 
 	if (intra & FUSB_INTRA_HARDRST) {
 		device_printf(sc->dev, "hard reset received\n");
@@ -2200,6 +2229,7 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp)
 		    FUSB_ST_SNK_TRANSITION_DEFAULT :
 		    FUSB_ST_SRC_TRANSITION_DEFAULT);
 		*evtp |= FUSB_EVT_REC_RESET;
+		*pd_evtp |= USBC_PD_E_HARD_RESET_RX;
 	}
 
 	if (intra & FUSB_INTRA_HARDSENT) {
@@ -2208,6 +2238,7 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp)
 		fusb302_set_state_locked(sc, sc->attached_as_sink ?
 		    FUSB_ST_SNK_TRANSITION_DEFAULT :
 		    FUSB_ST_SRC_TRANSITION_DEFAULT);
+		*pd_evtp |= USBC_PD_E_HARD_RESET_TX_OK;
 	}
 }
 
@@ -2367,7 +2398,7 @@ static void
 fusb302_irq_task(void *context, int pending __unused)
 {
 	struct fusb302_softc *sc;
-	uint32_t evt;
+	uint32_t evt, pd_evt;
 
 	sc = context;
 
@@ -2379,12 +2410,13 @@ fusb302_irq_task(void *context, int pending __unused)
 
 	/* Collect events: hardware alerts + timer expirations */
 	evt = 0;
-	fusb302_tcpc_alert_locked(sc, &evt);
+	pd_evt = 0;
+	fusb302_tcpc_alert_locked(sc, &evt, &pd_evt);
 	evt |= atomic_swap_int(&sc->pending_events, 0);
 	evt |= sc->work_continue;
 	sc->work_continue = 0;
 
-	if (evt == 0) {
+	if (evt == 0 && pd_evt == 0) {
 		mtx_unlock(&sc->mtx);
 		return;
 	}
@@ -2431,6 +2463,23 @@ fusb302_irq_task(void *context, int pending __unused)
 
 out:
 	mtx_unlock(&sc->mtx);
+
+	/*
+	 * Deliver accumulated events to the policy SM.  Done outside
+	 * sc->mtx because the policy takes its own lock and may call
+	 * back into TCPC ops (which re-acquire sc->mtx).  Each named
+	 * USBC_PD_E_* bit gets its own event() call to keep the API
+	 * usage straightforward; the policy folds them internally.
+	 */
+	if (pd_evt != 0 && sc->policy != NULL) {
+		uint32_t bits = pd_evt;
+		while (bits != 0) {
+			uint32_t b = bits & -bits;
+			usbc_pd_policy_event(sc->policy,
+			    (enum usbc_pd_event)b);
+			bits &= ~b;
+		}
+	}
 
 	/* Re-enable the interrupt now that IRQ flags are cleared. */
 	if (sc->initialized && sc->irq_res != NULL)
@@ -2980,6 +3029,52 @@ fusb302_attach(device_t dev)
 		goto fail;
 	}
 
+	/*
+	 * Bind the TCPC abstraction and allocate the policy state machine.
+	 * Today the embedded SM still drives the chip; the policy shadows
+	 * events alongside it.  Phase 3 step 9 will strip the embedded SM
+	 * and let the policy take over.
+	 *
+	 * Role mapping: FUSB_ROLE_SNK → sink default; SRC/DRP → source
+	 * default with DRP toggling enabled when the chip's role_pref is
+	 * DRP.  Caps advertise a placeholder fixed 5V@900mA in both
+	 * directions; future commits will pull these from FDT.
+	 */
+	sc->tcpc.dev = dev;
+	sc->tcpc.softc = sc;
+	sc->tcpc.ops = &fusb302_tcpc_ops;
+	{
+		struct usbc_pd_port_caps caps;
+
+		bzero(&caps, sizeof(caps));
+		if (sc->role_pref == FUSB_ROLE_SNK) {
+			caps.default_data_role = USBC_PD_DATA_UFP;
+			caps.default_power_role = USBC_PD_ROLE_SINK;
+		} else {
+			caps.default_data_role = USBC_PD_DATA_DFP;
+			caps.default_power_role = USBC_PD_ROLE_SOURCE;
+		}
+		caps.supports_drp = (sc->role_pref == FUSB_ROLE_DRP);
+		caps.advertise_rev = (sc->pd_spec_rev == 1) ?
+		    USBC_PD_REV_2_0 : USBC_PD_REV_3_0;
+		caps.nr_src_pdos = 1;
+		caps.src_pdos[0] = USBC_PD_PDO_TYPE_FIXED |
+		    USBC_PD_PDO_FIXED_USB_COMMS |
+		    USBC_PD_PDO_FIXED_VOLTAGE_MV(5000) |
+		    USBC_PD_PDO_FIXED_CURRENT_MA(900);
+		caps.nr_snk_pdos = 1;
+		caps.snk_pdos[0] = USBC_PD_PDO_TYPE_FIXED |
+		    USBC_PD_PDO_FIXED_USB_COMMS |
+		    USBC_PD_PDO_FIXED_VOLTAGE_MV(5000) |
+		    USBC_PD_PDO_FIXED_CURRENT_MA(900);
+		sc->policy = usbc_pd_policy_alloc(&sc->tcpc, &caps);
+		if (sc->policy == NULL) {
+			device_printf(dev, "cannot allocate PD policy\n");
+			error = ENOMEM;
+			goto fail;
+		}
+	}
+
 	/* IRQ allocation — same multi-fallback as original */
 	if (bus_get_resource(dev, SYS_RES_IRQ, sc->irq_rid, &irq_start,
 	    &irq_count) == 0) {
@@ -3041,12 +3136,26 @@ fusb302_attach(device_t dev)
 	if (sc->conn_state != FUSB_ST_UNATTACHED)
 		taskqueue_enqueue(taskqueue_thread, &sc->irq_task);
 
+	/*
+	 * Lift the policy out of USBC_PD_S_DISABLED so it begins observing
+	 * CC_CHANGE / VBUS_CHANGE / RX events from the IRQ task.  The
+	 * policy picks UNATTACHED_SRC or UNATTACHED_SNK based on caps;
+	 * from there it tracks attach state in parallel with the embedded
+	 * SM.  Step 9 will remove the embedded SM and let the policy be
+	 * the sole driver.
+	 */
+	usbc_pd_policy_event(sc->policy, USBC_PD_E_PORT_ENABLE);
+
 	fusb302_add_sysctls(sc);
 	OF_device_register_xref(OF_xref_from_node(ofw_bus_get_node(dev)), dev);
 	return (0);
 
 fail:
 	callout_drain(&sc->timer_state);
+	if (sc->policy != NULL) {
+		usbc_pd_policy_free(sc->policy);
+		sc->policy = NULL;
+	}
 	if (sc->vbus_enabled)
 		regulator_disable(sc->vbus_supply);
 	if (sc->vbus_supply != NULL)
@@ -3103,6 +3212,17 @@ fusb302_detach(device_t dev)
 	 * enqueue a fresh task between drains. */
 	callout_drain(&sc->timer_state);
 	taskqueue_drain(taskqueue_thread, &sc->irq_task);
+
+	/*
+	 * Tear down the policy SM after the IRQ task is fully drained
+	 * — once drained no remaining caller can dispatch into the
+	 * policy.  Free before mtx_destroy so the policy's own callout
+	 * is stopped while sc is still valid.
+	 */
+	if (sc->policy != NULL) {
+		usbc_pd_policy_free(sc->policy);
+		sc->policy = NULL;
+	}
 
 	/* Now safe to do I2C unlocked — no other thread reaches sc. */
 	(void)fusb302_write_reg(sc, FUSB_REG_CONTROL0,
@@ -3172,3 +3292,313 @@ static driver_t fusb302_driver = {
 DRIVER_MODULE(fusb302, iicbus, fusb302_driver, 0, 0);
 MODULE_DEPEND(fusb302, iicbus, IICBUS_MINVER, IICBUS_PREFVER, IICBUS_MAXVER);
 MODULE_VERSION(fusb302, 2);
+
+/* -----------------------------------------------------------------------
+ * TCPC backend skeleton (Phase 3, step 1).
+ *
+ * Stubs that will eventually let the chip-agnostic policy state machine
+ * (sys/dev/iicbus/usb/usbc/usbc_pd_policy.c) drive this chip through
+ * struct usbc_tcpc_ops instead of having its own embedded SM.  Each op
+ * currently returns ENOSYS so consumers can detect "not implemented yet."
+ * Subsequent commits replace each stub with real chip access, and
+ * eventually the embedded state machine in this file goes away.
+ * ----------------------------------------------------------------------- */
+
+static int	fusb302_tcpc_set_rp(struct usbc_tcpc *,
+		    enum usbc_pd_rp_value);
+static int	fusb302_tcpc_set_role(struct usbc_tcpc *,
+		    enum usbc_tcpc_role);
+static int	fusb302_tcpc_set_polarity(struct usbc_tcpc *,
+		    enum usbc_pd_polarity);
+static int	fusb302_tcpc_set_vconn(struct usbc_tcpc *, bool);
+static int	fusb302_tcpc_set_rx_enable(struct usbc_tcpc *, bool);
+static int	fusb302_tcpc_get_cc(struct usbc_tcpc *,
+		    enum usbc_tcpc_cc_state *, enum usbc_tcpc_cc_state *);
+static int	fusb302_tcpc_get_vbus_present(struct usbc_tcpc *, bool *);
+static int	fusb302_tcpc_set_vbus_source(struct usbc_tcpc *, bool);
+static int	fusb302_tcpc_transmit(struct usbc_tcpc *, enum usbc_pd_sop,
+		    const struct usbc_pd_msg *);
+static int	fusb302_tcpc_receive(struct usbc_tcpc *,
+		    enum usbc_pd_sop *, struct usbc_pd_msg *);
+static int	fusb302_tcpc_send_hard_reset(struct usbc_tcpc *);
+
+/*
+ * set_rp: program the Rp current advertisement (CONTROL0 bits 2:1).
+ * 01 = USB-default (80 uA), 10 = 1.5 A (180 uA), 11 = 3.0 A (330 uA).
+ * The TCPC abstraction's enum maps directly: USB_DEFAULT, _1_5A, _3_0A.
+ */
+static int
+fusb302_tcpc_set_rp(struct usbc_tcpc *t, enum usbc_pd_rp_value v)
+{
+	struct fusb302_softc *sc = t->softc;
+	uint8_t bits;
+
+	switch (v) {
+	case USBC_PD_RP_USB_DEFAULT:	bits = 0x02; break;
+	case USBC_PD_RP_1_5A:		bits = 0x04; break;
+	case USBC_PD_RP_3_0A:		bits = 0x06; break;
+	default:			return (EINVAL);
+	}
+	return (iic2errno(fusb302_update_reg(sc, FUSB_REG_CONTROL0,
+	    0x06 /* HOST_CUR mask */, bits)));
+}
+
+/*
+ * set_role: configure the chip's CC pull mode (CONTROL2[2:1]) and
+ * enable / disable the toggle state machine (CONTROL2 bit 0).  The
+ * TCPC role enum maps to chip mode bits: SNK = UFP, SRC = DFP, DRP
+ * keeps DRP toggle enabled.  The chip's existing helper
+ * fusb302_toggle_ctl2_locked() composes the right value from
+ * sc->role_pref; we update role_pref then call it.
+ */
+static int
+fusb302_tcpc_set_role(struct usbc_tcpc *t, enum usbc_tcpc_role r)
+{
+	struct fusb302_softc *sc = t->softc;
+	int role_pref;
+
+	switch (r) {
+	case USBC_TCPC_ROLE_SNK:	role_pref = FUSB_ROLE_SNK; break;
+	case USBC_TCPC_ROLE_SRC:	role_pref = FUSB_ROLE_SRC; break;
+	case USBC_TCPC_ROLE_DRP:	role_pref = FUSB_ROLE_DRP; break;
+	default:			return (EINVAL);
+	}
+	sc->role_pref = role_pref;
+	return (iic2errno(fusb302_write_reg(sc, FUSB_REG_CONTROL2,
+	    fusb302_toggle_ctl2_locked(sc))));
+}
+
+/*
+ * set_polarity: pin the active CC orientation.  Delegates to the
+ * existing chip helper, which programs SWITCHES0 (Rp/Rd/MEAS routing)
+ * and SWITCHES1 (TX path) consistently for the chosen pin.
+ */
+static int
+fusb302_tcpc_set_polarity(struct usbc_tcpc *t, enum usbc_pd_polarity p)
+{
+	struct fusb302_softc *sc = t->softc;
+	int polarity = (p == USBC_PD_POLARITY_CC2) ? 1 : 0;
+
+	fusb302_set_polarity_locked(sc, polarity);
+	return (0);
+}
+
+/*
+ * set_vconn: drive 5 V VCONN onto the inactive CC pin (the one
+ * opposite the attached partner) to power active-cable e-marker
+ * chips.  We update sc->vconn_enabled then re-run set_polarity to
+ * have it write SWITCHES0 with the VCONN bit composed correctly
+ * for the current cc_polarity.
+ */
+static int
+fusb302_tcpc_set_vconn(struct usbc_tcpc *t, bool en)
+{
+	struct fusb302_softc *sc = t->softc;
+
+	sc->vconn_enabled = en;
+	fusb302_set_polarity_locked(sc, sc->cc_polarity);
+	return (0);
+}
+
+/*
+ * set_rx_enable: arm or disarm BMC reception on the active CC pin.
+ * Delegates to the existing fusb302_enable_rx_locked() helper which
+ * sets SWITCHES0.MEAS_CC{1,2} (so the chip listens on the right pin)
+ * and SWITCHES1.AUTO_CRC (so hardware GoodCRC reply is enabled when
+ * a valid PD message is received).
+ */
+static int
+fusb302_tcpc_set_rx_enable(struct usbc_tcpc *t, bool en)
+{
+	struct fusb302_softc *sc = t->softc;
+
+	fusb302_enable_rx_locked(sc, en);
+	return (0);
+}
+
+/*
+ * get_cc: report CC1/CC2 termination as observed by the chip's
+ * toggle / measure logic.  We translate the FUSB302 TOGSS field
+ * (last completed CC toggle result) into the policy-machine's
+ * generic enum.  On a clean unattached port both pins read OPEN;
+ * after toggle locks onto an Rd partner one CC reads RD (we as
+ * source) or RP_USB (we as sink), the other stays OPEN.
+ */
+static int
+fusb302_tcpc_get_cc(struct usbc_tcpc *t,
+    enum usbc_tcpc_cc_state *cc1, enum usbc_tcpc_cc_state *cc2)
+{
+	struct fusb302_softc *sc = t->softc;
+	uint8_t status1a;
+	int err;
+
+	if (cc1 != NULL) *cc1 = USBC_TCPC_CC_OPEN;
+	if (cc2 != NULL) *cc2 = USBC_TCPC_CC_OPEN;
+	err = fusb302_read_reg(sc, FUSB_REG_STATUS1A, &status1a);
+	if (err != 0)
+		return (err);
+	switch ((status1a & FUSB_ST1A_TOGSS_MASK) >> FUSB_ST1A_TOGSS_SHIFT) {
+	case FUSB_TOGSS_SRC_CC1:
+		if (cc1 != NULL) *cc1 = USBC_TCPC_CC_RD;
+		break;
+	case FUSB_TOGSS_SRC_CC2:
+		if (cc2 != NULL) *cc2 = USBC_TCPC_CC_RD;
+		break;
+	case FUSB_TOGSS_SNK_CC1:
+		if (cc1 != NULL) *cc1 = USBC_TCPC_CC_RP_USB;
+		break;
+	case FUSB_TOGSS_SNK_CC2:
+		if (cc2 != NULL) *cc2 = USBC_TCPC_CC_RP_USB;
+		break;
+	default:
+		break;	/* TOGSS_NOTHING -- both CC open. */
+	}
+	return (0);
+}
+
+/*
+ * get_vbus_present: read the chip's VBUS comparator.  STATUS0 bit
+ * VBUSOK reflects whether VBUS is above the chip's "valid" threshold
+ * (~vSafe5V).  Note RockPro64-style boards expose VBUSOK as always-1
+ * regardless of partner state because of how the rail is wired; that
+ * is a board-level wart, not a chip-level one.
+ */
+static int
+fusb302_tcpc_get_vbus_present(struct usbc_tcpc *t, bool *present)
+{
+	struct fusb302_softc *sc = t->softc;
+	uint8_t status0;
+	int err;
+
+	if (present == NULL)
+		return (EINVAL);
+	*present = false;
+	err = fusb302_read_reg(sc, FUSB_REG_STATUS0, &status0);
+	if (err != 0)
+		return (err);
+	*present = (status0 & FUSB_ST0_VBUSOK) != 0;
+	return (0);
+}
+
+/*
+ * set_vbus_source: enable / disable the VBUS power regulator the
+ * chip drives toward the partner.  On RockPro64 this is the
+ * SY6280AAC switch fed from VCC5V0_USB.  Idempotent against
+ * sc->vbus_enabled to avoid double-enabling the regulator.
+ */
+static int
+fusb302_tcpc_set_vbus_source(struct usbc_tcpc *t, bool en)
+{
+	struct fusb302_softc *sc = t->softc;
+	int err;
+
+	if (sc->vbus_supply == NULL)
+		return (ENXIO);
+	if (en && !sc->vbus_enabled) {
+		err = regulator_enable(sc->vbus_supply);
+		if (err != 0)
+			return (err);
+		sc->vbus_enabled = true;
+	} else if (!en && sc->vbus_enabled) {
+		err = regulator_disable(sc->vbus_supply);
+		if (err != 0)
+			return (err);
+		sc->vbus_enabled = false;
+	}
+	return (0);
+}
+
+/*
+ * transmit: hand a PD message off to the chip's TX FIFO.  Copies
+ * msg->hdr / data[] into sc->send_head / send_load[] and kicks
+ * fusb302_fifo_write_locked() which writes BMC tokens + payload to
+ * the chip.  Hardware handles BMC encoding, CRC32, retries, and
+ * GoodCRC reception.  Completion is asynchronous: the chip's IRQ
+ * handler will eventually convert TXSENT or RETRYFAIL to a
+ * USBC_PD_E_TX_OK / USBC_PD_E_TX_FAIL event into the policy
+ * machine (wiring lands in a later commit).  Only SOP is supported
+ * for now; SOP'/SOP'' (cable e-marker) lands later.
+ */
+static int
+fusb302_tcpc_transmit(struct usbc_tcpc *t, enum usbc_pd_sop sop,
+    const struct usbc_pd_msg *msg)
+{
+	struct fusb302_softc *sc = t->softc;
+	uint8_t i;
+
+	if (msg == NULL)
+		return (EINVAL);
+	if (sop != USBC_PD_SOP)
+		return (ENOTSUP);
+
+	sc->send_head = msg->hdr;
+	for (i = 0; i < msg->ndo && i < nitems(sc->send_load); i++)
+		sc->send_load[i] = msg->data[i];
+	return (fusb302_fifo_write_locked(sc));
+}
+
+/*
+ * receive: pull one PD message from the chip's RX FIFO.  Wraps
+ * fusb302_fifo_read_locked() and copies sc->rec_head / rec_load[]
+ * into the caller's struct usbc_pd_msg.  Returns ENOENT if no
+ * message is available; the chip auto-discards GoodCRC frames so
+ * what we surface is always a real partner message.
+ */
+static int
+fusb302_tcpc_receive(struct usbc_tcpc *t, enum usbc_pd_sop *sop_out,
+    struct usbc_pd_msg *msg)
+{
+	struct fusb302_softc *sc = t->softc;
+	uint8_t ndo, i;
+	int err;
+
+	if (msg == NULL)
+		return (EINVAL);
+	err = fusb302_fifo_read_locked(sc);
+	if (err != 0)
+		return (err);
+	msg->hdr = sc->rec_head;
+	ndo = (uint8_t)PD_HDR_CNT(sc->rec_head);
+	if (ndo > nitems(msg->data))
+		ndo = nitems(msg->data);
+	msg->ndo = ndo;
+	for (i = 0; i < ndo; i++)
+		msg->data[i] = sc->rec_load[i];
+	if (sop_out != NULL)
+		*sop_out = USBC_PD_SOP;
+	return (0);
+}
+
+/*
+ * send_hard_reset: pulse CONTROL3.SEND_HARDRST to make the chip
+ * emit a Hard Reset on the active CC line.  The chip clears the
+ * bit on its own once the reset is on the wire and then raises a
+ * HARDSENT interrupt which becomes USBC_PD_E_HARD_RESET_TX_OK in
+ * the policy machine.
+ */
+static int
+fusb302_tcpc_send_hard_reset(struct usbc_tcpc *t)
+{
+	struct fusb302_softc *sc = t->softc;
+
+	return (iic2errno(fusb302_update_reg(sc, FUSB_REG_CONTROL3,
+	    FUSB_CTL3_SEND_HARDRST, FUSB_CTL3_SEND_HARDRST)));
+}
+
+/*
+ * Public ops table.  The policy machine populates struct usbc_tcpc with
+ * a pointer to this and a chip-private softc handle.
+ */
+const struct usbc_tcpc_ops fusb302_tcpc_ops = {
+	.set_rp		= fusb302_tcpc_set_rp,
+	.set_role	= fusb302_tcpc_set_role,
+	.set_polarity	= fusb302_tcpc_set_polarity,
+	.set_vconn	= fusb302_tcpc_set_vconn,
+	.set_rx_enable	= fusb302_tcpc_set_rx_enable,
+	.get_cc		= fusb302_tcpc_get_cc,
+	.get_vbus_present = fusb302_tcpc_get_vbus_present,
+	.set_vbus_source = fusb302_tcpc_set_vbus_source,
+	.transmit	= fusb302_tcpc_transmit,
+	.receive	= fusb302_tcpc_receive,
+	.send_hard_reset = fusb302_tcpc_send_hard_reset,
+};

@@ -42,6 +42,4 @@ device		rk_drm
 # the simple-audio-card DT node this is harmless -- the framework
 # just doesn't bind anything.
 device		sound
-device		audio_soc
-device		dummy_codec
-device		rk_i2s
+options		SOC_ROCKCHIP_RK3399

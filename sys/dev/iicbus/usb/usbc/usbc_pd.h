@@ -169,6 +169,11 @@ enum usbc_pd_rp_value {
 #define	USBC_PD_T_SRC_TRANSITION_MS	30	/* 25..35  ms */
 #define	USBC_PD_T_NO_RESPONSE_MS	5000	/* 4.5..5.5 s */
 #define	USBC_PD_T_TYPEC_SEND_SRCCAP_MS	150	/* 100..200 ms */
+#define	USBC_PD_T_TYPEC_SINK_WAIT_CAP_MS 350	/* 310..620 ms */
+#define	USBC_PD_T_PS_TRANSITION_MS	500	/* 450..550 ms */
+#define	USBC_PD_T_PS_HARD_RESET_MS	30	/* 25..35  ms */
+#define	USBC_PD_T_SAFE_5V_MS		275	/* tSafe5V, max */
 #define	USBC_PD_N_CAPS_COUNT		50
+#define	USBC_PD_N_HARD_RESET_COUNT	2	/* spec nHardResetCount */
 
 #endif /* !_USBC_PD_H_ */

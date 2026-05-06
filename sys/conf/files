@@ -1827,6 +1827,8 @@ dev/iicbus/adc/ad7418.c		optional ad7418
 dev/iicbus/adc/ads111x.c	optional ads111x
 dev/iicbus/adc/pcf8591.c	optional pcf8591
 dev/iicbus/usb/fusb302.c	optional fusb302 iicbus fdt regulator
+dev/iicbus/usb/usbc/usbc_pd_msg.c    optional fusb302 fdt
+dev/iicbus/usb/usbc/usbc_pd_policy.c optional fusb302 fdt
 dev/iicbus/controller/opencores/iicoc.c	optional iicoc
 dev/iicbus/controller/opencores/iicoc_fdt.c	optional iicoc fdt
 dev/iicbus/controller/opencores/iicoc_pci.c	optional iicoc pci

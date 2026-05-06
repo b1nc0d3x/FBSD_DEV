@@ -1773,6 +1773,81 @@ rk_cdn_dp_sysctl_aux_wake(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
+/*
+ * aux_probe: split-diagnostic for the stage-13 timeout.  Issues one
+ * WRITE_DPCD (SET_POWER 0x600 <- D0), queries the firmware's last
+ * AUX status, then issues one READ_DPCD (DPCD_REV 0x000).  Logs all
+ * three results so the failure mode falls out:
+ *
+ *   write OK  + read OK   -> AUX wholly alive (likely just needed wake)
+ *   write OK  + read FAIL -> firmware read-response path broken/misconfigured
+ *   write FAIL+ read FAIL -> AUX engine never drives wire (PHY/SBU level)
+ *
+ * Cheaper to run than a full stage walk and decisive about which layer
+ * to attack next.
+ */
+static const char *rk_cdn_dp_aux_status_name(uint32_t status);
+
+static int
+rk_cdn_dp_aux_probe(struct rk_cdn_dp_softc *sc)
+{
+	uint8_t d0 = 0x01;
+	uint8_t dpcd[16];
+	uint8_t status;
+	int werr, rerr, serr;
+
+	werr = rk_cdn_dp_mailbox_dpcd_write(sc, 0x600, &d0, 1);
+	device_printf(sc->dev,
+	    "aux_probe: WRITE 0x600 <- D0 result=%d\n", werr);
+
+	DELAY(20000);	/* 20ms — give firmware time to drive wire */
+
+	serr = rk_cdn_dp_mailbox_get_last_aux_status(sc, &status);
+	if (serr == 0)
+		device_printf(sc->dev,
+		    "aux_probe: aux_status=0x%02x (%s)\n", status,
+		    rk_cdn_dp_aux_status_name(status));
+	else
+		device_printf(sc->dev,
+		    "aux_probe: aux_status query failed (%d)\n", serr);
+
+	rerr = rk_cdn_dp_mailbox_dpcd_read(sc, 0x000, dpcd, sizeof(dpcd));
+	device_printf(sc->dev,
+	    "aux_probe: READ 0x000 result=%d\n", rerr);
+	if (rerr == 0)
+		device_printf(sc->dev,
+		    "aux_probe: DPCD[0..7]= %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		    dpcd[0], dpcd[1], dpcd[2], dpcd[3],
+		    dpcd[4], dpcd[5], dpcd[6], dpcd[7]);
+
+	if (werr != 0)
+		return (werr);
+	return (rerr);
+}
+
+static int
+rk_cdn_dp_sysctl_aux_probe(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	error = rk_cdn_dp_aux_probe(sc);
+	sx_sunlock(&sc->detach_sx);
+	return (error);
+}
+
 static int
 rk_cdn_dp_sysctl_edid_now(SYSCTL_HANDLER_ARGS)
 {
@@ -4671,6 +4746,10 @@ rk_cdn_dp_attach(device_t dev)
 	    "aux_wake_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_aux_wake, "I",
 	    "Write 1 to attempt DPCD SET_POWER D3 -> D0 to wake the sink");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "aux_probe_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_aux_probe, "I",
+	    "Write 1: WRITE_DPCD 0x600<-D0 + aux_status + READ_DPCD 0x000 (split diagnostic)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "dp_altmode_valid", CTLFLAG_RD, &sc->dp_altmode_valid, 0,
 	    "Last observed DP Alt Mode helper presence");
