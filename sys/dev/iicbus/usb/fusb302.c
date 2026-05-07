@@ -132,7 +132,16 @@
  * = 0x04 sets USB-default 80uA Rp, which is what we want at attach.
  */
 #define	FUSB_CTL0_HOST_CUR_USB	0x04	/* bits[3:2]=01 = USB-default 80uA Rp */
-#define	FUSB_CTL0_HOST_CUR_DEF	FUSB_CTL0_HOST_CUR_USB
+#define	FUSB_CTL0_HOST_CUR_1A5	0x08	/* bits[3:2]=10 = 1.5A 180uA Rp    */
+#define	FUSB_CTL0_HOST_CUR_3A	0x0c	/* bits[3:2]=11 = 3.0A 330uA Rp    */
+/*
+ * Linux's running fusb302 on Armbian (verified via regmap_reg_write
+ * trace) uses HOST_CUR=10 (1.5A / 180uA Rp) for advertise.  USB-PD
+ * partners react better to the 180uA pull-up than the 80uA USB-default
+ * one, particularly when the cable has ~10ohm series resistance.
+ * Match Linux exactly.
+ */
+#define	FUSB_CTL0_HOST_CUR_DEF	FUSB_CTL0_HOST_CUR_1A5
 #define	FUSB_CTL0_INT_MASK	0x20
 
 /* CONTROL1 bits */
@@ -201,13 +210,8 @@
 #define	FUSB_INTRB_GCRCSENT	0x01
 
 /* Interrupt mask register initial values for PD operation */
-#define	FUSB_MASK1_PD		0x25	/* unmask COLLISION, ALERT, VBUSOK,
-					   ACTIVITY, CRC_CHK -- need ACTIVITY +
-					   CRC_CHK to see whether the partner
-					   ever drives the wire / replies with
-					   a decodable packet, otherwise we
-					   have no visibility into why
-					   RETRYFAIL keeps firing */
+#define	FUSB_MASK1_PD		0x75	/* unmask COLLISION, ALERT, VBUSOK
+					   (matches Linux i2c-rk3x init) */
 #define	FUSB_MASKA_PD		0xa2	/* unmask TOGDONE,TXSENT,HARDSENT,RETRYFAIL,HARDRST */
 #define	FUSB_MASKB_PD		0xfe	/* unmask GCRCSENT */
 
@@ -2774,6 +2778,30 @@ fusb302_init(struct fusb302_softc *sc)
 	error = fusb302_write_reg(sc, FUSB_REG_POWER, FUSB_POWER_ALL);
 	if (error != 0)
 		return (error);
+
+	/*
+	 * Clear SWITCHES0 explicitly to 0 BEFORE the chip starts toggling.
+	 * Linux's regmap_reg_write trace on Armbian shows this is the FIRST
+	 * write to SWITCHES0 after power-on -- the chip's POR default has
+	 * PDWN1|PDWN2 set (0x03), and leaving them set during DRP toggle
+	 * presents Rd to the partner from the start, biasing the toggle
+	 * arbitration toward landing as SNK.  Clearing them lets MODE_DRP
+	 * + TOG_RD_ONLY do its job (settle on Rd values = SRC role).
+	 */
+	error = fusb302_write_reg(sc, FUSB_REG_SWITCHES0, 0);
+	if (error != 0)
+		return (error);
+
+	/*
+	 * Program the MDAC comparator threshold for USB-default Rp current.
+	 * Linux's cc_meas_high = 0x26 -> ~1.596 V, derived from the table
+	 * in FUSB302B datasheet (Table 22) as the Rd-Connect detection
+	 * threshold when HOST_CUR = USB-default.  Without this the chip
+	 * runs with its POR MDAC = 0x31 (~2.058 V) which sits ABOVE any
+	 * realistic CC voltage during attach -- so COMP never trips and
+	 * the toggle state machine has bad signal to pick from.
+	 */
+	(void)fusb302_write_reg(sc, FUSB_REG_MEASURE, 0x26);
 
 	/* Clear any stale interrupts */
 	fusb302_read_reg(sc, FUSB_REG_INTERRUPT, &intr);
