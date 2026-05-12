@@ -56,6 +56,7 @@
 #include <arm64/rockchip/rk3399_typec_altmode_var.h>
 
 #include "rk_drm.h"
+#include "rk_dp_forced_mode.h"
 #include "fb_if.h"
 
 static struct ofw_compat_data rk_drm_compat_data[] = {
@@ -388,23 +389,20 @@ rk_drm_log_connector_modes(struct rk_drm_softc *sc, struct drm_connector *connec
 	}
 }
 
+/*
+ * Bias the DRM mode picker toward the forced mode defined in
+ * rk_dp_forced_mode.h, so the connector's preferred-timing flag lines
+ * up with what the framer/VOP actually drive.
+ */
 static bool
-rk_drm_mode_is_1920x1080_60(const struct drm_display_mode *mode)
+rk_drm_mode_is_forced(const struct drm_display_mode *mode)
 {
 	if (mode == NULL)
 		return (false);
-	/*
-	 * 1920x1080p60 and 1920x1080p50 (CEA VIC 16 / 31) share the same
-	 * 148.5 MHz pixel clock — they differ in htotal (2200 vs 2640).
-	 * Without the htotal check we pick whichever comes first in the
-	 * EDID probed-mode list, which may be p50 and produces a stream
-	 * the panel won't display.
-	 */
-	return (mode->hdisplay == 1920 &&
-	    mode->vdisplay == 1080 &&
-	    mode->clock >= 148000 &&
-	    mode->clock <= 149000 &&
-	    mode->htotal == 2200);
+	return (mode->hdisplay == RK_DP_FORCED_HDISPLAY &&
+	    mode->vdisplay == RK_DP_FORCED_VDISPLAY &&
+	    mode->clock >= RK_DP_FORCED_CLOCK_LO &&
+	    mode->clock <= RK_DP_FORCED_CLOCK_HI);
 }
 
 static void
@@ -418,7 +416,7 @@ rk_drm_prefer_usbc_dp_mode(struct rk_drm_softc *sc, struct drm_connector *connec
 
 	chosen = NULL;
 	list_for_each_entry(iter, &connector->probed_modes, head) {
-		if (rk_drm_mode_is_1920x1080_60(iter)) {
+		if (rk_drm_mode_is_forced(iter)) {
 			chosen = iter;
 			break;
 		}
@@ -540,29 +538,24 @@ static void
 rk_drm_fill_forced_dp_mode(struct drm_display_mode *mode)
 {
 	/*
-	 * Use the XYM W156F1 panel's EDID-preferred native timing: 1920x1080@60.
-	 * Values taken verbatim from the panel's first Detailed Timing Descriptor:
-	 *   pixel clock 148.5 MHz; htotal 2200 (hfront 48, hsync 32);
-	 *   vtotal 1125 (vfront 3, vsync 5); sync polarity PHSYNC | NVSYNC
-	 *   (EDID byte 17 = 0x1a).
-	 *
-	 * Earlier comment claimed the panel preferred 1400x1050 — that was a
-	 * stale memory note.  Live-EDID dump (00 ff ff ff ff ff ff 00 …) puts
-	 * 1920x1080p60 in the first DTD with the preferred-timing bit set, plus
-	 * CTA VIC 16 marked native.  The panel accepts a range of timings so
-	 * 1400x1050 also lit, but native gives pixel-perfect display.
+	 * Values come from rk_dp_forced_mode.h; edit there to experiment.
+	 * Both this function and rk_cdn_dp_fill_forced_mode() consume the
+	 * same header and MUST stay in sync.
 	 */
 	memset(mode, 0, sizeof(*mode));
-	mode->clock = 148500;
-	mode->hdisplay = 1920;
-	mode->hsync_start = 1968;
-	mode->hsync_end = 2000;
-	mode->htotal = 2200;
-	mode->vdisplay = 1080;
-	mode->vsync_start = 1083;
-	mode->vsync_end = 1088;
-	mode->vtotal = 1125;
-	mode->flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NVSYNC;
+	mode->clock = RK_DP_FORCED_CLOCK_KHZ;
+	mode->hdisplay = RK_DP_FORCED_HDISPLAY;
+	mode->hsync_start = RK_DP_FORCED_HSYNC_START;
+	mode->hsync_end = RK_DP_FORCED_HSYNC_END;
+	mode->htotal = RK_DP_FORCED_HTOTAL;
+	mode->vdisplay = RK_DP_FORCED_VDISPLAY;
+	mode->vsync_start = RK_DP_FORCED_VSYNC_START;
+	mode->vsync_end = RK_DP_FORCED_VSYNC_END;
+	mode->vtotal = RK_DP_FORCED_VTOTAL;
+	mode->flags = (RK_DP_FORCED_H_POLARITY ? DRM_MODE_FLAG_PHSYNC :
+	    DRM_MODE_FLAG_NHSYNC) |
+	    (RK_DP_FORCED_V_POLARITY ? DRM_MODE_FLAG_PVSYNC :
+	    DRM_MODE_FLAG_NVSYNC);
 	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
 	drm_mode_set_name(mode);
 }
@@ -600,9 +593,9 @@ rk_drm_fb_target_size(uint32_t *width, uint32_t *height)
 
 	if (sc != NULL && sc->output_select == RK_DRM_OUTPUT_USBC_DP) {
 		if (width != NULL)
-			*width = 1920;
+			*width = RK_DP_FORCED_HDISPLAY;
 		if (height != NULL)
-			*height = 1080;
+			*height = RK_DP_FORCED_VDISPLAY;
 		return;
 	}
 
@@ -2205,6 +2198,27 @@ rk_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 	sc = device_get_softc(crtc->dev->dev);
 	active_mode = adjusted_mode != NULL ? adjusted_mode : mode;
 	if (rk_drm_output_route_locked(sc) == RK_DRM_OUTPUT_USBC_DP) {
+		struct drm_display_mode forced;
+
+		/*
+		 * USB-C DP override.  DRM may have picked any timing from
+		 * the EDID-derived connector mode list (or our forced mode if
+		 * it happens to match by hdisplay/vdisplay/pclk).  For
+		 * investigation, IGNORE DRM's choice and always drive the
+		 * exact values from rk_dp_forced_mode.h — this guarantees
+		 * VOP + cdn-dp framer both see the same custom timing without
+		 * needing to inject our mode into DRM's connector mode list.
+		 */
+		rk_drm_fill_forced_dp_mode(&forced);
+		device_printf(sc->dev,
+		    "USB-C DP override: DRM asked %ux%u@%u, forcing %ux%u@%u kHz\n",
+		    active_mode->hdisplay, active_mode->vdisplay,
+		    active_mode->clock, forced.hdisplay, forced.vdisplay,
+		    forced.clock);
+		active_mode = &forced;
+		if (adjusted_mode != NULL)
+			*adjusted_mode = forced;
+
 		cdn_enable_mode = rk_drm_lookup_cdn_enable_mode();
 		if (cdn_enable_mode == NULL)
 			return (-ENXIO);

@@ -77,6 +77,7 @@
 #include "syscon_if.h"
 #include "rk3399_power.h"
 #include "rk3399_typec_altmode_var.h"
+#include "rk_dp_forced_mode.h"
 
 #define RK_CDN_DP_MODE_FLAG_PHSYNC	(1u << 0)
 #define RK_CDN_DP_MODE_FLAG_PVSYNC	(1u << 2)
@@ -688,6 +689,8 @@ static int	rk_cdn_dp_sysctl_probe_warm(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_retrain_now(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_display_power(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_backlight_power(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_dpcd_write_now(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_dpcd_read_now(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_get_clocks(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_enable_clocks(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_sysctl_reg_addr(SYSCTL_HANDLER_ARGS);
@@ -2247,6 +2250,91 @@ rk_cdn_dp_sysctl_backlight_power(SYSCTL_HANDLER_ARGS)
 	if (error != 0)
 		return (error);
 	sc->backlight_state = (uint8_t)val;
+	return (0);
+}
+
+/*
+ * Generic DPCD AUX write/read sysctls.  Pair an address (uint16_t —
+ * full DPCD address space, including eDP backlight 0x720+ and vendor
+ * ranges 0x80000+) with an 8-bit value, then trigger via dpcd_write_now.
+ *
+ * Backed by sc->debug_reg_addr / sc->debug_reg_value (same storage as
+ * the cdn-dp mailbox-register pokers — distinct sysctls, separate
+ * trigger).  Userspace flow:
+ *
+ *   sysctl dev.rk_cdn_dp.0.debug_reg_addr=0x720      # DPCD addr
+ *   sysctl dev.rk_cdn_dp.0.debug_reg_value=0x00      # byte to write
+ *   sysctl dev.rk_cdn_dp.0.dpcd_write_now=1
+ *
+ * For reads:
+ *   sysctl dev.rk_cdn_dp.0.debug_reg_addr=0x720
+ *   sysctl dev.rk_cdn_dp.0.dpcd_read_now=1
+ *   sysctl -n dev.rk_cdn_dp.0.debug_reg_value      # result here
+ */
+static int
+rk_cdn_dp_sysctl_dpcd_write_now(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	uint8_t byte;
+	uint32_t addr;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	addr = sc->debug_reg_addr;
+	byte = (uint8_t)(sc->debug_reg_value & 0xff);
+	error = rk_cdn_dp_mailbox_dpcd_write(sc, addr, &byte, 1);
+	device_printf(sc->dev,
+	    "dpcd_write: DPCD 0x%05x <- 0x%02x result=%d\n",
+	    addr, byte, error);
+	sx_sunlock(&sc->detach_sx);
+	return (error);
+}
+
+static int
+rk_cdn_dp_sysctl_dpcd_read_now(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	uint8_t byte;
+	uint32_t addr;
+	int error, val = 0;
+	ssize_t got;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	addr = sc->debug_reg_addr;
+	byte = 0;
+	got = rk_cdn_dp_mailbox_dpcd_read(sc, addr, &byte, 1);
+	if (got != 1) {
+		device_printf(sc->dev,
+		    "dpcd_read: DPCD 0x%05x failed (got=%zd)\n", addr, got);
+		sx_sunlock(&sc->detach_sx);
+		return (EIO);
+	}
+	sc->debug_reg_value = byte;
+	device_printf(sc->dev,
+	    "dpcd_read: DPCD 0x%05x = 0x%02x\n", addr, byte);
+	sx_sunlock(&sc->detach_sx);
 	return (0);
 }
 
@@ -4048,25 +4136,23 @@ static void
 rk_cdn_dp_fill_forced_mode(struct rk_cdn_dp_softc *sc)
 {
 	/*
-	 * Keep the Cadence framer in lock-step with rk_drm's forced DP mode
-	 * (rk_drm_fill_forced_dp_mode).  Both sides MUST use the same values
-	 * or the sink will reject the stream.  Native panel timing per EDID:
-	 *   1920x1080 @ 60 Hz, pixclk 148.5 MHz, htotal 2200, vtotal 1125,
-	 *   sync polarity PHSYNC | NVSYNC (EDID byte 17 = 0x1a).
+	 * Values come from rk_dp_forced_mode.h; edit there to experiment.
+	 * Both this function and rk_drm_fill_forced_dp_mode() consume the
+	 * same header and MUST stay in sync.
 	 */
-	sc->pixel_clock_khz = 148500;
-	sc->hdisplay = 1920;
-	sc->hblank = 280;
-	sc->htotal = 2200;
-	sc->hsync_start = 1968;
-	sc->hsync_end = 2000;
-	sc->vdisplay = 1080;
-	sc->vblank = 45;
-	sc->vtotal = 1125;
-	sc->vsync_start = 1083;
-	sc->vsync_end = 1088;
-	sc->h_sync_polarity = 1;
-	sc->v_sync_polarity = 0;
+	sc->pixel_clock_khz = RK_DP_FORCED_CLOCK_KHZ;
+	sc->hdisplay = RK_DP_FORCED_HDISPLAY;
+	sc->hblank = RK_DP_FORCED_HBLANK;
+	sc->htotal = RK_DP_FORCED_HTOTAL;
+	sc->hsync_start = RK_DP_FORCED_HSYNC_START;
+	sc->hsync_end = RK_DP_FORCED_HSYNC_END;
+	sc->vdisplay = RK_DP_FORCED_VDISPLAY;
+	sc->vblank = RK_DP_FORCED_VBLANK;
+	sc->vtotal = RK_DP_FORCED_VTOTAL;
+	sc->vsync_start = RK_DP_FORCED_VSYNC_START;
+	sc->vsync_end = RK_DP_FORCED_VSYNC_END;
+	sc->h_sync_polarity = RK_DP_FORCED_H_POLARITY;
+	sc->v_sync_polarity = RK_DP_FORCED_V_POLARITY;
 	device_printf(sc->dev,
 	    "forced video mode: %ux%u @ %u kHz htotal=%u hsync=%u..%u (pol=%u) vtotal=%u vsync=%u..%u (pol=%u)\n",
 	    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz, sc->htotal,
@@ -6123,6 +6209,17 @@ rk_cdn_dp_attach(device_t dev)
 	    sc, 0, rk_cdn_dp_sysctl_backlight_power, "I",
 	    "AUX-channel backlight on/off via DPCD 0x720 BL_ENABLE bit "
 	    "(eDP 1.4+ spec; sink may NAK if unsupported)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "dpcd_write_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_dpcd_write_now, "I",
+	    "Write debug_reg_value (low byte) to DPCD addr debug_reg_addr "
+	    "via AUX.  For poking arbitrary DPCD addresses including "
+	    "eDP backlight ranges (0x701, 0x720-0x72f) and vendor ranges.");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "dpcd_read_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_dpcd_read_now, "I",
+	    "Read DPCD addr debug_reg_addr via AUX, store result in "
+	    "debug_reg_value (low byte).");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "debug_reg_addr", CTLTYPE_U32 | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_reg_addr, "IU",
