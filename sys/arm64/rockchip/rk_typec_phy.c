@@ -81,16 +81,28 @@
 #define	CMN_DIAG_PLL0_V2I_TUNE		(0x1c5 << 2)
 #define	CMN_DIAG_PLL0_CP_TUNE		(0x1c6 << 2)
 #define	CMN_DIAG_PLL0_LF_PROG		(0x1c7 << 2)
-#define	CMN_PLL1_VCOCAL_INIT		(0x104 << 2)
-#define	CMN_PLL1_VCOCAL_ITER		(0x105 << 2)
-#define	CMN_PLL1_VCOCAL_START		(0x108 << 2)
-#define	CMN_PLL1_INTDIV			(0x114 << 2)
-#define	CMN_PLL1_FRACDIV		(0x115 << 2)
-#define	CMN_PLL1_HIGH_THR		(0x116 << 2)
-#define	CMN_PLL1_DSM_DIAG		(0x117 << 2)
-#define	CMN_PLL1_SS_CTRL1		(0x118 << 2)
-#define	CMN_PLL1_SS_CTRL2		(0x119 << 2)
+/*
+ * CMN PLL1 register addresses must match Linux 4.4 BSP exactly — the historical
+ * port had these at +0x60 offsets which silently broke every HBR PLL
+ * configuration write (writes landed in unrelated registers, leaving PLL1's
+ * VCO uncalibrated). Matched against drivers/phy/rockchip/phy-rockchip-typec.c
+ * lines 92-104. Verified 2026-05-09 as the EQ-at-HBR root cause.
+ */
+#define	CMN_PLL1_VCOCAL_START		(0xa1 << 2)
+#define	CMN_PLL1_VCOCAL_OVRD		(0xa3 << 2)
+#define	CMN_PLL1_VCOCAL_INIT		(0xa4 << 2)
+#define	CMN_PLL1_VCOCAL_ITER		(0xa5 << 2)
+#define	CMN_PLL1_LOCK_REFCNT_START	(0xb0 << 2)
+#define	CMN_PLL1_LOCK_PLLCNT_START	(0xb2 << 2)
+#define	CMN_PLL1_LOCK_PLLCNT_THR	(0xb3 << 2)
+#define	CMN_PLL1_INTDIV			(0xb4 << 2)
+#define	CMN_PLL1_FRACDIV		(0xb5 << 2)
+#define	CMN_PLL1_HIGH_THR		(0xb6 << 2)
+#define	CMN_PLL1_DSM_DIAG		(0xb7 << 2)
+#define	CMN_PLL1_SS_CTRL1		(0xb8 << 2)
+#define	CMN_PLL1_SS_CTRL2		(0xb9 << 2)
 #define	CMN_PLLSM1_USER_DEF_CTRL	(0x37 << 2)
+#define	CMN_PLLSM1_PLLLOCK		(0x34 << 2)	/* PLL1 lock status */
 #define	CMN_DIAG_PLL1_FBH_OVRD		(0x1d0 << 2)
 #define	CMN_DIAG_PLL1_FBL_OVRD		(0x1d1 << 2)
 #define	CMN_DIAG_PLL1_OVRD		(0x1d2 << 2)
@@ -113,10 +125,22 @@
 #define	TX_TXCC_MGNFS_MULT_101(lane)	((0x4055 | ((lane) << 9)) << 2)
 #define	TX_TXCC_MGNFS_MULT_110(lane)	((0x4056 | ((lane) << 9)) << 2)
 #define	TX_TXCC_MGNFS_MULT_111(lane)	((0x4057 | ((lane) << 9)) << 2)
-#define	TX_TXCC_CPOST_MULT_10(lane)	((0x405c | ((lane) << 9)) << 2)
-#define	TX_TXCC_CPOST_MULT_01(lane)	((0x405d | ((lane) << 9)) << 2)
-#define	TX_TXCC_CPOST_MULT_00(lane)	((0x405e | ((lane) << 9)) << 2)
-#define	TX_TXCC_CPOST_MULT_11(lane)	((0x405f | ((lane) << 9)) << 2)
+/*
+ * CPOST_MULT_XX register addresses must match Linux 4.4 BSP exactly. The
+ * historical port had CPOST at offset 0x405c-0x405f (+0x10 byte offset wrong)
+ * AND swapped _00 ↔ _10 labels — every set_signal_levels CPOST_MULT_00 write
+ * landed on the wrong register, leaving actual TX pre-emphasis at chip-default
+ * regardless of partner adjust_request. Smoking-gun: 2026-05-10 register-poke
+ * bitbang trace showed we wrote 0x15 to "CPOST_00" successfully (readback OK
+ * at the WRONG address) but link partner never saw the pre-emphasis change,
+ * EQ stalled at max-swing/pre_emp request indefinitely.
+ *
+ * Linux phy-rockchip-typec.c:161 / rk3399_tcphy_helper.c:103 use 0x404c.
+ */
+#define	TX_TXCC_CPOST_MULT_00(lane)	((0x404c | ((lane) << 9)) << 2)
+#define	TX_TXCC_CPOST_MULT_01(lane)	((0x404d | ((lane) << 9)) << 2)
+#define	TX_TXCC_CPOST_MULT_10(lane)	((0x404e | ((lane) << 9)) << 2)
+#define	TX_TXCC_CPOST_MULT_11(lane)	((0x404f | ((lane) << 9)) << 2)
 #define	TX_TXCC_CAL_SCLR_MULT(lane)	((0x4047 | ((lane) << 9)) << 2)
 #define	XCVR_DIAG_PLLDRC_CTRL(lane)	((0x40e0 | ((lane) << 9)) << 2)
 #define	XCVR_DIAG_BIDI_CTRL(lane)	((0x40e8 | ((lane) << 9)) << 2)
@@ -161,6 +185,11 @@
  * cleared.
  */
 #define	DP_LINK_RESET_DEASSERTED	(1U << 8)
+#define	DP_LANE_0_DISABLE		(1U << 12)
+#define	DP_LANE_1_DISABLE		(1U << 13)
+#define	DP_LANE_2_DISABLE		(1U << 14)
+#define	DP_LANE_3_DISABLE		(1U << 15)
+#define	DP_LANE_DISABLE_MASK		(0xfU << 12)
 #define	DP_CLK_CTL			(0xc009 << 2)
 #define	 DP_PLL_CLOCK_ENABLE		(1U << 2)
 #define	 DP_PLL_CLOCK_DISABLE		(0U << 2)
@@ -246,7 +275,7 @@ static const struct rk_typec_phy_grf_prop rk3399_tcphy0_uphy_dp_sel = {
 	.msb = 19,
 };
 
-static const struct rk_typec_phy_reg rk3399_tcphy_dp_pll_cfg[] = {
+static const struct rk_typec_phy_reg __unused rk3399_tcphy_dp_pll_cfg[] = {
 	{ 0xf0,	CMN_PLL1_VCOCAL_INIT },
 	{ 0x18,	CMN_PLL1_VCOCAL_ITER },
 	{ 0x30b9,	CMN_PLL1_VCOCAL_START },
@@ -512,12 +541,28 @@ static void
 rk_typec_phy_cfg_dp_pll(struct rk_typec_phy_softc *sc)
 {
 	size_t i;
+	uint32_t hsclk;
 
+	/*
+	 * Linux's tcphy_cfg_dp_pll(tcphy, DP_DEFAULT_RATE=162000) loads the
+	 * RBR PLL config at init.  We previously loaded a "base" config with
+	 * INTDIV=0x21c that doesn't correspond to any standard DP rate;
+	 * switching from there to HBR via tcphy_dp_set_link_rate would fail
+	 * because PLL_VCOCAL_START / INTDIV mismatched the rate.  Match
+	 * Linux: set DATA_RATE_RBR, HSCLK_SEL_PLL1_DIV2, and load the RBR
+	 * cfg table — set_link_rate transitions cleanly from RBR.
+	 */
 	RK_TYPEC_PHY_WRITE(sc, DP_CLK_CTL, DP_PLL_CLOCK_ENABLE |
 	    DP_PLL_ENABLE | DP_PLL_DATA_RATE_RBR);
-	for (i = 0; i < nitems(rk3399_tcphy_dp_pll_cfg); i++)
-		RK_TYPEC_PHY_WRITE(sc, rk3399_tcphy_dp_pll_cfg[i].addr,
-		    rk3399_tcphy_dp_pll_cfg[i].value);
+
+	hsclk = RK_TYPEC_PHY_READ(sc, CMN_DIAG_HSCLK_SEL);
+	hsclk &= ~((0x3U << 4) | (0x3U << 0));
+	hsclk |= (3U << 4) | (0U << 0); /* CLK_PLL1_DIV2 (matches Linux RBR) */
+	RK_TYPEC_PHY_WRITE(sc, CMN_DIAG_HSCLK_SEL, hsclk);
+
+	for (i = 0; i < nitems(rk3399_tcphy_dp_pll_rbr_cfg); i++)
+		RK_TYPEC_PHY_WRITE(sc, rk3399_tcphy_dp_pll_rbr_cfg[i].addr,
+		    rk3399_tcphy_dp_pll_rbr_cfg[i].value);
 }
 
 static void
@@ -532,17 +577,17 @@ rk_typec_phy_cfg_dp_lane(struct rk_typec_phy_softc *sc, u_int lane)
 	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A3(lane), 0x98);
 
 	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_000(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_001(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_010(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_011(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_100(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_101(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_110(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_111(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_CPOST_MULT_10(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_CPOST_MULT_01(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_CPOST_MULT_00(lane), 0x0);
-	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_CPOST_MULT_11(lane), 0x0);
+	/*
+	 * Do NOT pre-zero MGNFS_MULT_001..111 or CPOST_MULT_00..11 here.
+	 * Before the 2026-05-10 CPOST address fix (0x405c -> 0x404c) these
+	 * zero writes landed on unmapped addresses (no-op). After the fix
+	 * they correctly target the analog drive multiplier registers, and
+	 * zeroing them at init clobbers chip defaults the AUX path needs —
+	 * hangs the dptx firmware after set_host_cap. set_voltages writes
+	 * MGNFS_000 + CPOST_00 per train iteration anyway; leave the rest
+	 * at chip default. Linux 4.4 tcphy_dp_cfg_lane writes none of
+	 * these.
+	 */
 
 	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_CAL_SCLR_MULT(lane), 0x128);
 	RK_TYPEC_PHY_WRITE(sc, TX_DIAG_TX_DRV(lane), 0x400);
@@ -550,6 +595,42 @@ rk_typec_phy_cfg_dp_lane(struct rk_typec_phy_softc *sc, u_int lane)
 	reg = RK_TYPEC_PHY_READ(sc, XCVR_DIAG_PLLDRC_CTRL(lane));
 	reg = (reg & 0x8fff) | 0x6000;
 	RK_TYPEC_PHY_WRITE(sc, XCVR_DIAG_PLLDRC_CTRL(lane), reg);
+}
+
+/*
+ * Per-lane USB3 TX configuration. Matches Linux 4.4 BSP
+ * `tcphy_tx_usb3_cfg_lane`. Used for the lanes that carry USB3 traffic in
+ * PIN_D/F mode (the other pair carries DP).
+ */
+static void
+rk_typec_phy_cfg_usb3_tx_lane(struct rk_typec_phy_softc *sc, u_int lane)
+{
+	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A0(lane), 0x7799);
+	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A1(lane), 0x7798);
+	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A2(lane), 0x5098);
+	RK_TYPEC_PHY_WRITE(sc, TX_PSC_A3(lane), 0x5098);
+	RK_TYPEC_PHY_WRITE(sc, TX_TXCC_MGNFS_MULT_000(lane), 0x0);
+	RK_TYPEC_PHY_WRITE(sc, XCVR_DIAG_BIDI_CTRL(lane), 0xbf);
+}
+
+/*
+ * Per-lane USB3 RX configuration. Matches Linux 4.4 BSP
+ * `tcphy_rx_usb3_cfg_lane`. Used for the lanes that carry USB3 traffic in
+ * PIN_D/F mode.
+ */
+static void
+rk_typec_phy_cfg_usb3_rx_lane(struct rk_typec_phy_softc *sc, u_int lane)
+{
+	RK_TYPEC_PHY_WRITE(sc, RX_PSC_A0(lane), 0xa6fd);
+	RK_TYPEC_PHY_WRITE(sc, RX_PSC_A1(lane), 0xa6fd);
+	RK_TYPEC_PHY_WRITE(sc, RX_PSC_A2(lane), 0xa410);
+	RK_TYPEC_PHY_WRITE(sc, RX_PSC_A3(lane), 0x2410);
+	RK_TYPEC_PHY_WRITE(sc, RX_PSC_CAL(lane), 0x23ff);
+	RK_TYPEC_PHY_WRITE(sc, RX_SIGDET_HL_FILT_TMR(lane), 0x13);
+	RK_TYPEC_PHY_WRITE(sc, RX_REE_CTRL_DATA_MASK(lane), 0x03e7);
+	RK_TYPEC_PHY_WRITE(sc, RX_DIAG_SIGDET_TUNE(lane), 0x1004);
+	RK_TYPEC_PHY_WRITE(sc, RX_PSC_RDY(lane), 0x2010);
+	RK_TYPEC_PHY_WRITE(sc, XCVR_DIAG_BIDI_CTRL(lane), 0xfb);
 }
 
 static void
@@ -892,14 +973,17 @@ rk_typec_phy_dp_set_link_rate(device_t dev, int link_rate, bool ssc_on)
 }
 
 /*
- * Configure the PHY's DP lane disable bits (DP_MODE_CTL[15:12]) for the
- * trained lane count.  Bits 12..15 = lane 0..3 disable.
+ * Empirically: live read of Armbian (Linux 4.4, working DP at 1400x1050) shows
+ * DP_MODE_CTL = 0x110 / 0x140 across boot and desktop modes — bits 15:12 are
+ * always 0.  Even though Linux's tcphy_dp_set_lane_count() writes those bits,
+ * the final settled state has all lanes enabled.  Some other code path (PHY
+ * re-init or a write we haven't traced) clears them after.  Treat lane count
+ * as sink-side training state only and leave DP_MODE_CTL untouched.
  */
 int
 rk_typec_phy_dp_set_lane_count(device_t dev, int lane_count)
 {
 	struct rk_typec_phy_softc *sc;
-	uint32_t reg, disable;
 
 	if (dev == NULL)
 		return (EINVAL);
@@ -907,26 +991,17 @@ rk_typec_phy_dp_set_lane_count(device_t dev, int lane_count)
 	if (sc == NULL)
 		return (EINVAL);
 
-	reg = RK_TYPEC_PHY_READ(sc, DP_MODE_CTL);
-	reg |= 0xfU << 12;	/* set ALL lane-disable bits */
 	switch (lane_count) {
 	case 4:
-		disable = 0;	/* enable all 4 */
-		break;
 	case 2:
-		disable = (1U << 14) | (1U << 15);	/* keep lanes 2,3 disabled */
-		break;
 	case 1:
-		disable = (1U << 13) | (1U << 14) | (1U << 15);
 		break;
 	default:
 		return (EINVAL);
 	}
-	reg &= ~(0xfU << 12);
-	reg |= disable;
-	RK_TYPEC_PHY_WRITE(sc, DP_MODE_CTL, reg);
 	device_printf(sc->dev,
-	    "set_lane_count: lanes=%d DP_MODE_CTL=0x%x\n", lane_count, reg);
+	    "set_lane_count: lanes=%d leaving DP_MODE_CTL=0x%x unchanged\n",
+	    lane_count, RK_TYPEC_PHY_READ(sc, DP_MODE_CTL));
 	return (0);
 }
 
@@ -1115,8 +1190,21 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 	if (phy != RK3399_TYPEC_PHY_DP && phy != RK3399_TYPEC_PHY_USB3)
 		return (ERANGE);
 
+	/*
+	 * USB3-vs-USB2 routing for the SS lanes:
+	 *   USB3 mode: SS lanes carry USB3 SuperSpeed → enable USB3 host.
+	 *   DP mode (PIN_C/E, 4-lane DP):  SS lanes are DP → force USB3 host
+	 *     into USB2-only so it can't drive interfering signals on the
+	 *     same physical wires as our DP TX.  Linux's `tcphy_phy_init` for
+	 *     `MODE_DFP_DP` calls `tcphy_cfg_usb3_to_usb2_only(tcphy, true)`
+	 *     for exactly this reason (line 1179 in 4.4 BSP phy-rockchip-typec.c).
+	 *     Without this, the USB3 host's idle signaling on SS lanes leaks
+	 *     into the DP main link → CR survives but EQ never symbol-locks.
+	 */
 	if (phy == RK3399_TYPEC_PHY_USB3)
 		rk_typec_phy_set_usb2_only(sc, false);
+	else if (phy == RK3399_TYPEC_PHY_DP)
+		rk_typec_phy_set_usb2_only(sc, true);
 
 	err = clk_enable(sc->tcpdcore);
 	if (err != 0) {
@@ -1162,19 +1250,21 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 			hwreset_assert(sc->rst_uphy);
 			hwreset_assert(sc->rst_tcphy);
 			DELAY(10000);
-		} else if (pma_rd & PMA_CMN_CTRL1_READY) {
+		} else if ((pma_rd & PMA_CMN_CTRL1_READY) &&
+		    sc->init_done && sc->flip == sc->init_flip) {
 			/*
-			 * PMA active and PHY already in A2_READY: skip init.
-			 * Re-running common 24M setup knocks PMA out of A2,
-			 * and asserting rst_uphy while the PLL runs leaves
-			 * PMA stuck.  conn_dir GRF can NOT be safely written
-			 * mid-flight either (breaks A2 PSM).
+			 * PMA active and PHY already in A2_READY: skip init only
+			 * if this driver already brought the PHY up in the same
+			 * connector orientation.  Re-running common 24M setup
+			 * knocks PMA out of A2, and asserting rst_uphy while the
+			 * PLL runs leaves PMA stuck.  conn_dir GRF can NOT be
+			 * safely written mid-flight either (breaks A2 PSM).
 			 *
-			 * If sc->flip differs from what was set at PHY startup,
-			 * conn_dir is now stale and lane 1 EQ will fail because
-			 * DP wires are routed for the wrong orientation.  We
-			 * have no good remediation from this state — see
-			 * project_rkdrm.md frontier notes.
+			 * Do not trust a bootloader- or firmware-inherited A2
+			 * state: if init_done is false, or the live orientation
+			 * differs from init_flip, we must tear the PHY down and
+			 * reinitialize it so PMA_LANE_CFG and conn_dir match the
+			 * current Type-C orientation.
 			 */
 			device_printf(dev,
 			    "dp-init: PHY already in A2 (dp=0x%x pma=0x%x), skip init (flip=%u init_flip=%u init_done=%u)\n",
@@ -1183,6 +1273,15 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 			rk_typec_phy_dp_aux_set_flip(sc);
 			rk_typec_phy_dp_aux_calibration(sc);
 			return (0);
+		} else if (pma_rd & PMA_CMN_CTRL1_READY) {
+			device_printf(dev,
+			    "dp-init: inherited/stale A2 state (dp=0x%x pma=0x%x flip=%u init_flip=%u init_done=%u), forcing reinit\n",
+			    dp_rd, pma_rd, sc->flip ? 1 : 0,
+			    sc->init_flip ? 1 : 0, sc->init_done ? 1 : 0);
+			hwreset_assert(sc->rst_pipe);
+			hwreset_assert(sc->rst_uphy);
+			hwreset_assert(sc->rst_tcphy);
+			DELAY(10000);
 		}
 	}
 
@@ -1247,13 +1346,40 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 		RK_TYPEC_PHY_WRITE(sc, CMN_DIAG_HSCLK_SEL, reg);
 
 		rk_typec_phy_cfg_dp_pll(sc);
-		for (int i = 0; i < 4; i++)
-			rk_typec_phy_cfg_dp_lane(sc, i);
 		/*
-		 * CDN-DP is configured for 2-lane DP + USB3 (lanes=2 in host_cap).
-		 * PIN_ASSIGN_D_F (0x5100) matches that: lanes 0-1 carry DP, lanes 2-3
-		 * are USB3.  PIN_ASSIGN_C_E (0x51d9) is 4-lane DP-only and mismatches
-		 * CDN-DP's 2-lane mode, which causes AUX routing to fail.
+		 * Per-lane configuration matching Linux 4.4 BSP's PIN_D/F path
+		 * (`tcphy_phy_init` else-branch when MODE includes MODE_DFP_USB):
+		 *   flip=1 (CC2): USB3 TX on lane 3, USB3 RX on lane 2, DP on 0,1
+		 *   flip=0 (CC1): USB3 TX on lane 0, USB3 RX on lane 1, DP on 2,3
+		 * This matches `set_signal_levels`'s flip-aware lane selection.
+		 * Configuring all 4 lanes as DP (the previous `for i 0..3
+		 * cfg_dp_lane`) conflicted with `PMA_LANE_CFG=PIN_ASSIGN_D_F`
+		 * (which says lanes 2,3 are USB3) — analog cross-coupling between
+		 * misconfigured DP-driven lanes and the actual DP lanes broke EQ.
+		 * Live ftrace capture from working Armbian 4.4 BSP confirmed Linux
+		 * uses this 2-USB3-+-2-DP per-lane split for our exact cable.
+		 */
+		if (sc->flip) {
+			rk_typec_phy_cfg_usb3_tx_lane(sc, 3);
+			rk_typec_phy_cfg_usb3_rx_lane(sc, 2);
+			rk_typec_phy_cfg_dp_lane(sc, 0);
+			rk_typec_phy_cfg_dp_lane(sc, 1);
+		} else {
+			rk_typec_phy_cfg_usb3_tx_lane(sc, 0);
+			rk_typec_phy_cfg_usb3_rx_lane(sc, 1);
+			rk_typec_phy_cfg_dp_lane(sc, 2);
+			rk_typec_phy_cfg_dp_lane(sc, 3);
+		}
+		/*
+		 * Pin Assignment selection.  Live read of Armbian shows
+		 * PMA_LANE_CFG = 0x51d9 (PIN_C_E), but Armbian's per-lane DP
+		 * electrical config is keyed to the C_E lane map (PMA0..3 all DP,
+		 * with PMA0,1 internally = DP_LANE_2,3).  Our cfg_dp_lane() calls
+		 * still drive flip-aware on PMA lanes 0,1 (CC2) / 2,3 (CC1), which
+		 * matches the D_F map (PMA 0,1 = USB3, PMA 2,3 = DP).  Switching to
+		 * C_E without also reworking cfg_dp_lane causes the trained link
+		 * to collapse at modeset (PMA-vs-internal-lane skew).  Stay on D_F
+		 * until per-lane cfg is reworked too.
 		 */
 		RK_TYPEC_PHY_WRITE(sc, PMA_LANE_CFG, PIN_ASSIGN_D_F);
 
@@ -1498,6 +1624,132 @@ rk_typec_phy_set_phy_mode(struct phynode *phynode, phy_mode_t mode,
 	}
 }
 
+/*
+ * "Poke ahead" diagnostic: pre-write the signal-level registers for the
+ * EQ-target values (swing=2, pre_emp=1) to the active DP lanes BEFORE the
+ * cdn_dp link-train sequence runs.  Then poll dump_regs to see whether
+ * those values stay or get overwritten during EQ — points to whether
+ * something else (firmware, another driver path) is mutating our writes.
+ *
+ * Hardcoded for swing=2 pre_emp=1 at RBR/HBR (not HBR2): MGNFS=0x00,
+ * CPOST=0x15, TX_DRV=0x400, CAL_SCLR=0x128, PLLDRC bits 14:12 = 0x6.
+ */
+static int
+rk_typec_phy_sysctl_force_eq_test(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_typec_phy_softc *sc = arg1;
+	int error, val = 0;
+	int dp[2];
+	int i;
+	uint32_t reg;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL || val != 1)
+		return (error);
+
+	if (sc->flip) {
+		dp[0] = 0; dp[1] = 1;
+	} else {
+		dp[0] = 2; dp[1] = 3;
+	}
+
+	/*
+	 * write+readback+verify each target register; only consider the bit
+	 * "poked successfully" if the readback matches.  Mismatches indicate
+	 * read-only bits, sticky bits, or some other registers ignoring writes
+	 * in the current chip state — which itself is diagnostic.
+	 */
+#define POKE_VERIFY(_reg_macro, _addr_arg, _want, _name) do {		\
+	uint32_t _wrote = (_want);					\
+	RK_TYPEC_PHY_WRITE(sc, _reg_macro(_addr_arg), _wrote);		\
+	uint32_t _read = RK_TYPEC_PHY_READ(sc, _reg_macro(_addr_arg));	\
+	if (_read == _wrote)						\
+		device_printf(sc->dev,					\
+		    "FORCE_EQ: lane%d %s wrote=0x%04x readback=0x%04x ✓\n",\
+		    _addr_arg, _name, _wrote, _read);			\
+	else								\
+		device_printf(sc->dev,					\
+		    "FORCE_EQ: lane%d %s wrote=0x%04x readback=0x%04x ✗ "\
+		    "(bit not writable in current state)\n",		\
+		    _addr_arg, _name, _wrote, _read);			\
+} while (0)
+
+	for (i = 0; i < 2; i++) {
+		int lane = dp[i];
+		POKE_VERIFY(TX_TXCC_MGNFS_MULT_000, lane, 0x00, "MGNFS_000");
+		POKE_VERIFY(TX_TXCC_CPOST_MULT_00,  lane, 0x15, "CPOST_00 ");
+		POKE_VERIFY(TX_TXCC_CAL_SCLR_MULT,  lane, 0x128, "CAL_SCLR ");
+		POKE_VERIFY(TX_DIAG_TX_DRV,         lane, 0x400, "TX_DRV   ");
+
+		reg = RK_TYPEC_PHY_READ(sc, XCVR_DIAG_PLLDRC_CTRL(lane));
+		reg = (reg & ~(0x7U << 12)) | (0x6U << 12);
+		POKE_VERIFY(XCVR_DIAG_PLLDRC_CTRL,  lane, reg,  "PLLDRC   ");
+	}
+#undef POKE_VERIFY
+	return (0);
+}
+
+/*
+ * Snapshot a curated set of PHY registers to dmesg.  Intended for diff'ing
+ * across time (poll every 500 ms while link-train runs) to find which
+ * registers mutate during EQ phase.  Uses %x1, %x2 for x16 register I/O
+ * matching the rest of the driver.
+ */
+static int
+rk_typec_phy_sysctl_dump_regs(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_typec_phy_softc *sc = arg1;
+	int error, val = 0;
+	int dp[2];
+	int i;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL || val != 1)
+		return (error);
+
+	/* DP lane indices for current flip orientation. */
+	if (sc->flip) {
+		dp[0] = 0; dp[1] = 1;
+	} else {
+		dp[0] = 2; dp[1] = 3;
+	}
+
+	device_printf(sc->dev,
+	    "REGDUMP: DP_MODE_CTL=0x%08x PMA_CMN_CTRL1=0x%08x DP_CLK_CTL=0x%08x "
+	    "PMA_LANE_CFG=0x%08x flip=%d flip_override=%d\n",
+	    RK_TYPEC_PHY_READ(sc, DP_MODE_CTL),
+	    RK_TYPEC_PHY_READ(sc, PMA_CMN_CTRL1),
+	    RK_TYPEC_PHY_READ(sc, DP_CLK_CTL),
+	    RK_TYPEC_PHY_READ(sc, PMA_LANE_CFG),
+	    sc->flip, sc->flip_override);
+
+	device_printf(sc->dev,
+	    "REGDUMP: PLL1 INTDIV=0x%04x VCOCAL_START=0x%04x "
+	    "PLLSM1_LOCK=0x%04x HSCLK_SEL=0x%04x\n",
+	    RK_TYPEC_PHY_READ(sc, CMN_PLL1_INTDIV),
+	    RK_TYPEC_PHY_READ(sc, CMN_PLL1_VCOCAL_START),
+	    RK_TYPEC_PHY_READ(sc, CMN_PLLSM1_PLLLOCK),
+	    RK_TYPEC_PHY_READ(sc, CMN_DIAG_HSCLK_SEL));
+
+	for (i = 0; i < 2; i++) {
+		int lane = dp[i];
+		device_printf(sc->dev,
+		    "REGDUMP: dp_lane%d MGNFS_000=0x%04x CPOST_00=0x%04x "
+		    "TX_DRV=0x%04x CAL_SCLR=0x%04x PLLDRC=0x%04x "
+		    "PSC_A0=0x%04x BIDI=0x%04x\n",
+		    lane,
+		    RK_TYPEC_PHY_READ(sc, TX_TXCC_MGNFS_MULT_000(lane)),
+		    RK_TYPEC_PHY_READ(sc, TX_TXCC_CPOST_MULT_00(lane)),
+		    RK_TYPEC_PHY_READ(sc, TX_DIAG_TX_DRV(lane)),
+		    RK_TYPEC_PHY_READ(sc, TX_TXCC_CAL_SCLR_MULT(lane)),
+		    RK_TYPEC_PHY_READ(sc, XCVR_DIAG_PLLDRC_CTRL(lane)),
+		    RK_TYPEC_PHY_READ(sc, TX_PSC_A0(lane)),
+		    RK_TYPEC_PHY_READ(sc, XCVR_DIAG_BIDI_CTRL(lane)));
+	}
+
+	return (0);
+}
+
 static int
 rk_typec_phy_probe(device_t dev)
 {
@@ -1638,6 +1890,22 @@ rk_typec_phy_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "flip_override", CTLFLAG_RW, &sc->flip_override, -1,
 	    "AUX polarity flip override: -1=auto(FUSB302), 0=CC1, 1=CC2");
+
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "dump_regs", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_typec_phy_sysctl_dump_regs, "I",
+	    "Write 1 to snapshot key PHY registers (DP mode, PMA, PLL1 lock, "
+	    "per-lane signal levels) into dmesg — for diff'ing across time "
+	    "during link train to find mutating registers");
+
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "force_eq_test", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_typec_phy_sysctl_force_eq_test, "I",
+	    "Write 1 to pre-poke EQ-target signal levels (swing=2 pre_emp=1) "
+	    "to the active DP lanes — for watching whether stage-16 link-train "
+	    "preserves or overwrites them");
 
 	return (0);
 

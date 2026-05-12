@@ -23,12 +23,23 @@
 
 #include "rk_drm.h"
 
+#ifndef DRM_MODE_FLAG_PPIXDATA
+#define	DRM_MODE_FLAG_PPIXDATA	0
+#endif
+
 #define HDMI_PHY_I2C_ADDR  0x69
 
 #define RK_DRM_SYS_GRF_GPIO4C_IOMUX 0x0e028
+#define RK_DRM_SYS_GRF_SOC_CON9     0x6224
 #define RK_DRM_SYS_GRF_SOC_CON20    0x6250
 #define RK_DRM_GRF_HDMI_LCDC_SEL    (1u << 6)
 #define RK_DRM_GRF_EDP_LCDC_SEL     (1u << 5)
+/*
+ * SOC_CON9[12] = DP_SEL_VOP_LIT: 0 = route VOP_BIG to Cadence MHDP
+ * (the USB-C DP encoder), 1 = route VOP_LITTLE.  Distinct from
+ * SOC_CON20[5] which muxes the Analogix eDP encoder.
+ */
+#define RK_DRM_GRF_DP_SEL_VOP_LIT   (1u << 12)
 #define RK_DRM_GRF_GPIO4C_I2C3HDMI  0x003f0005u
 
 #define RK_DRM_VOP_DSP_HTOTAL_HS_END 0x0188
@@ -46,15 +57,32 @@
 #define RK_DRM_VOP_SYS_CTRL_MIPI_EN    (1u << 15)
 #define RK_DRM_VOP_SYS_CTRL_MIPI_DUAL  (1u << 3)
 #define RK_DRM_VOP_DSP_OUT_MODE_MASK 0x0000000fu
-#define RK_DRM_VOP_DSP_OUT_MODE_AAAA 0x0000000fu
+#define RK_DRM_VOP_DSP_OUT_MODE_P888 0x00000000u	/* RGB888 24bpp */
+#define RK_DRM_VOP_DSP_OUT_MODE_AAAA 0x0000000fu	/* RGB+alpha 30bpp */
+#define RK_DRM_VOP_DSP_CTRL0_PIN_POL_MASK   (0x7u << 4)
+#define RK_DRM_VOP_DSP_CTRL0_DCLK_POL       (1u << 7)
+#define RK_DRM_VOP_DSP_CTRL0_P2I_EN         (1u << 5)
+#define RK_DRM_VOP_DSP_CTRL0_INTERLACE      (1u << 10)
+#define RK_DRM_VOP_DSP_CTRL1_DP_PIN_POL_MASK (0x7u << 16)
+#define RK_DRM_VOP_DSP_CTRL1_DP_DCLK_POL    (1u << 19)
 #define RK_DRM_VOP_DSP_CTRL1_HDMI_PIN_POL_MASK  (0x7u << 20)
 #define RK_DRM_VOP_DSP_CTRL1_HDMI_PIN_POL_POS   (0x3u << 20)
 #define RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL      (1u << 23)
 #define RK_DRM_VOP_WIN0_LB_MODE_RGB_1920X5 (4u << 5)
 #define RK_DRM_VOP_WIN0_DATA_FMT_XRGB8888 0x00000000u
-#define RK_DRM_VOP_WIN0_CTRL0_ENABLE  (RK_DRM_VOP_WIN0_LB_MODE_RGB_1920X5 | \
+/*
+ * Live read of working Armbian shows WIN0_CTRL0 = 0x3a000081 — lower 8 bits
+ * are enable+LB_MODE+fmt as before, but bits 25/27/28/29 in 0x3a000000 are
+ * also set (likely csc_en + color-space + ymir/yuv-clip default state).
+ * Mirror that so the scanout pipeline matches the working reference.
+ */
+#define RK_DRM_VOP_WIN0_CTRL0_UPPER 0x3a000000u
+#define RK_DRM_VOP_WIN0_CTRL0_ENABLE  (RK_DRM_VOP_WIN0_CTRL0_UPPER | \
+    RK_DRM_VOP_WIN0_LB_MODE_RGB_1920X5 | \
     RK_DRM_VOP_WIN0_DATA_FMT_XRGB8888 | 0x00000001u)
 #define RK_DRM_VOP_WIN0_CTRL2_PRIMARY 0x00000021u
+#define RK_DRM_VOP_WIN0_SRC_ALPHA_CTRL_OPAQUE 0x00ff0000u
+#define RK_DRM_VOP_WIN0_DST_ALPHA_CTRL_OPAQUE 0x00000000u
 
 #define RK_DRM_FB_DMA_LOWADDR_TEST    0x0fffffffu
 
@@ -285,6 +313,7 @@ static const struct rk_drm_pll_rate rk_drm_pll_rates[] = {
 	{ 106500, 1, 71, 4, 4 },
 	{ 108000, 3, 54, 4, 1 },
 	{ 119000, 6, 119, 4, 1 },
+	{ 121750, 6, 487, 4, 4 },
 	{ 148500, 4, 99, 4, 1 },
 };
 
@@ -324,6 +353,12 @@ rk_drm_grf_write4(struct rk_drm_softc *sc, size_t off, uint32_t val)
 	bus_space_write_4(fdtbus_bs_tag, sc->grf_bsh, off, val);
 	bus_space_barrier(fdtbus_bs_tag, sc->grf_bsh, off, 4,
 	    BUS_SPACE_BARRIER_WRITE);
+}
+
+static inline uint32_t
+rk_drm_grf_read4(struct rk_drm_softc *sc, size_t off)
+{
+	return (bus_space_read_4(fdtbus_bs_tag, sc->grf_bsh, off));
 }
 
 static inline uint32_t
@@ -683,15 +718,22 @@ rk_drm_route_vop_to_hdmi(struct rk_drm_softc *sc)
 }
 
 /*
- * Route VOP B (the big VOP) to drive the eDP/DP output path.
- * GRF SOC_CON20[5] = EDP_LCDC_SEL: 0 = VOP_BIG, 1 = VOP_LITTLE.
- * Hiword-update: low half = 0 (clear bit), high half = bit-mask.
+ * Route VOP B (the big VOP) to drive both DP encoders.
+ *  - SOC_CON20[5] = EDP_LCDC_SEL: 0 = VOP_BIG -> Analogix eDP
+ *  - SOC_CON20[6] = HDMI_LCDC_SEL: 1 = VOP_LIT -> HDMI (live Armbian has this set
+ *                   even though display is on DP — routes HDMI off VOP_BIG)
+ *  - SOC_CON9[12] = DP_SEL_VOP_LIT: 0 = VOP_BIG -> Cadence MHDP
+ * Hiword-update: low half = value, high half = bit-mask.
  */
 static void
 rk_drm_route_vop_to_dp(struct rk_drm_softc *sc)
 {
 	rk_drm_grf_write4(sc, RK_DRM_SYS_GRF_SOC_CON20,
 	    (RK_DRM_GRF_EDP_LCDC_SEL << 16));
+	rk_drm_grf_write4(sc, RK_DRM_SYS_GRF_SOC_CON20,
+	    (RK_DRM_GRF_HDMI_LCDC_SEL << 16) | RK_DRM_GRF_HDMI_LCDC_SEL);
+	rk_drm_grf_write4(sc, RK_DRM_SYS_GRF_SOC_CON9,
+	    (RK_DRM_GRF_DP_SEL_VOP_LIT << 16));
 }
 
 static int
@@ -751,6 +793,48 @@ rk_drm_vop_pulse_dclk_reset(struct rk_drm_softc *sc)
 }
 
 static void
+rk_drm_vop_program_win0_opaque(struct rk_drm_softc *sc,
+    const struct drm_display_mode *mode, uint32_t hact_start,
+    uint32_t vact_start)
+{
+	uint32_t stride_bytes, stride_words;
+
+	/*
+	 * The fixed boot framebuffer is allocated at the maximum 1920-wide
+	 * pitch, but the direct modeset path programs WIN0 before KMS has a
+	 * chance to rebind a GEM framebuffer with its own pitch.  Linux sets
+	 * yrgb_vir from the actual visible buffer pitch, so mirror that here
+	 * instead of reusing the allocation pitch.
+	 */
+	stride_bytes = roundup2(mode->hdisplay, 16) * (RK_DRM_BPP / 8);
+	stride_words = stride_bytes / 4;
+
+	rk_drm_vop_write4(sc, 0x0038, 0x00000000);
+	rk_drm_vop_write4(sc, 0x003c, stride_words);
+	rk_drm_vop_write4(sc, 0x0040, (uint32_t)sc->fb_pa);
+	rk_drm_vop_write4(sc, 0x0048,
+	    (((uint32_t)mode->vdisplay - 1) << 16) |
+	    ((uint32_t)mode->hdisplay - 1));
+	rk_drm_vop_write4(sc, 0x004c,
+	    (((uint32_t)mode->vdisplay - 1) << 16) |
+	    ((uint32_t)mode->hdisplay - 1));
+	rk_drm_vop_write4(sc, 0x0050,
+	    (vact_start << 16) | hact_start);
+	/*
+	 * XRGB8888 primary plane: force opaque blending state so stale
+	 * bootloader alpha registers cannot black-hole the scanout.
+	 */
+	rk_drm_vop_write4(sc, 0x0060, RK_DRM_VOP_WIN0_SRC_ALPHA_CTRL_OPAQUE);
+	rk_drm_vop_write4(sc, 0x0064, RK_DRM_VOP_WIN0_DST_ALPHA_CTRL_OPAQUE);
+	rk_drm_vop_write4(sc, 0x006c, RK_DRM_VOP_WIN0_CTRL2_PRIMARY);
+	rk_drm_vop_write4(sc, RK_DRM_VOP_POST_DSP_HACT_INFO,
+	    (hact_start << 16) | (hact_start + mode->hdisplay));
+	rk_drm_vop_write4(sc, RK_DRM_VOP_POST_DSP_VACT_INFO,
+	    (vact_start << 16) | (vact_start + mode->vdisplay));
+	rk_drm_vop_write4(sc, 0x0030, RK_DRM_VOP_WIN0_CTRL0_ENABLE);
+}
+
+static void
 rk_drm_vop_init_mode(struct rk_drm_softc *sc,
     const struct drm_display_mode *mode)
 {
@@ -765,9 +849,9 @@ rk_drm_vop_init_mode(struct rk_drm_softc *sc,
 
 	rk_drm_cru_write4(sc, 0x01bc,
 	    ((((0x1fu << 8) | (0x3u << 6) | 0x1fu) << 16) |
-	    ((3u << 8) | (1u << 6) | 1u)));
+	    ((3u << 8) | (1u << 7) | 1u)));
 	rk_drm_cru_write4(sc, 0x01c4,
-	    ((((1u << 11) | (0x3u << 8) | 0xffu) << 16) | 0x0000u));
+	    ((((1u << 11) | (0x3u << 8) | 0xffu) << 16) | 0x0100u));
 
 	sys_ctrl = rk_drm_vop_read4(sc, 0x0008);
 	dsp_ctrl0 = rk_drm_vop_read4(sc, 0x0010);
@@ -793,23 +877,7 @@ rk_drm_vop_init_mode(struct rk_drm_softc *sc,
 	    RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL;
 	rk_drm_vop_write4(sc, 0x0014, dsp_ctrl1);
 
-	rk_drm_vop_write4(sc, 0x0038, 0x00000000);
-	rk_drm_vop_write4(sc, 0x003c, sc->stride / 4);
-	rk_drm_vop_write4(sc, 0x0040, (uint32_t)sc->fb_pa);
-	rk_drm_vop_write4(sc, 0x0048,
-	    (((uint32_t)mode->vdisplay - 1) << 16) |
-	    ((uint32_t)mode->hdisplay - 1));
-	rk_drm_vop_write4(sc, 0x004c,
-	    (((uint32_t)mode->vdisplay - 1) << 16) |
-	    ((uint32_t)mode->hdisplay - 1));
-	rk_drm_vop_write4(sc, 0x0050,
-	    (vact_start << 16) | hact_start);
-	rk_drm_vop_write4(sc, 0x006c, RK_DRM_VOP_WIN0_CTRL2_PRIMARY);
-	rk_drm_vop_write4(sc, RK_DRM_VOP_POST_DSP_HACT_INFO,
-	    (hact_start << 16) | (hact_start + mode->hdisplay));
-	rk_drm_vop_write4(sc, RK_DRM_VOP_POST_DSP_VACT_INFO,
-	    (vact_start << 16) | (vact_start + mode->vdisplay));
-	rk_drm_vop_write4(sc, 0x0030, RK_DRM_VOP_WIN0_CTRL0_ENABLE);
+	rk_drm_vop_program_win0_opaque(sc, mode, hact_start, vact_start);
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_HTOTAL_HS_END,
 	    ((uint32_t)mode->htotal << 16) | rk_drm_mode_hsync_len(mode));
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_HACT_ST_END,
@@ -818,7 +886,14 @@ rk_drm_vop_init_mode(struct rk_drm_softc *sc,
 	    ((uint32_t)mode->vtotal << 16) | rk_drm_mode_vsync_len(mode));
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_VACT_ST_END,
 	    (vact_start << 16) | (vact_start + mode->vdisplay));
-	rk_drm_vop_write4(sc, 0x0000, 0x00000001);
+	/*
+	 * REG_CFG_DONE (offset 0x0000) is hiword-update: mask in upper 16
+	 * bits, value in lower. Writing 0x1 alone (mask bit clear) is a
+	 * silent no-op — the commit never fires, so all the staged VOP
+	 * register writes above stay in the shadow bank and never reach
+	 * the live registers. Correct form: 0x10001.
+	 */
+	rk_drm_vop_write4(sc, 0x0000, 0x00010001);
 	rk_drm_vop_pulse_dclk_reset(sc);
 	DELAY(40000);
 }
@@ -836,7 +911,8 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
     const struct drm_display_mode *mode)
 {
 	uint32_t hact_start, vact_start;
-	uint32_t sys_ctrl, dsp_ctrl0;
+	uint32_t sys_ctrl, dsp_ctrl0, dsp_ctrl1, post_scl_ctrl;
+	uint32_t pin_pol, dp_pin_pol;
 
 	hact_start = rk_drm_mode_hact_start(mode);
 	vact_start = rk_drm_mode_vact_start(mode);
@@ -852,40 +928,100 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 
 	sys_ctrl = rk_drm_vop_read4(sc, 0x0008);
 	dsp_ctrl0 = rk_drm_vop_read4(sc, 0x0010);
+	dsp_ctrl1 = rk_drm_vop_read4(sc, 0x0014);
+	post_scl_ctrl = rk_drm_vop_read4(sc, 0x0180);
 
+	/*
+	 * Live read of working Armbian shows SYS_CTRL = 0x20801800: both
+	 * dp_en (bit 11) and rgb_en (bit 12) set, plus reserved bits 23/29.
+	 * Despite Linux's output_type-switch in rockchip_drm_vop.c looking
+	 * mutually-exclusive, the actual settled state on RK3399 vop_big with
+	 * a working Cadence DP path carries both bits — rgb_en here is the
+	 * internal parallel-RGB output-formatter the Cadence framer consumes,
+	 * not an external mux selector.
+	 */
 	sys_ctrl &= ~(RK_DRM_VOP_SYS_CTRL_STANDBY |
 	    RK_DRM_VOP_SYS_CTRL_MMU_EN |
 	    RK_DRM_VOP_SYS_CTRL_HDMI_EN |
+	    RK_DRM_VOP_SYS_CTRL_EDP_EN |
 	    RK_DRM_VOP_SYS_CTRL_MIPI_EN |
 	    RK_DRM_VOP_SYS_CTRL_MIPI_DUAL);
 	sys_ctrl |= RK_DRM_VOP_SYS_CTRL_ENABLE |
-	    RK_DRM_VOP_SYS_CTRL_RGB_EN |
-	    RK_DRM_VOP_SYS_CTRL_EDP_EN;
+	    RK_DRM_VOP_SYS_CTRL_RGB_EN;
 	rk_drm_vop_write4(sc, 0x0008, sys_ctrl);
 
+	/*
+	 * Linux cdn_dp_atomic_check (cdn-dp-core.c:973) forces
+	 * `ROCKCHIP_OUT_MODE_AAAA` for the DP connector regardless of
+	 * pixel bus_format — the Cadence framer's input bus is 32-bit
+	 * with the alpha lane unused. P888 (24-bit packed) cycles VOP
+	 * output differently and breaks link sync (verified empirically
+	 * 2026-05-10: trying P888 dropped LANE0_1_STATUS 0x77→0x00 and
+	 * SINK_STATUS 0x01→0x00).
+	 */
 	dsp_ctrl0 &= ~RK_DRM_VOP_DSP_OUT_MODE_MASK;
 	dsp_ctrl0 |= RK_DRM_VOP_DSP_OUT_MODE_AAAA;
+	/*
+	 * On RK3399 vop_big (VOP version 3.5) DSP_CTRL0 bits 4..6 are NOT
+	 * pin polarity — Linux's `.pin_pol = VOP_REG_VER(... bits 4..6, 3, 0, 1)`
+	 * (rockchip_vop_reg.c:222) restricts that field to VOP 3.0/3.1.  On
+	 * 3.5, bit 5 is `p2i_en` and bits 4/6 are other functions.  DP pin
+	 * polarity lives in DSP_CTRL1[16:18] (handled below).
+	 *
+	 * Live read of working Armbian shows DSP_CTRL0 = 0x0f — only OUT_MODE
+	 * bits set; bit 7 (DCLK_POL) is also 0.  Clear all the legacy
+	 * pin_pol/dclk_pol/p2i/interlace bits and don't set DCLK_POL.
+	 */
+	pin_pol = 0;
+	if ((mode->flags & DRM_MODE_FLAG_NHSYNC) == 0)
+		pin_pol |= (1u << 0);
+	if ((mode->flags & DRM_MODE_FLAG_NVSYNC) == 0)
+		pin_pol |= (1u << 1);
+	dsp_ctrl0 &= ~(RK_DRM_VOP_DSP_CTRL0_PIN_POL_MASK |
+	    RK_DRM_VOP_DSP_CTRL0_DCLK_POL |
+	    RK_DRM_VOP_DSP_CTRL0_P2I_EN |
+	    RK_DRM_VOP_DSP_CTRL0_INTERLACE);
 	rk_drm_vop_write4(sc, 0x0010, dsp_ctrl0);
 
-	/* DSP_CTRL1 pin polarity: leave at hardware reset for DP. */
+	/*
+	 * DSP_CTRL1 polarities for Cadence DP path (RK3399).  Per Linux
+	 * rockchip_vop_reg.c and rockchip_drm_vop.c:
+	 *   bits 18:16 = dp_pin_pol  (bit 0 = HSYNC_POSITIVE,
+	 *                             bit 1 = VSYNC_POSITIVE,
+	 *                             bit 2 = DEN_NEGATIVE)
+	 *   bit  19    = dp_dclk_pol (Linux's DP encoder_enable forces 0)
+	 *   bits 20-31 are hdmi/edp/mipi pin+dclk polarity fields — clear
+	 *                them so prior HDMI/eDP state can't leak through.
+	 * For PHSYNC mode → set HSYNC_POSITIVE; for PVSYNC → set
+	 * VSYNC_POSITIVE.  NHSYNC/NVSYNC leave the bit cleared (Linux
+	 * rockchip_drm_vop.c:2885).
+	 */
+	dp_pin_pol = pin_pol;
+	dsp_ctrl1 &= ~(RK_DRM_VOP_DSP_CTRL1_DP_PIN_POL_MASK |
+	    RK_DRM_VOP_DSP_CTRL1_DP_DCLK_POL |
+	    RK_DRM_VOP_DSP_CTRL1_HDMI_PIN_POL_MASK |
+	    RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL);
+	dsp_ctrl1 |= (dp_pin_pol & 0x7) << 16;	/* dp_dclk_pol forced low */
+	/*
+	 * Match Linux's RGB888 setup: no dither-down or pre-dither on the
+	 * 32-bit AAAA Cadence path, but leave the dither selector at Allegro.
+	 */
+	dsp_ctrl1 &= ~((1u << 3) | (1u << 2) | (1u << 1));
+	dsp_ctrl1 |= (1u << 4);
+	rk_drm_vop_write4(sc, 0x0014, dsp_ctrl1);
 
-	rk_drm_vop_write4(sc, 0x0038, 0x00000000);
-	rk_drm_vop_write4(sc, 0x003c, sc->stride / 4);
-	rk_drm_vop_write4(sc, 0x0040, (uint32_t)sc->fb_pa);
-	rk_drm_vop_write4(sc, 0x0048,
-	    (((uint32_t)mode->vdisplay - 1) << 16) |
-	    ((uint32_t)mode->hdisplay - 1));
-	rk_drm_vop_write4(sc, 0x004c,
-	    (((uint32_t)mode->vdisplay - 1) << 16) |
-	    ((uint32_t)mode->hdisplay - 1));
-	rk_drm_vop_write4(sc, 0x0050,
-	    (vact_start << 16) | hact_start);
-	rk_drm_vop_write4(sc, 0x006c, RK_DRM_VOP_WIN0_CTRL2_PRIMARY);
-	rk_drm_vop_write4(sc, RK_DRM_VOP_POST_DSP_HACT_INFO,
-	    (hact_start << 16) | (hact_start + mode->hdisplay));
-	rk_drm_vop_write4(sc, RK_DRM_VOP_POST_DSP_VACT_INFO,
-	    (vact_start << 16) | (vact_start + mode->vdisplay));
-	rk_drm_vop_write4(sc, 0x0030, RK_DRM_VOP_WIN0_CTRL0_ENABLE);
+	/*
+	 * Keep the VOP->Cadence interface in plain RGB mode. Linux clears
+	 * data-swap and post-scaler YUV output state here; stale values can
+	 * yield a trained link that never produces visible pixels.
+	 */
+	dsp_ctrl0 &= ~(0x1fu << 12);	/* dsp_data_swap = 0 */
+	rk_drm_vop_write4(sc, 0x0010, dsp_ctrl0);
+	post_scl_ctrl &= ~(1u << 2);	/* dsp_out_yuv = 0 */
+	rk_drm_vop_write4(sc, 0x0180, post_scl_ctrl);
+	rk_drm_vop_write4(sc, 0x0018, 0x00000000);	/* dsp_background = 0 */
+
+	rk_drm_vop_program_win0_opaque(sc, mode, hact_start, vact_start);
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_HTOTAL_HS_END,
 	    ((uint32_t)mode->htotal << 16) | rk_drm_mode_hsync_len(mode));
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_HACT_ST_END,
@@ -894,7 +1030,14 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	    ((uint32_t)mode->vtotal << 16) | rk_drm_mode_vsync_len(mode));
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_VACT_ST_END,
 	    (vact_start << 16) | (vact_start + mode->vdisplay));
-	rk_drm_vop_write4(sc, 0x0000, 0x00000001);
+	/*
+	 * REG_CFG_DONE (offset 0x0000) is hiword-update: mask in upper 16
+	 * bits, value in lower. Writing 0x1 alone (mask bit clear) is a
+	 * silent no-op — the commit never fires, so all the staged VOP
+	 * register writes above stay in the shadow bank and never reach
+	 * the live registers. Correct form: 0x10001.
+	 */
+	rk_drm_vop_write4(sc, 0x0000, 0x00010001);
 	rk_drm_vop_pulse_dclk_reset(sc);
 	DELAY(40000);
 }
@@ -939,7 +1082,14 @@ rk_drm_hw_set_scanout(struct rk_drm_softc *sc, vm_paddr_t paddr, uint32_t stride
 
 	rk_drm_vop_write4(sc, 0x003c, stride / 4);
 	rk_drm_vop_write4(sc, 0x0040, (uint32_t)paddr);
-	rk_drm_vop_write4(sc, 0x0000, 0x00000001);
+	/*
+	 * REG_CFG_DONE (offset 0x0000) is hiword-update: mask in upper 16
+	 * bits, value in lower. Writing 0x1 alone (mask bit clear) is a
+	 * silent no-op — the commit never fires, so all the staged VOP
+	 * register writes above stay in the shadow bank and never reach
+	 * the live registers. Correct form: 0x10001.
+	 */
+	rk_drm_vop_write4(sc, 0x0000, 0x00010001);
 	return (0);
 }
 
@@ -955,10 +1105,18 @@ rk_drm_hw_disable(struct rk_drm_softc *sc)
 	sys_ctrl = rk_drm_vop_read4(sc, 0x0008);
 	sys_ctrl &= ~(RK_DRM_VOP_SYS_CTRL_ENABLE |
 	    RK_DRM_VOP_SYS_CTRL_RGB_EN |
-	    RK_DRM_VOP_SYS_CTRL_HDMI_EN);
+	    RK_DRM_VOP_SYS_CTRL_HDMI_EN |
+	    RK_DRM_VOP_SYS_CTRL_EDP_EN);
 	sys_ctrl |= RK_DRM_VOP_SYS_CTRL_STANDBY;
 	rk_drm_vop_write4(sc, 0x0008, sys_ctrl);
-	rk_drm_vop_write4(sc, 0x0000, 0x00000001);
+	/*
+	 * REG_CFG_DONE (offset 0x0000) is hiword-update: mask in upper 16
+	 * bits, value in lower. Writing 0x1 alone (mask bit clear) is a
+	 * silent no-op — the commit never fires, so all the staged VOP
+	 * register writes above stay in the shadow bank and never reach
+	 * the live registers. Correct form: 0x10001.
+	 */
+	rk_drm_vop_write4(sc, 0x0000, 0x00010001);
 
 	/*
 	 * Blank TMDS output but keep HPD sense alive so native hotplug polling
@@ -1785,6 +1943,129 @@ rk_drm_hw_audio_i2s_start(struct rk_drm_softc *sc)
  * Caller may hold sc->hw_lock to serialize against modeset.  Safe to
  * call when the HDMI is not yet attached — returns early in that case.
  */
+/*
+ * Dump VOP B + relevant CRU registers to dmesg. Used to verify the modeset
+ * actually programmed the hardware, distinguishing "register writes happened"
+ * (should be visible in our dmesg printf logs) from "registers actually hold
+ * those values now" (only direct readback proves).
+ */
+void
+rk_drm_hw_vop_dump(struct rk_drm_softc *sc)
+{
+	uint32_t cfg_done, sys_ctrl, dsp_ctrl0, dsp_ctrl1, win0_ctrl0;
+	uint32_t win0_ystride, win0_yrgb_mst, win0_act, win0_dsp_inf;
+	uint32_t win0_dsp_st, win0_src_alpha, win0_dst_alpha;
+	uint32_t htotal, hact, vtotal, vact, intr_status;
+
+	if (!sc->hw_attached) {
+		device_printf(sc->dev, "vop_dump: not attached\n");
+		return;
+	}
+
+	cfg_done    = rk_drm_vop_read4(sc, 0x0000);
+	sys_ctrl    = rk_drm_vop_read4(sc, 0x0008);
+	dsp_ctrl0   = rk_drm_vop_read4(sc, 0x0010);
+	dsp_ctrl1   = rk_drm_vop_read4(sc, 0x0014);
+	win0_ctrl0  = rk_drm_vop_read4(sc, 0x0030);
+	win0_ystride= rk_drm_vop_read4(sc, 0x003c);
+	win0_yrgb_mst = rk_drm_vop_read4(sc, 0x0040);
+	win0_act    = rk_drm_vop_read4(sc, 0x0048);
+	win0_dsp_inf= rk_drm_vop_read4(sc, 0x004c);
+	win0_dsp_st = rk_drm_vop_read4(sc, 0x0050);
+	win0_src_alpha = rk_drm_vop_read4(sc, 0x0060);
+	win0_dst_alpha = rk_drm_vop_read4(sc, 0x0064);
+	htotal      = rk_drm_vop_read4(sc, 0x0188);
+	hact        = rk_drm_vop_read4(sc, 0x018c);
+	vtotal      = rk_drm_vop_read4(sc, 0x0190);
+	vact        = rk_drm_vop_read4(sc, 0x0194);
+	intr_status = rk_drm_vop_read4(sc, 0x00ac);
+
+	device_printf(sc->dev,
+	    "vop_dump: CFG_DONE=0x%08x SYS_CTRL=0x%08x DSP_CTRL0=0x%08x DSP_CTRL1=0x%08x\n",
+	    cfg_done, sys_ctrl, dsp_ctrl0, dsp_ctrl1);
+	device_printf(sc->dev,
+	    "vop_dump: WIN0 CTRL0=0x%08x YSTRIDE=0x%08x YRGB_MST=0x%08x ACT=0x%08x DSP_INF=0x%08x DSP_ST=0x%08x SRC_ALPHA=0x%08x DST_ALPHA=0x%08x\n",
+	    win0_ctrl0, win0_ystride, win0_yrgb_mst, win0_act, win0_dsp_inf,
+	    win0_dsp_st, win0_src_alpha, win0_dst_alpha);
+	device_printf(sc->dev,
+	    "vop_dump: HTOTAL=0x%08x HACT=0x%08x VTOTAL=0x%08x VACT=0x%08x INTR_STATUS=0x%08x\n",
+	    htotal, hact, vtotal, vact, intr_status);
+	{
+		uint32_t soc_con9, soc_con20;
+		soc_con9  = rk_drm_grf_read4(sc, RK_DRM_SYS_GRF_SOC_CON9);
+		soc_con20 = rk_drm_grf_read4(sc, RK_DRM_SYS_GRF_SOC_CON20);
+		device_printf(sc->dev,
+		    "vop_dump: GRF SOC_CON9=0x%08x (DP_SEL_VOP_LIT bit12=%u → %s),"
+		    " SOC_CON20=0x%08x (EDP_LCDC_SEL bit5=%u → %s)\n",
+		    soc_con9, !!(soc_con9 & RK_DRM_GRF_DP_SEL_VOP_LIT),
+		    (soc_con9 & RK_DRM_GRF_DP_SEL_VOP_LIT) ? "VOP_LIT" : "VOP_BIG",
+		    soc_con20, !!(soc_con20 & RK_DRM_GRF_EDP_LCDC_SEL),
+		    (soc_con20 & RK_DRM_GRF_EDP_LCDC_SEL) ? "VOP_LIT" : "VOP_BIG");
+	}
+	{
+		/*
+		 * VPLL state + DCLK_VOP0 source/divisor decode.
+		 * VPLL Fout = (24 MHz * FBDIV) / (REFDIV * POSTDIV1 * POSTDIV2)
+		 * CON0 [11:0]  = FBDIV
+		 * CON1 [5:0]   = REFDIV
+		 * CON1 [10:8]  = POSTDIV1
+		 * CON1 [14:12] = POSTDIV2
+		 * CON2 [31]    = LOCK
+		 * CON3 [9:8]   = PLL_MODE  (0=slow, 1=normal, 2=deepslow)
+		 *
+		 * Per Linux clk-rk3399.c:1267 `COMPOSITE(DCLK_VOP0_DIV, ...,
+		 * RK3399_CLKSEL_CON(49), 8, 2, MFLAGS, 0, 8, DFLAGS, ...)`:
+		 *   CRU CLKSEL_CON49 = offset 0x01c4
+		 *     [7:0]  DCLK_VOP0_DIV  (8-bit divider, rockchip composite
+		 *                            convention: actual = field+1)
+		 *     [9:8]  DCLK_VOP0_SEL  (0=VPLL, 1=CPLL, 2=GPLL)
+		 */
+		uint32_t con0 = rk_drm_cru_read4(sc, RK_DRM_CRU_VPLL_CON0);
+		uint32_t con1 = rk_drm_cru_read4(sc, RK_DRM_CRU_VPLL_CON1);
+		uint32_t con2 = rk_drm_cru_read4(sc, RK_DRM_CRU_VPLL_CON2);
+		uint32_t con3 = rk_drm_cru_read4(sc, RK_DRM_CRU_VPLL_CON3);
+		uint32_t cksel_con47 = rk_drm_cru_read4(sc, 0x01bc);
+		uint32_t cksel_con49 = rk_drm_cru_read4(sc, 0x01c4);
+		uint32_t fbdiv = con0 & 0xfff;
+		uint32_t refdiv = con1 & 0x3f;
+		uint32_t postdiv1 = (con1 >> 8) & 0x7;
+		uint32_t postdiv2 = (con1 >> 12) & 0x7;
+		uint64_t fout_khz = 0;
+		if (refdiv && postdiv1 && postdiv2)
+			fout_khz = ((uint64_t)24000 * fbdiv) /
+			    ((uint64_t)refdiv * postdiv1 * postdiv2);
+		uint32_t dclk_div = (cksel_con49 & 0xff) + 1;
+		uint32_t dclk_pll_sel = (cksel_con49 >> 8) & 0x3;
+		static const char * const pll_names[] = {"VPLL","CPLL","GPLL","?"};
+		device_printf(sc->dev,
+		    "vop_dump: VPLL CON0=0x%08x CON1=0x%08x CON2=0x%08x CON3=0x%08x\n",
+		    con0, con1, con2, con3);
+		device_printf(sc->dev,
+		    "vop_dump: VPLL fbdiv=%u refdiv=%u pd1=%u pd2=%u Fout=%llu kHz "
+		    "LOCK=%u mode=%u\n",
+		    fbdiv, refdiv, postdiv1, postdiv2,
+		    (unsigned long long)fout_khz,
+		    !!(con2 & RK_DRM_CRU_VPLL_CON2_LOCK),
+		    (con3 >> 8) & 0x3);
+		device_printf(sc->dev,
+		    "vop_dump: CRU CLKSEL_CON47=0x%08x CLKSEL_CON49=0x%08x "
+		    "DCLK_VOP0_DIV=%u SEL=%u (%s) -> dclk_vop0 ~%llu kHz\n",
+		    cksel_con47, cksel_con49, dclk_div, dclk_pll_sel,
+		    pll_names[dclk_pll_sel], (unsigned long long)(fout_khz / dclk_div));
+	}
+	device_printf(sc->dev,
+	    "vop_dump: SYS_CTRL decode: ENABLE=%d STANDBY=%d RGB_EN=%d HDMI_EN=%d EDP_EN=%d MIPI_EN=%d MMU_EN=%d\n",
+	    !!(sys_ctrl & RK_DRM_VOP_SYS_CTRL_ENABLE),
+	    !!(sys_ctrl & RK_DRM_VOP_SYS_CTRL_STANDBY),
+	    !!(sys_ctrl & RK_DRM_VOP_SYS_CTRL_RGB_EN),
+	    !!(sys_ctrl & RK_DRM_VOP_SYS_CTRL_HDMI_EN),
+	    !!(sys_ctrl & RK_DRM_VOP_SYS_CTRL_EDP_EN),
+	    !!(sys_ctrl & RK_DRM_VOP_SYS_CTRL_MIPI_EN),
+	    !!(sys_ctrl & RK_DRM_VOP_SYS_CTRL_MMU_EN));
+	device_printf(sc->dev,
+	    "vop_dump: WIN0 ENABLE=%d (ctrl0 bit 0)\n", win0_ctrl0 & 1);
+}
+
 void
 rk_drm_hw_audio_dump(struct rk_drm_softc *sc)
 {

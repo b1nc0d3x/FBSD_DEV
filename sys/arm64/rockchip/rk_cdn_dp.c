@@ -78,6 +78,31 @@
 #include "rk3399_power.h"
 #include "rk3399_typec_altmode_var.h"
 
+#define RK_CDN_DP_MODE_FLAG_PHSYNC	(1u << 0)
+#define RK_CDN_DP_MODE_FLAG_PVSYNC	(1u << 2)
+
+#define	MODE_I2C_START	1
+#define	MODE_I2C_WRITE	2
+#define	MODE_I2C_READ	4
+#define	MODE_I2C_STOP	8
+
+#define	AUX_I2C_WRITE	0x0
+#define	AUX_I2C_READ	0x1
+#define	AUX_I2C_MOT	0x4
+
+struct iic_dp_aux_data {
+	bool running;
+	uint16_t address;
+	void *priv;
+	int (*aux_ch)(device_t idev, int mode, uint8_t write_byte,
+	    uint8_t *read_byte);
+	device_t port;
+};
+
+int iic_dp_aux_add_bus(device_t dev, const char *name,
+    int (*ch)(device_t idev, int mode, uint8_t write_byte,
+    uint8_t *read_byte), void *priv, device_t *bus, device_t *adapter);
+
 /* RK3399 supports up to two TYPE-C ports, each providing one DP PHY. */
 #define	RK_CDN_DP_MAX_PHYS	2
 
@@ -293,6 +318,8 @@
 #define	RK_CDN_DP_DPTX_GET_EDID		0x02
 #define	RK_CDN_DP_DPTX_READ_DPCD	0x03
 #define	RK_CDN_DP_DPTX_SET_VIDEO	0x0c
+#define	RK_CDN_DP_DPTX_WRITE_FIELD	0x08
+#define	RK_CDN_DP_MAX_EDID_BLOCKS	2
 
 /* DP framer / MSA register offsets (Cadence DPTX, mailbox WRITE_REGISTER). */
 #define	RK_CDN_DP_BND_HSYNC2VSYNC	0x0b00
@@ -304,8 +331,8 @@
 #define	RK_CDN_DP_DP_FRAMER_PXL_REPR	0x220c
 #define	RK_CDN_DP_DP_FRAMER_SP		0x2210
 #define	 RK_CDN_DP_FRAMER_SP_INTERLACE	(1U << 2)
-#define	 RK_CDN_DP_FRAMER_SP_HSP	(1U << 1)
-#define	 RK_CDN_DP_FRAMER_SP_VSP	(1U << 0)
+#define	 RK_CDN_DP_FRAMER_SP_HSP	(1U << 0)
+#define	 RK_CDN_DP_FRAMER_SP_VSP	(1U << 1)
 #define	RK_CDN_DP_DP_VC_TABLE(x)	(0x2218 + ((x) << 2))
 #define	RK_CDN_DP_DP_VB_ID		0x2258
 #define	RK_CDN_DP_DP_FRONT_BACK_PORCH	0x2278
@@ -331,6 +358,16 @@
 #define	RK_CDN_DP_DPTX_READ_EVENT	0x0a
 #define	RK_CDN_DP_DPTX_GET_LAST_AUX_STATUS	0x0e
 #define	RK_CDN_DP_DPTX_HPD_STATE	0x11
+/* Firmware-driven link training (Linux 4.4 cdn-dp-reg.h:368-370). */
+#define	RK_CDN_DP_DPTX_TRAINING_CONTROL	0x09
+#define	RK_CDN_DP_DPTX_READ_LINK_STAT	0x0b
+#define	RK_CDN_DP_LINK_TRAINING_RUN	1
+/* DPTX_READ_EVENT response byte 1 bits (cdn-dp-reg.h:412,419). */
+#define	RK_CDN_DP_TRAINING_EVENT	(1U << 1)
+#define	RK_CDN_DP_EQ_PHASE_FINISHED	(1U << 3)
+/* Linux fixed timing constants (cdn-dp-reg.c:33-34). */
+#define	RK_CDN_DP_LINK_TRAINING_RETRY_MS	20
+#define	RK_CDN_DP_LINK_TRAINING_TIMEOUT_MS	500
 
 #define	RK_CDN_DP_FW_STANDBY		0
 #define	RK_CDN_DP_FW_ACTIVE		1
@@ -354,7 +391,13 @@
 
 #define	RK_CDN_DP_FW_ALIVE_TIMEOUT_US	1000000
 #define	RK_CDN_DP_MAILBOX_RETRY_US	1000
-#define	RK_CDN_DP_MAILBOX_TIMEOUT_US	5000000
+/*
+ * Cap mailbox_write FULL-clear wait at 500 ms.  The dptx firmware
+ * normally clears FULL in well under 1 ms; 5 s here meant a wedged
+ * firmware would burn 5 s per write × hundreds of write-then-poll
+ * retries upstack, locking shutdown out for tens of minutes.
+ */
+#define	RK_CDN_DP_MAILBOX_TIMEOUT_US	500000
 #define	RK_CDN_DP_MAILBOX_READ_TIMEOUT_US	10000000
 #define	RK_CDN_DP_DPCD_READ_RETRIES	16
 #define	RK_CDN_DP_DPCD_DEFER_DELAY_US	20000
@@ -426,6 +469,8 @@ static struct resource_spec rk_cdn_dp_spec[] = {
 
 struct rk_cdn_dp_softc {
 	device_t		dev;
+	device_t		aux_iicbus;
+	device_t		aux_iic_adapter;
 	phandle_t		node;
 	struct resource		*res[RK_CDN_DP_RES_COUNT];
 	clk_t			clks[RK_CDN_DP_NCLKS];
@@ -464,6 +509,9 @@ struct rk_cdn_dp_softc {
 	int			hostcap_usb_ss_override;
 	int			skip_aux_swap;
 	uint32_t		aux_swap_value;
+	int			skip_dpcd;	/* synthesize sink_caps, skip AUX read */
+	uint32_t		debug_reg_addr;
+	uint32_t		debug_reg_value;
 	int			dp_altmode_valid;
 	int			dp_altmode_ready;
 	int			dp_altmode_usb_ss;
@@ -509,10 +557,14 @@ struct rk_cdn_dp_softc {
 	uint32_t		sink_max_link_rate_khz;
 	uint8_t			link_plan_rate_code;
 	uint8_t			link_plan_lanes;
+	uint8_t			expected_link_bw_set;
+	uint8_t			expected_lane_count_set;
 	uint8_t			link_status[DP_LINK_STATUS_SIZE];
 	uint8_t			train_set[4];
 	bool			link_trained;
-	uint8_t			edid[128];
+	bool			fw_link_training_used;
+	uint8_t			edid[128 * RK_CDN_DP_MAX_EDID_BLOCKS];
+	uint16_t		edid_len;
 	bool			edid_valid;
 	/*
 	 * Video info parsed from EDID's first detailed timing block.
@@ -543,6 +595,12 @@ struct rk_cdn_dp_fw_header {
 };
 
 static void	rk_cdn_dp_release(device_t dev);
+static int	rk_cdn_dp_aux_prepare(struct rk_cdn_dp_softc *sc,
+		    uint8_t cmd, uint32_t addr, uint8_t *buf, int len);
+static int	rk_cdn_dp_aux_finish(struct rk_cdn_dp_softc *sc,
+		    uint8_t *buf, int len);
+static int	rk_cdn_dp_aux_i2c_xfer(device_t idev, int mode,
+		    uint8_t write_byte, uint8_t *read_byte);
 static int	rk_cdn_dp_probe_dpcd_caps(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_complete_dpcd_caps(struct rk_cdn_dp_softc *sc);
 static uint32_t	rk_cdn_dp_link_rate_khz(uint8_t code);
@@ -550,6 +608,12 @@ static void	rk_cdn_dp_record_sink_caps(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_plan_link(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_mailbox_dpcd_write(struct rk_cdn_dp_softc *sc,
 		    uint32_t addr, const uint8_t *buf, uint16_t len);
+static int	rk_cdn_dp_write_link_config(struct rk_cdn_dp_softc *sc,
+		    const char *tag);
+static void	rk_cdn_dp_verify_link_config(struct rk_cdn_dp_softc *sc,
+		    const char *tag);
+static void	rk_cdn_dp_log_phy_config(struct rk_cdn_dp_softc *sc,
+		    const char *tag, uint32_t phy_config);
 static int	rk_cdn_dp_start_link_training(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_mailbox_get_firmware(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_mailbox_prepare_ucpu(struct rk_cdn_dp_softc *sc);
@@ -563,10 +627,20 @@ static int	rk_cdn_dp_mailbox_dpcd_read_retry(struct rk_cdn_dp_softc *sc,
 static int	rk_cdn_dp_mailbox_get_last_aux_status(struct rk_cdn_dp_softc *sc,
 		    uint8_t *status_out);
 static int	rk_cdn_dp_read_edid(struct rk_cdn_dp_softc *sc);
+int		rk_cdn_dp_get_cached_edid(device_t dev, uint8_t *buf,
+		    size_t len);
+int		rk_cdn_dp_auto_bringup_default(void);
+int		rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
+		    uint16_t hsync_start, uint16_t hsync_end, uint16_t htotal,
+		    uint16_t vdisplay, uint16_t vsync_start, uint16_t vsync_end,
+		    uint16_t vtotal, uint32_t flags);
+static void	rk_cdn_dp_fill_forced_mode(struct rk_cdn_dp_softc *sc);
 static void	rk_cdn_dp_get_hostcap_config(struct rk_cdn_dp_softc *sc,
 		    uint8_t *lanes, bool *flip, int *usb_ss);
 static void	rk_cdn_dp_mailbox_drain(struct rk_cdn_dp_softc *sc, int limit);
 static int	rk_cdn_dp_mailbox_drain_events(struct rk_cdn_dp_softc *sc);
+static int	rk_cdn_dp_mailbox_settle_post_hostcap(
+		    struct rk_cdn_dp_softc *sc);
 static void	rk_cdn_dp_mailbox_capture_state(struct rk_cdn_dp_softc *sc);
 static void	rk_cdn_dp_mailbox_log_state(struct rk_cdn_dp_softc *sc,
 		    const char *tag);
@@ -579,6 +653,8 @@ static void	rk_cdn_dp_log_typec_state(struct rk_cdn_dp_softc *sc,
 static int	rk_cdn_dp_get_power_domain(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_get_extcon(struct rk_cdn_dp_softc *sc);
 static void	rk_cdn_dp_refresh_typec_provider(struct rk_cdn_dp_softc *sc);
+static void	rk_cdn_dp_snapshot_typec_state(struct rk_cdn_dp_softc *sc,
+		    const char *tag);
 static int	rk_cdn_dp_select_active_port(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_do_enable_phys(struct rk_cdn_dp_softc *sc);
 static bool	rk_cdn_dp_is_rockpro64(device_t dev);
@@ -602,8 +678,15 @@ static int	rk_cdn_dp_sysctl_hostcap_flip(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_hostcap_usb_ss(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_active_port(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_reprobe(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_refresh_typec(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_framer_dump(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_reg_addr(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_reg_value(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_reg_read(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_reg_write(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_rebind_child(bool reprobe);
 static void	rk_cdn_dp_reset_runtime_state(struct rk_cdn_dp_softc *sc);
+static int	rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target);
 static void	rk_cdn_dp_rebind_taskfn(void *context, int pending);
 static int	rk_cdn_dp_module_event(module_t mod, int what, void *arg);
 
@@ -1096,6 +1179,129 @@ rk_cdn_dp_mailbox_reg_write(struct rk_cdn_dp_softc *sc, uint16_t addr, uint32_t 
 }
 
 static int
+rk_cdn_dp_mailbox_reg_write_bit(struct rk_cdn_dp_softc *sc, uint16_t addr,
+    uint8_t start_bit, uint8_t bits_no, uint32_t val)
+{
+	uint8_t msg[8];
+
+	msg[0] = (addr >> 8) & 0xff;
+	msg[1] = addr & 0xff;
+	msg[2] = start_bit;
+	msg[3] = bits_no;
+	msg[4] = (val >> 24) & 0xff;
+	msg[5] = (val >> 16) & 0xff;
+	msg[6] = (val >> 8) & 0xff;
+	msg[7] = val & 0xff;
+
+	return (rk_cdn_dp_mailbox_send(sc, RK_CDN_DP_MB_MODULE_ID_DP_TX,
+	    RK_CDN_DP_DPTX_WRITE_FIELD, sizeof(msg), msg));
+}
+
+/*
+ * Mailbox READ_REGISTER (opcode 0x07): firmware-side proxy for reading
+ * cdn_dp internal registers (including the AUX engine MMIO at 0x0780+
+ * which the CPU cannot map via /dev/mem).  Body is 2-byte address; reply
+ * is 6 bytes: addr_h, addr_l, val[31:24], val[23:16], val[15:8], val[7:0].
+ */
+static int
+rk_cdn_dp_mailbox_reg_read(struct rk_cdn_dp_softc *sc, uint16_t addr, uint32_t *val_out)
+{
+	uint8_t msg[2];
+	uint8_t reply[6];
+	int error;
+
+	msg[0] = (addr >> 8) & 0xff;
+	msg[1] = addr & 0xff;
+
+	error = rk_cdn_dp_mailbox_send(sc, RK_CDN_DP_MB_MODULE_ID_DP_TX,
+	    RK_CDN_DP_DPTX_READ_REGISTER, sizeof(msg), msg);
+	if (error != 0)
+		return (error);
+	error = rk_cdn_dp_mailbox_validate_receive(sc,
+	    RK_CDN_DP_MB_MODULE_ID_DP_TX, RK_CDN_DP_DPTX_READ_REGISTER,
+	    sizeof(reply));
+	if (error != 0)
+		return (error);
+	error = rk_cdn_dp_mailbox_read_receive(sc, reply, sizeof(reply));
+	if (error != 0)
+		return (error);
+	*val_out = ((uint32_t)reply[2] << 24) | ((uint32_t)reply[3] << 16) |
+	    ((uint32_t)reply[4] << 8) | (uint32_t)reply[5];
+	return (0);
+}
+
+/*
+ * Sysctl handler: dump the AUX engine MMIO (TRM 6.3.4 register map at
+ * 0x0780–0x07A4) via the firmware-side READ_REGISTER mailbox so we can
+ * see what state the AUX engine is in right before/after a DPCD attempt.
+ */
+static int
+rk_cdn_dp_sysctl_aux_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error;
+	static const struct { uint16_t addr; const char *name; } regs[] = {
+		{0x0780, "AUX_CH_STA"},
+		{0x0784, "AUX_ERR_NUM"},
+		{0x0788, "AUX_CH_DEFER_CTL"},
+		{0x078c, "AUX_RX_COMM"},
+		{0x0790, "BUFFER_DATA_CTL"},
+		{0x0794, "AUX_CH_CTL_1"},
+		{0x0798, "AUX_ADDR_7_0"},
+		{0x079c, "AUX_ADDR_15_8"},
+		{0x07a0, "AUX_ADDR_19_16"},
+		{0x07a4, "AUX_CH_CTL_2"},
+		{0x280c, "AUX_SWAP_INVERSION_CONTROL"},
+	};
+	int trigger = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &trigger, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (trigger == 0)
+		return (0);
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	{
+		/*
+		 * Sanity check READ_REGISTER: write a known sentinel to
+		 * AUX_SWAP_INVERSION_CONTROL and read it back.  If readback
+		 * matches the sentinel, the opcode-7 plumbing is correct
+		 * and the AUX engine zeroes elsewhere are real chip state.
+		 * If readback is 0, the firmware's READ_REGISTER reply
+		 * format differs from what we assume.
+		 */
+		uint32_t v0 = 0xdeadbeef, v1 = 0xdeadbeef;
+		int e0 = rk_cdn_dp_mailbox_reg_read(sc, 0x280c, &v0);
+		device_printf(sc->dev,
+		    "  AUX_SWAP_INVERSION_CONTROL pre-write [0x280c] = 0x%08x%s\n",
+		    v0, e0 == 0 ? "" : " (mailbox error)");
+		(void)rk_cdn_dp_mailbox_reg_write(sc, 0x280c, 0x3);
+		DELAY(1000);
+		int e1 = rk_cdn_dp_mailbox_reg_read(sc, 0x280c, &v1);
+		device_printf(sc->dev,
+		    "  AUX_SWAP_INVERSION_CONTROL post-write=3 [0x280c] = 0x%08x%s\n",
+		    v1, e1 == 0 ? "" : " (mailbox error)");
+	}
+	for (size_t i = 0; i < nitems(regs); i++) {
+		uint32_t v = 0xdeadbeef;
+		int e = rk_cdn_dp_mailbox_reg_read(sc, regs[i].addr, &v);
+		device_printf(sc->dev,
+		    "  %-28s [0x%04x] = 0x%08x%s\n",
+		    regs[i].name, regs[i].addr, v,
+		    e == 0 ? "" : " (mailbox error)");
+		if (e != 0)
+			break;
+	}
+	sx_sunlock(&sc->detach_sx);
+	return (0);
+}
+
+static int
 rk_cdn_dp_load_firmware(struct rk_cdn_dp_softc *sc)
 {
 	const struct rk_cdn_dp_fw_header *hdr;
@@ -1281,18 +1487,17 @@ rk_cdn_dp_set_host_cap(struct rk_cdn_dp_softc *sc, uint8_t lanes, bool flip)
 		uint32_t aux_swap;
 
 		/*
-		 * AUX_SWAP_INVERSION_CONTROL must match cable orientation:
-		 * CC1 (no flip)  -> 0x0 (no inversion)
-		 * CC2 (flipped)  -> 0x3 (invert both AUX wires)
-		 *
-		 * Earlier we hardcoded 0x3 always and worked around CC1
-		 * failures by setting skip_aux_swap=1 — that left the
-		 * register at firmware default which happens to work for
-		 * CC1 but makes the orientation-vs-swap relationship
-		 * unclear.  Compute the value from the current flip
-		 * directly so both orientations are explicit.
+		 * Linux ALWAYS writes AUX_HOST_INVERT (0x3) regardless of
+		 * cable orientation — see cdn_dp_set_host_cap in
+		 * drivers/gpu/drm/rockchip/cdn-dp-reg.c, which calls
+		 * cdn_dp_reg_write(DP_AUX_SWAP_INVERSION_CONTROL,
+		 * AUX_HOST_INVERT).  The flip orientation is handled by the
+		 * lane-mapping byte in the host-cap message body
+		 * (LANE_MAPPING_NORMAL=0x1b vs LANE_MAPPING_FLIPPED=0xe4),
+		 * NOT by AUX_SWAP_INVERSION_CONTROL.  Earlier flip→AUX_SWAP
+		 * splits were fighting the lane mapping.
 		 */
-		aux_swap = flip ? 0x3U : 0x0U;
+		aux_swap = sc->aux_swap_value;
 		device_printf(sc->dev,
 		    "host_cap: AUX_SWAP=0x%x (flip=%u, ctl_override=0x%x)\n",
 		    aux_swap, flip ? 1 : 0, sc->aux_swap_value);
@@ -1345,12 +1550,55 @@ rk_cdn_dp_mailbox_dpcd_write(struct rk_cdn_dp_softc *sc, uint32_t addr,
 	error = rk_cdn_dp_mailbox_read_receive(sc, reg, sizeof(reg));
 	if (error != 0)
 		return (error);
-	if ((((uint16_t)reg[0] << 8) | reg[1]) != len)
-		return (EINVAL);
 	if ((((uint32_t)reg[2] << 16) | ((uint32_t)reg[3] << 8) | reg[4]) != addr)
 		return (EINVAL);
 
 	return (0);
+}
+
+static int
+rk_cdn_dp_write_link_config(struct rk_cdn_dp_softc *sc, const char *tag)
+{
+	uint8_t buf[2];
+	int error;
+
+	buf[0] = sc->link_plan_rate_code;
+	buf[1] = sc->link_plan_lanes;
+	if ((sc->aux_dpcd[DP_MAX_LANE_COUNT] & DP_LANE_COUNT_ENHANCED_FRAME_EN) != 0)
+		buf[1] |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
+
+	sc->expected_link_bw_set = buf[0];
+	sc->expected_lane_count_set = buf[1];
+	error = rk_cdn_dp_mailbox_dpcd_write(sc, DP_LINK_BW_SET, buf, 2);
+	if (error != 0)
+		return (error);
+
+	device_printf(sc->dev,
+	    "%s: wrote DPCD 0x100=0x%02x 0x101=0x%02x\n",
+	    tag, sc->expected_link_bw_set, sc->expected_lane_count_set);
+	rk_cdn_dp_verify_link_config(sc, tag);
+	return (0);
+}
+
+static void
+rk_cdn_dp_verify_link_config(struct rk_cdn_dp_softc *sc, const char *tag)
+{
+	uint8_t buf[2];
+	int error;
+
+	error = rk_cdn_dp_mailbox_dpcd_read(sc, DP_LINK_BW_SET, buf, sizeof(buf));
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "%s: verify DPCD 0x100/0x101 read failed (%d)\n",
+		    tag, error);
+		return;
+	}
+	device_printf(sc->dev,
+	    "%s: verify DPCD 0x100=0x%02x 0x101=0x%02x expected=0x%02x/0x%02x%s\n",
+	    tag, buf[0], buf[1], sc->expected_link_bw_set,
+	    sc->expected_lane_count_set,
+	    (buf[0] == sc->expected_link_bw_set &&
+	    buf[1] == sc->expected_lane_count_set) ? "" : " MISMATCH");
 }
 
 static int
@@ -1385,9 +1633,8 @@ rk_cdn_dp_mailbox_dpcd_read_retry(struct rk_cdn_dp_softc *sc, uint32_t addr,
 
 		error = rk_cdn_dp_mailbox_send(sc, RK_CDN_DP_MB_MODULE_ID_DP_TX,
 		    RK_CDN_DP_DPTX_READ_DPCD, sizeof(msg), msg);
-		if (error != 0) {
+		if (error != 0)
 			return (error);
-		}
 
 		error = rk_cdn_dp_mailbox_validate_receive(sc,
 		    RK_CDN_DP_MB_MODULE_ID_DP_TX, RK_CDN_DP_DPTX_READ_DPCD,
@@ -1409,25 +1656,15 @@ rk_cdn_dp_mailbox_dpcd_read_retry(struct rk_cdn_dp_softc *sc, uint32_t addr,
 			    ((uint32_t)reg[1] << 8) | reg[2];
 			short_status = reg[3];
 
-			/*
-			 * 5-byte short reply: firmware acknowledged the command
-			 * but the AUX wire result must be queried separately
-			 * via DPTX_GET_LAST_AUX_STATUS. The bytes inside the
-			 * 5-byte body don't reliably encode the wire status
-			 * (observed body=00 00 00 00 00 while the firmware's
-			 * persistent last_aux_status register reported NACK).
-			 */
 			aux_err = rk_cdn_dp_mailbox_get_last_aux_status(sc,
 			    &wire_status);
 			if (aux_err == 0) {
 				if (wire_status == 0x02 || wire_status == 0x08)
-					return (EAGAIN);  /* DEFER */
-				if (wire_status == 0x01 || wire_status == 0x04)
-					return (EIO);     /* NACK */
-				if (wire_status == 0x00) {
-					/* ACK with no data — keep polling */
 					return (EAGAIN);
-				}
+				if (wire_status == 0x01 || wire_status == 0x04)
+					return (EIO);
+				if (wire_status == 0x00)
+					return (EAGAIN);
 				device_printf(sc->dev,
 				    "dpcd-read 0x%05x: AUX wire status=0x%02x "
 				    "(short reply addr=0x%05x byte3=0x%02x)\n",
@@ -1435,10 +1672,6 @@ rk_cdn_dp_mailbox_dpcd_read_retry(struct rk_cdn_dp_softc *sc, uint32_t addr,
 				    short_status);
 				return (EIO);
 			}
-
-			/* aux_status query itself failed — fall back to the
-			 * old short_status[3] heuristic for a best-effort
-			 * decision. */
 			if (short_status == 0x02 || short_status == 0x08)
 				return (EAGAIN);
 			if (short_status == 0x01 || short_status == 0x04)
@@ -1451,12 +1684,6 @@ rk_cdn_dp_mailbox_dpcd_read_retry(struct rk_cdn_dp_softc *sc, uint32_t addr,
 			return (EAGAIN);
 		}
 
-		/*
-		 * mbox_last_header/expect are populated by validate_receive
-		 * ONLY when it sees a header but it doesn't match. A read
-		 * failure (e.g. ETIMEDOUT polling for the response) leaves
-		 * those zero, so distinguish so the print is honest.
-		 */
 		if (error == ETIMEDOUT) {
 			device_printf(sc->dev,
 			    "dpcd-read 0x%05x: timeout waiting for "
@@ -1480,9 +1707,8 @@ rk_cdn_dp_mailbox_dpcd_read_retry(struct rk_cdn_dp_softc *sc, uint32_t addr,
 		return (error);
 
 	error = rk_cdn_dp_mailbox_read_receive(sc, reg, sizeof(reg));
-	if (error != 0) {
+	if (error != 0)
 		return (error);
-	}
 
 	error = rk_cdn_dp_mailbox_read_receive(sc, buf, len);
 	return (error);
@@ -1845,6 +2071,43 @@ rk_cdn_dp_aux_probe(struct rk_cdn_dp_softc *sc)
 		    err, err == 0 ? one : 0xff);
 	}
 
+	/*
+	 * Post-train sink status block: tells us whether the panel
+	 * actually thinks it's receiving valid video on the trained link.
+	 *   0x101 LINK_BW_SET (readback) — sink confirms link rate
+	 *   0x102 LANE_COUNT_SET (readback) — sink confirms lane count
+	 *   0x200 SINK_COUNT
+	 *   0x202 LANE0_1_STATUS
+	 *   0x203 LANE2_3_STATUS
+	 *   0x204 LANE_ALIGN_STATUS_UPDATED
+	 *   0x205 SINK_STATUS (bit 0 = SINK_PORT0 sync-locked,
+	 *                      bit 1 = RX_PORT1 sync-locked)
+	 */
+	{
+		uint8_t buf[8];
+		int err;
+
+		err = rk_cdn_dp_mailbox_dpcd_read(sc, 0x100, buf, 2);
+		if (err == 0)
+			device_printf(sc->dev,
+			    "aux_probe: LINK_BW_SET=0x%02x LANE_COUNT_SET=0x%02x\n",
+			    buf[0], buf[1]);
+		if (err == 0)
+			device_printf(sc->dev,
+			    "aux_probe: expected LINK_BW_SET=0x%02x LANE_COUNT_SET=0x%02x%s\n",
+			    sc->expected_link_bw_set, sc->expected_lane_count_set,
+			    (buf[0] == sc->expected_link_bw_set &&
+			    buf[1] == sc->expected_lane_count_set) ? "" : " MISMATCH");
+
+		err = rk_cdn_dp_mailbox_dpcd_read(sc, 0x200, buf, 6);
+		if (err == 0)
+			device_printf(sc->dev,
+			    "aux_probe: SINK_COUNT=0x%02x DEVICE_SVC_IRQ=0x%02x "
+			    "LANE0_1_STATUS=0x%02x LANE2_3_STATUS=0x%02x "
+			    "ALIGN_STATUS=0x%02x SINK_STATUS=0x%02x\n",
+			    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
+	}
+
 	if (werr != 0)
 		return (werr);
 	return (rerr);
@@ -1869,6 +2132,176 @@ rk_cdn_dp_sysctl_aux_probe(SYSCTL_HANDLER_ARGS)
 		return (ENXIO);
 	}
 	error = rk_cdn_dp_aux_probe(sc);
+	sx_sunlock(&sc->detach_sx);
+	return (error);
+}
+
+static int
+rk_cdn_dp_sysctl_framer_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val = 0;
+	static const struct { uint16_t addr; const char *name; } regs[] = {
+		{ RK_CDN_DP_DP_FRAMER_GLOBAL_CONFIG, "DP_FRAMER_GLOBAL_CONFIG" },
+		{ RK_CDN_DP_DP_TX_PHY_CONFIG_REG, "DP_TX_PHY_CONFIG_REG" },
+		{ RK_CDN_DP_DPTX_LANE_EN, "DPTX_LANE_EN" },
+		{ RK_CDN_DP_DPTX_ENHNCD, "DPTX_ENHNCD" },
+		{ RK_CDN_DP_DP_FRAMER_TU, "DP_FRAMER_TU" },
+		{ RK_CDN_DP_DP_FRAMER_PXL_REPR, "DP_FRAMER_PXL_REPR" },
+		{ RK_CDN_DP_DP_FRAMER_SP, "DP_FRAMER_SP" },
+		{ RK_CDN_DP_DP_FRONT_BACK_PORCH, "DP_FRONT_BACK_PORCH" },
+		{ RK_CDN_DP_DP_BYTE_COUNT, "DP_BYTE_COUNT" },
+		{ RK_CDN_DP_MSA_HORIZONTAL_0, "MSA_HORIZONTAL_0" },
+		{ RK_CDN_DP_MSA_HORIZONTAL_1, "MSA_HORIZONTAL_1" },
+		{ RK_CDN_DP_MSA_VERTICAL_0, "MSA_VERTICAL_0" },
+		{ RK_CDN_DP_MSA_VERTICAL_1, "MSA_VERTICAL_1" },
+		{ RK_CDN_DP_MSA_MISC, "MSA_MISC" },
+		{ RK_CDN_DP_STREAM_CONFIG, "STREAM_CONFIG" },
+		{ RK_CDN_DP_DP_HORIZONTAL, "DP_HORIZONTAL" },
+		{ RK_CDN_DP_DP_VERTICAL_0, "DP_VERTICAL_0" },
+		{ RK_CDN_DP_DP_VERTICAL_1, "DP_VERTICAL_1" },
+	};
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	device_printf(sc->dev,
+	    "framer_dump: trained=%d video_configured=%d rate_code=0x%x lanes=%u pixel_clock=%u\n",
+	    sc->link_trained ? 1 : 0, sc->video_configured ? 1 : 0,
+	    sc->link_plan_rate_code, sc->link_plan_lanes, sc->pixel_clock_khz);
+	for (size_t i = 0; i < nitems(regs); i++) {
+		uint32_t v = 0xdeadbeef;
+		int e = rk_cdn_dp_mailbox_reg_read(sc, regs[i].addr, &v);
+		device_printf(sc->dev,
+		    "  %-24s [0x%04x] = 0x%08x%s\n",
+		    regs[i].name, regs[i].addr, v,
+		    e == 0 ? "" : " (mailbox error)");
+		if (e != 0)
+			break;
+	}
+	sx_sunlock(&sc->detach_sx);
+	return (0);
+}
+
+static int
+rk_cdn_dp_sysctl_reg_addr(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error;
+	uint32_t val;
+
+	sc = arg1;
+	val = sc->debug_reg_addr;
+	error = sysctl_handle_32(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	sc->debug_reg_addr = val & 0xffff;
+	return (0);
+}
+
+static void
+rk_cdn_dp_log_phy_config(struct rk_cdn_dp_softc *sc, const char *tag,
+    uint32_t phy_config)
+{
+	device_printf(sc->dev,
+	    "%s: phy_config=0x%08x train_en=%u pattern=%u scrambler_bypass=%u "
+	    "encoder_bypass=%u skew_bypass=%u disparity_rst=%u "
+	    "lane_skew=%u/%u/%u/%u ten_bit=%u\n",
+	    tag, phy_config,
+	    phy_config & 0x1,
+	    (phy_config >> 1) & 0xf,
+	    (phy_config >> 5) & 0x1,
+	    (phy_config >> 6) & 0x1,
+	    (phy_config >> 7) & 0x1,
+	    (phy_config >> 8) & 0x1,
+	    (phy_config >> 9) & 0x7,
+	    (phy_config >> 12) & 0x7,
+	    (phy_config >> 15) & 0x7,
+	    (phy_config >> 18) & 0x7,
+	    (phy_config >> 21) & 0x1);
+}
+
+static int
+rk_cdn_dp_sysctl_reg_value(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error;
+	uint32_t val;
+
+	sc = arg1;
+	val = sc->debug_reg_value;
+	error = sysctl_handle_32(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	sc->debug_reg_value = val;
+	return (0);
+}
+
+static int
+rk_cdn_dp_sysctl_reg_read(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val;
+	uint32_t regv;
+
+	sc = arg1;
+	val = 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	error = rk_cdn_dp_mailbox_reg_read(sc, (uint16_t)sc->debug_reg_addr, &regv);
+	if (error == 0) {
+		sc->debug_reg_value = regv;
+		device_printf(sc->dev,
+		    "debug_reg: read [0x%04x] = 0x%08x\n",
+		    (uint16_t)sc->debug_reg_addr, regv);
+	}
+	sx_sunlock(&sc->detach_sx);
+	return (error);
+}
+
+static int
+rk_cdn_dp_sysctl_reg_write(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val;
+
+	sc = arg1;
+	val = 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	error = rk_cdn_dp_mailbox_reg_write(sc, (uint16_t)sc->debug_reg_addr,
+	    sc->debug_reg_value);
+	if (error == 0)
+		device_printf(sc->dev,
+		    "debug_reg: write [0x%04x] = 0x%08x\n",
+		    (uint16_t)sc->debug_reg_addr, sc->debug_reg_value);
 	sx_sunlock(&sc->detach_sx);
 	return (error);
 }
@@ -1994,6 +2427,41 @@ rk_cdn_dp_mailbox_drain_events(struct rk_cdn_dp_softc *sc)
 }
 
 static int
+rk_cdn_dp_mailbox_settle_post_hostcap(struct rk_cdn_dp_softc *sc)
+{
+	uint32_t ka_prev, ka_cur, pending, full;
+	int error, i;
+
+	ka_prev = rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE);
+	for (i = 0; i < 50; i++) {
+		rk_cdn_dp_mailbox_drain(sc, 64);
+		pending = rk_cdn_dp_read_4(sc, RK_CDN_DP_SW_EVENTS0);
+		full = rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_FULL_ADDR);
+		if (pending != 0) {
+			error = rk_cdn_dp_mailbox_drain_events(sc);
+			if (error != 0)
+				return (error);
+			rk_cdn_dp_mailbox_drain(sc, 64);
+			pending = rk_cdn_dp_read_4(sc, RK_CDN_DP_SW_EVENTS0);
+			full = rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_FULL_ADDR);
+		}
+		ka_cur = rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE);
+		if (pending == 0 && full == 0 && ka_cur != 0 &&
+		    (ka_cur != ka_prev || i >= 2))
+			return (0);
+		ka_prev = ka_cur;
+		DELAY(2000);
+	}
+
+	device_printf(sc->dev,
+	    "post-hostcap settle timed out: SW_EVENTS0=0x%x FULL=0x%x KEEP_ALIVE=0x%08x\n",
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_SW_EVENTS0),
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_MAILBOX_FULL_ADDR),
+	    rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE));
+	return (ETIMEDOUT);
+}
+
+static int
 rk_cdn_dp_wait_sink_ready(struct rk_cdn_dp_softc *sc)
 {
 	uint8_t sink_count;
@@ -2007,7 +2475,14 @@ rk_cdn_dp_wait_sink_ready(struct rk_cdn_dp_softc *sc)
 	 * DP RX is fully up; this poll gives them time to settle.
 	 *
 	 * 5s with a 10ms cadence (500 iterations).
+	 *
+	 * Early-bail: if the mailbox times out repeatedly with KEEP_ALIVE
+	 * frozen, the dptx firmware has wedged and no further polling will
+	 * help — return ETIMEDOUT immediately rather than burning seconds
+	 * per iteration (which blocks shutdown for tens of minutes).
 	 */
+	uint32_t fw_dead_ka = 0;
+	int fw_dead_streak = 0;
 	for (i = 0; i < 500; i++) {
 		error = rk_cdn_dp_mailbox_dpcd_read_retry(sc,
 		    RK_CDN_DP_DPCD_SINK_COUNT, &sink_count, 1, 1);
@@ -2017,15 +2492,33 @@ rk_cdn_dp_wait_sink_ready(struct rk_cdn_dp_softc *sc)
 			    sink_count, sink_count & 0x3f, i);
 			if ((sink_count & 0x3f) != 0)
 				return (0);
-		} else if (i == 0 || i % 50 == 49) {
-			/* Periodic progress log so we can see what's happening
-			 * during the long poll without flooding dmesg. */
-			device_printf(sc->dev,
-			    "sink_count poll: error=%d (try %d)\n", error, i);
-			if (i == 0)
-				rk_cdn_dp_log_typec_state(sc,
-				    "sink_count poll typec");
-			rk_cdn_dp_mailbox_log_state(sc, "sink_count poll state");
+			fw_dead_streak = 0;
+		} else {
+			uint32_t ka = rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE);
+			if (error == ETIMEDOUT && ka == fw_dead_ka)
+				fw_dead_streak++;
+			else
+				fw_dead_streak = (error == ETIMEDOUT) ? 1 : 0;
+			fw_dead_ka = ka;
+			if (i == 0 || i % 50 == 49) {
+				device_printf(sc->dev,
+				    "sink_count poll: error=%d (try %d) "
+				    "ka=0x%08x streak=%d\n",
+				    error, i, ka, fw_dead_streak);
+				if (i == 0)
+					rk_cdn_dp_log_typec_state(sc,
+					    "sink_count poll typec");
+				rk_cdn_dp_mailbox_log_state(sc,
+				    "sink_count poll state");
+			}
+			if (fw_dead_streak >= 3) {
+				device_printf(sc->dev,
+				    "sink_count poll: firmware wedged "
+				    "(ka frozen at 0x%08x for %d straight "
+				    "timeouts) — bailing\n",
+				    fw_dead_ka, fw_dead_streak);
+				return (ETIMEDOUT);
+			}
 		}
 		DELAY(10000);	/* 10ms */
 	}
@@ -2311,9 +2804,7 @@ rk_cdn_dp_aux_prepare(struct rk_cdn_dp_softc *sc, uint8_t cmd, uint32_t addr,
 
 	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUX_ADDR_7_0, addr & 0xff);
 	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUX_ADDR_15_8, (addr >> 8) & 0xff);
-	if (((addr >> 16) & 0x0f) != 0)
-		rk_cdn_dp_write_4(sc, RK_CDN_DP_AUX_ADDR_19_16,
-		    (addr >> 16) & 0x0f);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUX_ADDR_19_16, (addr >> 16) & 0x0f);
 	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUX_CH_CTL_1,
 	    (((len > 0 ? len - 1 : 0) & 0xf) << 4) | (cmd & 0xf));
 	sc->aux_pending_cmd = cmd;
@@ -2322,6 +2813,58 @@ rk_cdn_dp_aux_prepare(struct rk_cdn_dp_softc *sc, uint8_t cmd, uint32_t addr,
 	sc->aux_prepared = true;
 
 	return (0);
+}
+
+static int
+rk_cdn_dp_aux_i2c_xfer(device_t idev, int mode, uint8_t write_byte,
+    uint8_t *read_byte)
+{
+	struct iic_dp_aux_data *aux;
+	struct rk_cdn_dp_softc *sc;
+	uint8_t cmd, data = 0;
+	int error, len;
+
+	aux = device_get_softc(idev);
+	sc = aux != NULL ? aux->priv : NULL;
+	if (sc == NULL)
+		return (-ENXIO);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (-ENXIO);
+	}
+
+	cmd = ((mode & MODE_I2C_READ) != 0) ? AUX_I2C_READ : AUX_I2C_WRITE;
+	if ((mode & MODE_I2C_STOP) == 0)
+		cmd |= AUX_I2C_MOT;
+
+	if ((mode & MODE_I2C_START) != 0) {
+		len = 0;
+		error = rk_cdn_dp_aux_prepare(sc, cmd, aux->address, NULL, len);
+	} else if ((mode & MODE_I2C_READ) != 0) {
+		len = 1;
+		error = rk_cdn_dp_aux_prepare(sc, cmd, aux->address, NULL, len);
+	} else if ((mode & MODE_I2C_WRITE) != 0) {
+		data = write_byte;
+		len = 1;
+		error = rk_cdn_dp_aux_prepare(sc, cmd, aux->address, &data, len);
+	} else {
+		len = 0;
+		error = rk_cdn_dp_aux_prepare(sc, cmd, aux->address, NULL, len);
+	}
+	if (error == 0) {
+		if ((mode & MODE_I2C_READ) != 0 && (mode & MODE_I2C_START) == 0)
+			error = rk_cdn_dp_aux_finish(sc, &data, 1);
+		else
+			error = rk_cdn_dp_aux_finish(sc, NULL, 0);
+	}
+	if (error == 0 && (mode & MODE_I2C_READ) != 0 &&
+	    (mode & MODE_I2C_START) == 0 && read_byte != NULL)
+		*read_byte = data;
+
+	sx_sunlock(&sc->detach_sx);
+	return (-error);
 }
 
 static int
@@ -2341,6 +2884,7 @@ rk_cdn_dp_aux_finish(struct rk_cdn_dp_softc *sc, uint8_t *buf, int len)
 	if (error != 0) {
 		device_printf(sc->dev, "AUX wait timeout cmd=0x%x addr=0x%x\n",
 		    sc->aux_pending_cmd, sc->aux_pending_addr);
+		sc->aux_prepared = false;
 		return (error);
 	}
 
@@ -2352,21 +2896,26 @@ rk_cdn_dp_aux_finish(struct rk_cdn_dp_softc *sc, uint8_t *buf, int len)
 		    rk_cdn_dp_aux_status_name(sta),
 		    sta & RK_CDN_DP_AUX_STATUS_MASK,
 		    rk_cdn_dp_read_4(sc, RK_CDN_DP_AUX_ERR_NUM) & 0xff);
+		sc->aux_prepared = false;
 		return (EIO);
 	}
 
 	if (sc->aux_pending_cmd == RK_CDN_DP_AUX_CMD_NATIVE_READ) {
 		buf_ctl = rk_cdn_dp_read_4(sc, RK_CDN_DP_BUFFER_DATA_CTL);
-		if ((buf_ctl & RK_CDN_DP_BUF_HAVE_DATA) == 0)
+		if ((buf_ctl & RK_CDN_DP_BUF_HAVE_DATA) == 0) {
+			sc->aux_prepared = false;
 			return (ENXIO);
+		}
 		count = buf_ctl & RK_CDN_DP_BUF_DATA_COUNT_MASK;
 		if (count > len)
 			count = len;
 		for (i = 0; i < count; i++)
 			buf[i] = rk_cdn_dp_read_4(sc,
 			    RK_CDN_DP_BUF_DATA_0 + (i * 4)) & 0xff;
-		if (count < len)
+		if (count < len) {
+			sc->aux_prepared = false;
 			return (EMSGSIZE);
+		}
 	}
 
 	sc->aux_prepared = false;
@@ -2673,6 +3222,10 @@ rk_cdn_dp_set_pattern(struct rk_cdn_dp_softc *sc, uint8_t dp_train_pat)
 		    RK_CDN_DP_TX_PHY_SCRAMBLER_BYPASS(1) |
 		    RK_CDN_DP_TX_PHY_TRAINING_PATTERN(pattern);
 	}
+	rk_cdn_dp_log_phy_config(sc,
+	    (pattern == DP_TRAINING_PATTERN_DISABLE) ?
+	    "set_pattern(live-video)" : "set_pattern(training)",
+	    phy_config);
 
 	error = rk_cdn_dp_mailbox_reg_write(sc,
 	    RK_CDN_DP_DP_FRAMER_GLOBAL_CONFIG, global_config);
@@ -2810,11 +3363,11 @@ static uint8_t
 rk_cdn_dp_select_chaneq_pattern(struct rk_cdn_dp_softc *sc)
 {
 	/*
-	 * Use TPS3 if sink advertises support and rate is HBR2 (540 MHz);
-	 * otherwise TPS2.
+	 * Mirror Linux's Cadence training helper: use TPS3 whenever the sink
+	 * advertises support, not only at HBR2.  Some sinks complete EQ at HBR
+	 * only when we present TPS3 during channel equalization.
 	 */
-	if (sc->link_plan_rate_code == 0x14 &&
-	    (sc->aux_dpcd[DP_MAX_LANE_COUNT] & 0x40) != 0)
+	if ((sc->aux_dpcd[DP_MAX_LANE_COUNT] & 0x40) != 0)
 		return (DP_TRAINING_PATTERN_3);
 	return (DP_TRAINING_PATTERN_2);
 }
@@ -2904,10 +3457,110 @@ rk_cdn_dp_lower_rate(struct rk_cdn_dp_softc *sc)
 	return (0);
 }
 
+/*
+ * Firmware-driven link training fallback (Linux 4.4 cdn-dp-reg.c:564-639).
+ *
+ * The Cadence dptx.bin firmware has its own internal CR+EQ state machine
+ * that uses fixed PHY config values it ships with.  Linux uses this as a
+ * fallback when host-side DPCD-driven (software) training fails — the
+ * firmware's analog tuning may succeed where ours doesn't, especially on
+ * "boards with unique hardware design" (per Linux's comment).
+ *
+ * Protocol: send DPTX_TRAINING_CONTROL=LINK_TRAINING_RUN; poll READ_EVENT
+ * until event[1] & EQ_PHASE_FINISHED; then DPTX_READ_LINK_STAT to learn
+ * the firmware's negotiated rate/lanes.
+ */
+static int
+rk_cdn_dp_fw_train_link(struct rk_cdn_dp_softc *sc)
+{
+	uint8_t msg, event[2], status[10];
+	int error, elapsed_ms;
+
+	msg = RK_CDN_DP_LINK_TRAINING_RUN;
+	error = rk_cdn_dp_mailbox_send(sc, RK_CDN_DP_MB_MODULE_ID_DP_TX,
+	    RK_CDN_DP_DPTX_TRAINING_CONTROL, sizeof(msg), &msg);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "fw-train: TRAINING_CONTROL send failed (%d)\n", error);
+		return (error);
+	}
+
+	for (elapsed_ms = 0;
+	    elapsed_ms < RK_CDN_DP_LINK_TRAINING_TIMEOUT_MS;
+	    elapsed_ms += RK_CDN_DP_LINK_TRAINING_RETRY_MS) {
+		DELAY(RK_CDN_DP_LINK_TRAINING_RETRY_MS * 1000);
+
+		error = rk_cdn_dp_mailbox_send(sc,
+		    RK_CDN_DP_MB_MODULE_ID_DP_TX,
+		    RK_CDN_DP_DPTX_READ_EVENT, 0, NULL);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "fw-train: READ_EVENT send failed (%d)\n", error);
+			return (error);
+		}
+		error = rk_cdn_dp_mailbox_validate_receive(sc,
+		    RK_CDN_DP_MB_MODULE_ID_DP_TX,
+		    RK_CDN_DP_DPTX_READ_EVENT, sizeof(event));
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "fw-train: READ_EVENT recv invalid (%d)\n", error);
+			return (error);
+		}
+		error = rk_cdn_dp_mailbox_read_receive(sc, event, sizeof(event));
+		if (error != 0)
+			return (error);
+
+		if (event[1] & RK_CDN_DP_EQ_PHASE_FINISHED) {
+			device_printf(sc->dev,
+			    "fw-train: EQ_PHASE_FINISHED after %d ms "
+			    "(event=%02x %02x)\n",
+			    elapsed_ms, event[0], event[1]);
+			break;
+		}
+	}
+	if (elapsed_ms >= RK_CDN_DP_LINK_TRAINING_TIMEOUT_MS) {
+		device_printf(sc->dev,
+		    "fw-train: timeout (%d ms) waiting for EQ_PHASE_FINISHED\n",
+		    elapsed_ms);
+		return (ETIMEDOUT);
+	}
+
+	/*
+	 * Firmware finished training; read back its negotiated rate/lanes.
+	 * status[0] = rate_code, status[1] = lane_count, [2..9] reserved.
+	 */
+	error = rk_cdn_dp_mailbox_send(sc, RK_CDN_DP_MB_MODULE_ID_DP_TX,
+	    RK_CDN_DP_DPTX_READ_LINK_STAT, 0, NULL);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "fw-train: READ_LINK_STAT send failed (%d)\n", error);
+		return (error);
+	}
+	error = rk_cdn_dp_mailbox_validate_receive(sc,
+	    RK_CDN_DP_MB_MODULE_ID_DP_TX,
+	    RK_CDN_DP_DPTX_READ_LINK_STAT, sizeof(status));
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "fw-train: READ_LINK_STAT recv invalid (%d)\n", error);
+		return (error);
+	}
+	error = rk_cdn_dp_mailbox_read_receive(sc, status, sizeof(status));
+	if (error != 0)
+		return (error);
+
+	device_printf(sc->dev,
+	    "fw-train: firmware negotiated rate_code=0x%02x lanes=%u\n",
+	    status[0], status[1]);
+	sc->link_plan_rate_code = status[0];
+	sc->link_plan_lanes = status[1] & 0x1f;	/* lane count, low 5 bits */
+	return (0);
+}
+
 static int
 rk_cdn_dp_link_train(struct rk_cdn_dp_softc *sc)
 {
 	uint8_t buf[2];
+	bool ssc_on;
 	int error;
 
 	if (!sc->sink_caps_valid || sc->link_plan_lanes == 0 ||
@@ -2915,8 +3568,9 @@ rk_cdn_dp_link_train(struct rk_cdn_dp_softc *sc)
 		return (ENOENT);
 
 	/* Sink-side prep: downspread + 8b10b. (Run once.) */
-	buf[0] = (sc->aux_dpcd[DP_MAX_DOWNSPREAD] & DP_MAX_DOWNSPREAD_0_5) ?
-	    DP_SPREAD_AMP_0_5 : 0;
+	ssc_on = (sc->aux_dpcd[DP_MAX_DOWNSPREAD] &
+	    DP_MAX_DOWNSPREAD_0_5) != 0;
+	buf[0] = ssc_on ? DP_SPREAD_AMP_0_5 : 0;
 	buf[1] = (sc->aux_dpcd[DP_MAIN_LINK_CHANNEL_CODING] & 0x01) ?
 	    DP_SET_ANSI_8B10B : 0;
 	error = rk_cdn_dp_mailbox_dpcd_write(sc, DP_DOWNSPREAD_CTRL, buf, 2);
@@ -2924,27 +3578,14 @@ rk_cdn_dp_link_train(struct rk_cdn_dp_softc *sc)
 		return (error);
 
 	for (;;) {
-		/* Tell sink the trained rate + lane count + enhanced framing. */
-		buf[0] = sc->link_plan_rate_code;
-		buf[1] = sc->link_plan_lanes;
-		if ((sc->aux_dpcd[DP_MAX_LANE_COUNT] &
-		    DP_LANE_COUNT_ENHANCED_FRAME_EN) != 0)
-			buf[1] |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
-		error = rk_cdn_dp_mailbox_dpcd_write(sc, DP_LINK_BW_SET,
-		    buf, 2);
-		if (error != 0)
-			return (error);
-
 		/*
-		 * Switch the PHY to the chosen data rate AND enable the
-		 * right lane count BEFORE the CR loop.  Without these, the
-		 * PHY drives the wrong symbol clock or with disabled lanes;
-		 * display reports CR=0 with adjust_request asking for max
-		 * swing on every iteration.
+		 * Match Linux ordering on each attempt: re-rate the PHY first,
+		 * then tell the sink the active link configuration.  That keeps
+		 * both ends in sync when we retry at a lower bandwidth.
 		 */
 		error = rk_typec_phy_dp_set_link_rate_first(
 		    (int)rk_cdn_dp_link_rate_khz(sc->link_plan_rate_code),
-		    false);
+		    ssc_on);
 		if (error != 0) {
 			device_printf(sc->dev,
 			    "phy set_link_rate failed (%d)\n", error);
@@ -2958,28 +3599,65 @@ rk_cdn_dp_link_train(struct rk_cdn_dp_softc *sc)
 			return (error);
 		}
 
+		/* Tell sink the trained rate + lane count + enhanced framing. */
+		error = rk_cdn_dp_write_link_config(sc, "link_train");
+		if (error != 0)
+			return (error);
+
 		error = rk_cdn_dp_link_train_clock_recovery(sc);
 		if (error != 0) {
-			(void)rk_cdn_dp_stop_link_train(sc);
 			if (rk_cdn_dp_lower_rate(sc) == 0)
 				continue;	/* retry at lower rate */
-			return (error);
+			break;
 		}
 		error = rk_cdn_dp_link_train_channel_eq(sc);
 		if (error != 0) {
-			(void)rk_cdn_dp_stop_link_train(sc);
 			if (rk_cdn_dp_lower_rate(sc) == 0)
 				continue;	/* retry at lower rate */
-			return (error);
+			break;
 		}
 		break;	/* both phases succeeded */
 	}
 
-	error = rk_cdn_dp_stop_link_train(sc);
-	if (error != 0)
-		return (error);
+	{
+		int stop_error;
+
+		stop_error = rk_cdn_dp_stop_link_train(sc);
+		if (stop_error != 0)
+			return (stop_error);
+	}
+
+	/*
+	 * Software training failed — fall back to firmware-driven training
+	 * (Linux 4.4 cdn_dp_train_link does the same).  The dptx.bin firmware
+	 * has its own internal CR+EQ FSM with fixed PHY tuning that may
+	 * succeed where our DPCD-driven max-swing/pre-emp doesn't.  Only log
+	 * if firmware training also fails.
+	 */
+	if (error != 0) {
+		int fw_error;
+
+		device_printf(sc->dev,
+		    "software link training failed (%d); trying firmware-driven\n",
+		    error);
+		fw_error = rk_cdn_dp_fw_train_link(sc);
+		if (fw_error != 0) {
+			device_printf(sc->dev,
+			    "firmware link training also failed (%d)\n", fw_error);
+			return (error);	/* return original sw error */
+		}
+		sc->link_trained = true;
+		sc->fw_link_training_used = true;
+		device_printf(sc->dev,
+		    "link trained (firmware): rate_code=0x%x (%u kHz) lanes=%u\n",
+		    sc->link_plan_rate_code,
+		    rk_cdn_dp_link_rate_khz(sc->link_plan_rate_code),
+		    sc->link_plan_lanes);
+		return (0);
+	}
 
 	sc->link_trained = true;
+	sc->fw_link_training_used = false;
 	device_printf(sc->dev,
 	    "link trained: rate_code=0x%x (%u kHz) lanes=%u train_set[0]=0x%02x\n",
 	    sc->link_plan_rate_code,
@@ -3040,6 +3718,7 @@ rk_cdn_dp_read_edid(struct rk_cdn_dp_softc *sc)
 	    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };
 	int i;
 	const uint8_t *e;
+	uint8_t ext_blocks, cached_blocks, block;
 
 	/*
 	 * EDID is read via firmware-side AUX over SBU, independent of the
@@ -3050,8 +3729,7 @@ rk_cdn_dp_read_edid(struct rk_cdn_dp_softc *sc)
 	if (!sc->sink_caps_valid)
 		return (ENOENT);
 
-	error = rk_cdn_dp_mailbox_get_edid_block(sc, 0, sc->edid,
-	    sizeof(sc->edid));
+	error = rk_cdn_dp_mailbox_get_edid_block(sc, 0, sc->edid, 128);
 	if (error != 0) {
 		device_printf(sc->dev, "EDID read failed: %d\n", error);
 		return (error);
@@ -3067,13 +3745,34 @@ rk_cdn_dp_read_edid(struct rk_cdn_dp_softc *sc)
 		}
 	}
 
+	ext_blocks = sc->edid[126];
+	cached_blocks = ext_blocks;
+	if (cached_blocks > (RK_CDN_DP_MAX_EDID_BLOCKS - 1)) {
+		device_printf(sc->dev,
+		    "EDID advertises %u extension block(s), caching first %u only\n",
+		    ext_blocks, RK_CDN_DP_MAX_EDID_BLOCKS - 1);
+		cached_blocks = RK_CDN_DP_MAX_EDID_BLOCKS - 1;
+	}
+	for (block = 1; block <= cached_blocks; block++) {
+		error = rk_cdn_dp_mailbox_get_edid_block(sc, block,
+		    &sc->edid[block * 128], 128);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "EDID extension block %u read failed: %d\n",
+			    block, error);
+			return (error);
+		}
+	}
+
+	sc->edid_len = 128 * (1 + cached_blocks);
 	sc->edid_valid = true;
 	device_printf(sc->dev,
-	    "EDID OK: vendor=%c%c%c product=0x%02x%02x%02x%02x\n",
+	    "EDID OK: vendor=%c%c%c product=0x%02x%02x%02x%02x version=%u.%u ext=%u cached_len=%u\n",
 	    ((e[8] >> 2) & 0x1f) + 'A' - 1,
 	    (((e[8] & 0x3) << 3) | (e[9] >> 5)) + 'A' - 1,
 	    (e[9] & 0x1f) + 'A' - 1,
-	    e[10], e[11], e[12], e[13]);
+	    e[10], e[11], e[12], e[13], e[18], e[19], ext_blocks,
+	    sc->edid_len);
 	device_printf(sc->dev,
 	    "EDID first 32B: %02x %02x %02x %02x %02x %02x %02x %02x "
 	    "%02x %02x %02x %02x %02x %02x %02x %02x "
@@ -3083,6 +3782,26 @@ rk_cdn_dp_read_edid(struct rk_cdn_dp_softc *sc)
 	    e[8], e[9], e[10], e[11], e[12], e[13], e[14], e[15],
 	    e[16], e[17], e[18], e[19], e[20], e[21], e[22], e[23],
 	    e[24], e[25], e[26], e[27], e[28], e[29], e[30], e[31]);
+	return (0);
+}
+
+int
+rk_cdn_dp_get_cached_edid(device_t dev, uint8_t *buf, size_t len)
+{
+	struct rk_cdn_dp_softc *sc;
+	size_t copy_len;
+
+	if (dev == NULL || buf == NULL || len < 128)
+		return (EINVAL);
+	sc = device_get_softc(dev);
+	if (sc == NULL)
+		return (EINVAL);
+	if (!sc->edid_valid)
+		return (ENXIO);
+	copy_len = sc->edid_len >= 128 ? sc->edid_len : 128;
+	if (len < copy_len)
+		return (ENOSPC);
+	memcpy(buf, sc->edid, copy_len);
 	return (0);
 }
 
@@ -3157,6 +3876,63 @@ rk_cdn_dp_parse_edid_dtd(struct rk_cdn_dp_softc *sc)
 	return (0);
 }
 
+static void
+rk_cdn_dp_fill_forced_mode(struct rk_cdn_dp_softc *sc)
+{
+	/*
+	 * Keep the Cadence framer in lock-step with rk_drm's current USB-C DP
+	 * test mode. Until both sides consume the same connector-selected mode,
+	 * stage18 must not keep advertising the first EDID DTD (1920x1080)
+	 * while VOP is scanning 1400x1050.
+	 */
+	sc->pixel_clock_khz = 121750;
+	sc->hdisplay = 1400;
+	sc->hblank = 464;
+	sc->htotal = 1864;
+	sc->hsync_start = 1488;
+	sc->hsync_end = 1632;
+	sc->vdisplay = 1050;
+	sc->vblank = 39;
+	sc->vtotal = 1089;
+	sc->vsync_start = 1053;
+	sc->vsync_end = 1057;
+	sc->h_sync_polarity = 0;
+	sc->v_sync_polarity = 1;
+	device_printf(sc->dev,
+	    "forced video mode: %ux%u @ %u kHz htotal=%u hsync=%u..%u (pol=%u) vtotal=%u vsync=%u..%u (pol=%u)\n",
+	    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz, sc->htotal,
+	    sc->hsync_start, sc->hsync_end, sc->h_sync_polarity, sc->vtotal,
+	    sc->vsync_start, sc->vsync_end, sc->v_sync_polarity);
+}
+
+static void
+rk_cdn_dp_fill_mode(struct rk_cdn_dp_softc *sc, uint32_t clock,
+    uint16_t hdisplay, uint16_t hsync_start, uint16_t hsync_end,
+    uint16_t htotal, uint16_t vdisplay, uint16_t vsync_start,
+    uint16_t vsync_end, uint16_t vtotal, uint32_t flags)
+{
+	sc->pixel_clock_khz = clock;
+	sc->hdisplay = hdisplay;
+	sc->hblank = htotal - hdisplay;
+	sc->hsync_start = hsync_start;
+	sc->hsync_end = hsync_end;
+	sc->htotal = htotal;
+	sc->vdisplay = vdisplay;
+	sc->vblank = vtotal - vdisplay;
+	sc->vsync_start = vsync_start;
+	sc->vsync_end = vsync_end;
+	sc->vtotal = vtotal;
+	sc->h_sync_polarity =
+	    ((flags & RK_CDN_DP_MODE_FLAG_PHSYNC) != 0) ? 1 : 0;
+	sc->v_sync_polarity =
+	    ((flags & RK_CDN_DP_MODE_FLAG_PVSYNC) != 0) ? 1 : 0;
+	device_printf(sc->dev,
+	    "selected video mode: %ux%u @ %u kHz htotal=%u hsync=%u..%u (pol=%u) vtotal=%u vsync=%u..%u (pol=%u)\n",
+	    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz, sc->htotal,
+	    sc->hsync_start, sc->hsync_end, sc->h_sync_polarity, sc->vtotal,
+	    sc->vsync_start, sc->vsync_end, sc->v_sync_polarity);
+}
+
 /*
  * Calculate transfer-unit (TU) size + valid-symbol count and program the
  * Cadence DP framer + MSA registers.
@@ -3177,9 +3953,7 @@ rk_cdn_dp_config_video(struct rk_cdn_dp_softc *sc)
 	if (!sc->link_trained)
 		return (ENOENT);
 	if (sc->pixel_clock_khz == 0) {
-		error = rk_cdn_dp_parse_edid_dtd(sc);
-		if (error != 0)
-			return (error);
+		rk_cdn_dp_fill_forced_mode(sc);
 	}
 
 	link_rate = rk_cdn_dp_link_rate_khz(sc->link_plan_rate_code) / 1000;
@@ -3295,6 +4069,7 @@ rk_cdn_dp_config_video(struct rk_cdn_dp_softc *sc)
 	error = rk_cdn_dp_mailbox_reg_write(sc, RK_CDN_DP_STREAM_CONFIG, 1);
 	if (error != 0)
 		return (error);
+	device_printf(sc->dev, "config_video: STREAM_CONFIG <- 0x00000001\n");
 
 	val = (uint32_t)(sc->hsync_end - sc->hsync_start) |
 	    ((uint32_t)sc->hdisplay << 16);
@@ -3313,6 +4088,20 @@ rk_cdn_dp_config_video(struct rk_cdn_dp_softc *sc)
 	if (error != 0)
 		return (error);
 
+	/*
+	 * Final commit: clear DP_VB_ID[2] (NO_VIDEO).  Linux's cdn_dp_config_video
+	 * does this as the last write in the function (cdn-dp-reg.c:896) — it
+	 * tells the framer that the upcoming frames are real video, not blanking.
+	 * Without it the sink sees a valid link but never sees pixels.
+	 */
+	error = rk_cdn_dp_mailbox_reg_write_bit(sc, RK_CDN_DP_DP_VB_ID, 2, 1, 0);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "config_video: DP_VB_ID NO_VIDEO clear failed (%d)\n",
+		    error);
+		return (error);
+	}
+
 	sc->video_configured = true;
 	device_printf(sc->dev,
 	    "config_video: TU=%u VS=%llu (rem=%u) %ux%u @ %u kHz, %u-lane HBR\n",
@@ -3330,9 +4119,141 @@ static int
 rk_cdn_dp_set_video_status(struct rk_cdn_dp_softc *sc, bool active)
 {
 	uint8_t msg = active ? 1 : 0;
+	int error;
 
-	return (rk_cdn_dp_mailbox_send(sc, RK_CDN_DP_MB_MODULE_ID_DP_TX,
-	    RK_CDN_DP_DPTX_SET_VIDEO, sizeof(msg), &msg));
+	if (!sc->fw_link_training_used)
+		return (0);
+
+	error = rk_cdn_dp_mailbox_send(sc, RK_CDN_DP_MB_MODULE_ID_DP_TX,
+	    RK_CDN_DP_DPTX_SET_VIDEO, sizeof(msg), &msg);
+	if (error == 0)
+		rk_cdn_dp_verify_link_config(sc,
+		    active ? "set_video_status(active)" :
+		    "set_video_status(idle)");
+	return (error);
+}
+
+/*
+ * Exported entry point: lets rk_drm transition the dptx firmware framer
+ * to VIDEO_VALID after the VOP modeset has actually programmed the VOP
+ * to produce pixels. Mirrors Linux 4.4's cdn-dp-core.c flow where
+ * cdn_dp_encoder_enable sends VIDEO_IDLE before config_video and
+ * VIDEO_VALID after.  Stage 19 now leaves the framer in IDLE so that
+ * the CRTC side performs the single final VALID edge once pixels are live.
+ */
+int rk_cdn_dp_set_video_active_first(bool active);
+int
+rk_cdn_dp_set_video_active_first(bool active)
+{
+	devclass_t dc;
+	device_t dev;
+	struct rk_cdn_dp_softc *sc;
+
+	dc = devclass_find("rk_cdn_dp");
+	if (dc == NULL)
+		return (ENXIO);
+	dev = devclass_get_device(dc, 0);
+	if (dev == NULL)
+		return (ENXIO);
+	sc = device_get_softc(dev);
+	if (sc == NULL)
+		return (ENXIO);
+	return (rk_cdn_dp_set_video_status(sc, active));
+}
+
+int
+rk_cdn_dp_auto_bringup_default(void)
+{
+	devclass_t dc;
+	device_t dev;
+	struct rk_cdn_dp_softc *sc;
+	int error;
+
+	dc = devclass_find("rk_cdn_dp");
+	if (dc == NULL)
+		return (ENXIO);
+	dev = devclass_get_device(dc, 0);
+	if (dev == NULL)
+		return (ENXIO);
+	sc = device_get_softc(dev);
+	if (sc == NULL)
+		return (ENXIO);
+
+	rk_cdn_dp_reset_runtime_state(sc);
+	sc->skip_aux_swap = rk_cdn_dp_is_rockpro64(sc->dev) ? 1 : 0;
+	sc->hostcap_lanes_override = 2;
+	sc->allow_phys = true;
+	sc->allow_aux = true;
+
+	error = rk_cdn_dp_set_stage(sc, RK_CDN_DP_STAGE_VIDEO_ON);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "auto_bringup_default: stage19 failed: %d\n", error);
+		return (error);
+	}
+
+	device_printf(sc->dev,
+	    "auto_bringup_default: stage19 complete (skip_aux_swap=%d lanes=%d)\n",
+	    sc->skip_aux_swap, sc->hostcap_lanes_override);
+	return (0);
+}
+
+int
+rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
+    uint16_t hsync_start, uint16_t hsync_end, uint16_t htotal,
+    uint16_t vdisplay, uint16_t vsync_start, uint16_t vsync_end,
+    uint16_t vtotal, uint32_t flags)
+{
+	devclass_t dc;
+	device_t dev;
+	struct rk_cdn_dp_softc *sc;
+	int error;
+
+	dc = devclass_find("rk_cdn_dp");
+	if (dc == NULL)
+		return (ENXIO);
+	dev = devclass_get_device(dc, 0);
+	if (dev == NULL)
+		return (ENXIO);
+	sc = device_get_softc(dev);
+	if (sc == NULL)
+		return (ENXIO);
+
+	/*
+	 * Mirror the Linux encoder path closely:
+	 * - reset runtime/link state
+	 * - derive mode from the DRM-selected mode
+	 * - enable/train/configure the Cadence block for that exact mode
+	 * - leave the framer idle only if firmware training was used
+	 */
+	rk_cdn_dp_reset_runtime_state(sc);
+	sc->skip_aux_swap = rk_cdn_dp_is_rockpro64(sc->dev) ? 1 : 0;
+	sc->hostcap_lanes_override = 2;
+	sc->allow_phys = true;
+	sc->allow_aux = true;
+	rk_cdn_dp_fill_mode(sc, clock, hdisplay, hsync_start, hsync_end, htotal,
+	    vdisplay, vsync_start, vsync_end, vtotal, flags);
+
+	error = rk_cdn_dp_set_stage(sc, RK_CDN_DP_STAGE_CONFIG_VIDEO);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "enable_mode: config-video path failed: %d\n", error);
+		return (error);
+	}
+	if (sc->fw_link_training_used) {
+		error = rk_cdn_dp_set_stage(sc, RK_CDN_DP_STAGE_VIDEO_ON);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "enable_mode: video-idle arm failed: %d\n", error);
+			return (error);
+		}
+	}
+
+	device_printf(sc->dev,
+	    "enable_mode: ready for %ux%u@%u kHz (fw_training=%d stage=%d)\n",
+	    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz,
+	    sc->fw_link_training_used ? 1 : 0, sc->stage);
+	return (0);
 }
 
 static int
@@ -3354,11 +4275,7 @@ rk_cdn_dp_start_link_training(struct rk_cdn_dp_softc *sc)
 	if (error != 0)
 		return (error);
 
-	buf[0] = sc->link_plan_rate_code;
-	buf[1] = sc->link_plan_lanes;
-	if ((sc->aux_dpcd[DP_MAX_LANE_COUNT] & DP_LANE_COUNT_ENHANCED_FRAME_EN) != 0)
-		buf[1] |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
-	error = rk_cdn_dp_mailbox_dpcd_write(sc, DP_LINK_BW_SET, buf, 2);
+	error = rk_cdn_dp_write_link_config(sc, "start_link_training");
 	if (error != 0)
 		return (error);
 
@@ -3396,15 +4313,8 @@ rk_cdn_dp_start_link_training(struct rk_cdn_dp_softc *sc)
 static int
 rk_cdn_dp_probe(device_t dev)
 {
-	if (ofw_bus_search_compatible(dev, rk_cdn_dp_compat_data)->ocd_data == 0) {
-		printf("rk_cdn_dp: probe reject %s%d compat mismatch\n",
-		    device_get_name(dev), device_get_unit(dev));
+	if (ofw_bus_search_compatible(dev, rk_cdn_dp_compat_data)->ocd_data == 0)
 		return (ENXIO);
-	}
-
-	printf("rk_cdn_dp: probe accept %s%d node=%s status=%s\n",
-	    device_get_name(dev), device_get_unit(dev), ofw_bus_get_name(dev),
-	    ofw_bus_status_okay(dev) ? "okay" : "disabled");
 	device_set_desc(dev, "Rockchip RK3399 Cadence DisplayPort scaffold");
 	return (BUS_PROBE_DEFAULT);
 }
@@ -3662,6 +4572,28 @@ rk_cdn_dp_refresh_typec_provider(struct rk_cdn_dp_softc *sc)
 		sc->extcon_dev = dev;
 }
 
+static void
+rk_cdn_dp_snapshot_typec_state(struct rk_cdn_dp_softc *sc, const char *tag)
+{
+	struct rk3399_typec_dp_altmode_status altmode;
+	bool have_altmode;
+
+	if (sc == NULL)
+		return;
+
+	rk_cdn_dp_refresh_typec_provider(sc);
+	have_altmode = rk_cdn_dp_get_altmode_status(sc, &altmode);
+	if (!have_altmode) {
+		sc->dp_altmode_valid = 0;
+		sc->dp_altmode_ready = 0;
+		sc->dp_altmode_usb_ss = -1;
+		sc->dp_altmode_pin_assignment = 0;
+		sc->dp_altmode_status = 0;
+	}
+	if (tag != NULL)
+		rk_cdn_dp_log_typec_state(sc, tag);
+}
+
 static bool
 rk_cdn_dp_is_rockpro64(device_t dev)
 {
@@ -3719,15 +4651,18 @@ rk_cdn_dp_get_altmode_status(struct rk_cdn_dp_softc *sc,
     struct rk3399_typec_dp_altmode_status *status)
 {
 	int (*get_status)(device_t, struct rk3399_typec_dp_altmode_status *);
+	device_t dev;
 
 	if (status == NULL)
 		return (false);
-	(void)rk_cdn_dp_resolve_typec_dev(sc);
+	dev = rk_cdn_dp_resolve_typec_dev(sc);
+	if (dev == NULL || !device_is_attached(dev))
+		return (false);
 
 	get_status = rk_cdn_dp_lookup_altmode_status();
 	if (get_status == NULL)
 		return (false);
-	if (get_status(sc->extcon_dev, status) != 0 || !status->valid)
+	if (get_status(dev, status) != 0 || !status->valid)
 		return (false);
 
 	sc->dp_altmode_valid = status->valid ? 1 : 0;
@@ -4022,6 +4957,30 @@ rk_cdn_dp_sysctl_reprobe(SYSCTL_HANDLER_ARGS)
 }
 
 static int
+rk_cdn_dp_sysctl_refresh_typec(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, value;
+
+	sc = arg1;
+	value = 0;
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (value != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	rk_cdn_dp_snapshot_typec_state(sc, "refresh_typec_now");
+	sx_sunlock(&sc->detach_sx);
+	return (0);
+}
+
+static int
 rk_cdn_dp_sysctl_hostcap_lanes(SYSCTL_HANDLER_ARGS)
 {
 	int error, value;
@@ -4227,7 +5186,7 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 	if (target > RK_CDN_DP_STAGE_VIDEO_ON)
 		return (EINVAL);
 
-	rk_cdn_dp_refresh_typec_provider(sc);
+	rk_cdn_dp_snapshot_typec_state(sc, NULL);
 
 	for (next = sc->stage + 1; next <= target; next++) {
 		if (next == RK_CDN_DP_STAGE_PHYS && !rk_cdn_dp_allow_phys(sc)) {
@@ -4426,12 +5385,49 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				return (error);
 			}
 			rk_cdn_dp_mailbox_log_state(sc, "after set_host_cap");
-			error = rk_cdn_dp_mailbox_probe_dpcd_caps(sc);
+			error = rk_cdn_dp_mailbox_settle_post_hostcap(sc);
 			if (error != 0) {
 				sc->last_error = error;
-				device_printf(sc->dev, "mailbox DPCD read failed (%d)\n",
-				    error);
+				device_printf(sc->dev,
+				    "post-hostcap settle failed (%d)\n", error);
 				return (error);
+			}
+			rk_cdn_dp_mailbox_log_state(sc, "after post-hostcap settle");
+			if (sc->skip_dpcd) {
+				/*
+				 * Bypass the AUX-channel DPCD read entirely.
+				 * Synthesize a baseline sink_caps that any DP
+				 * 1.1 sink supports: 2 lanes at 1.62 Gbps, no
+				 * enhanced framing, no spread spectrum. Lets
+				 * stage 14+ (link-plan / training / EDID) run
+				 * so we can isolate whether AUX is fundamentally
+				 * dead or just our DPCD-read mailbox demux is
+				 * desynced.
+				 */
+				memset(sc->aux_dpcd, 0, sizeof(sc->aux_dpcd));
+				sc->aux_dpcd[0] = 0x11;	/* DPCD rev 1.1 */
+				sc->aux_dpcd[1] = 0x06;	/* MAX_LINK_RATE 1.62 Gbps */
+				sc->aux_dpcd[2] = 0x02;	/* MAX_LANE_COUNT=2 */
+				rk_cdn_dp_record_sink_caps(sc);
+				device_printf(sc->dev,
+				    "stage13: skip_dpcd=1, synthesized "
+				    "DPCD 1.1 / 1.62Gbps / 2-lane\n");
+				break;
+			}
+			error = rk_cdn_dp_mailbox_probe_dpcd_caps(sc);
+			if (error != 0) {
+				device_printf(sc->dev,
+				    "mailbox DPCD read failed (%d); falling back to synthesized sink caps\n",
+				    error);
+				memset(sc->aux_dpcd, 0, sizeof(sc->aux_dpcd));
+				sc->aux_dpcd[0] = 0x11;	/* DPCD rev 1.1 */
+				sc->aux_dpcd[1] = 0x06;	/* MAX_LINK_RATE 1.62 Gbps */
+				sc->aux_dpcd[2] = 0x02;	/* MAX_LANE_COUNT=2 */
+				rk_cdn_dp_record_sink_caps(sc);
+				device_printf(sc->dev,
+				    "stage13: synthesized fallback "
+				    "DPCD 1.1 / 1.62Gbps / 2-lane\n");
+				break;
 			}
 			device_printf(sc->dev, "stage13: dpcd-read done\n");
 			break;
@@ -4497,17 +5493,22 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			    "stage18: config-video done\n");
 			break;
 		case RK_CDN_DP_STAGE_VIDEO_ON:
+			if (!sc->fw_link_training_used) {
+				device_printf(sc->dev,
+				    "stage19: software-trained link; no firmware video arm needed\n");
+				break;
+			}
 			device_printf(sc->dev,
-			    "stage19: entering video-on\n");
-			error = rk_cdn_dp_set_video_status(sc, true);
+			    "stage19: entering video-idle arm\n");
+			error = rk_cdn_dp_set_video_status(sc, false);
 			if (error != 0) {
 				sc->last_error = error;
 				device_printf(sc->dev,
-				    "video-on failed (%d)\n", error);
+				    "video-idle arm failed (%d)\n", error);
 				return (error);
 			}
 			device_printf(sc->dev,
-			    "stage19: video-on done (firmware framer enabled)\n");
+			    "stage19: video-idle armed; awaiting VOP live pixels\n");
 			break;
 		default:
 			return (EINVAL);
@@ -4557,6 +5558,37 @@ rk_cdn_dp_sysctl_stage(SYSCTL_HANDLER_ARGS)
 }
 
 
+/*
+ * Sysctl write-1 handler that rewinds stage→ATTACHED and clears runtime
+ * state, so the operator can re-walk stages 1..14 with new tunables
+ * without kldunload (which is unsafe per project memory — leaves PHY
+ * and firmware in inconsistent state).  Caller must re-set
+ * skip_aux_swap / hostcap_* / allow_phys / allow_aux after reset.
+ */
+static int
+rk_cdn_dp_sysctl_reset_state(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val;
+
+	sc = arg1;
+	val = 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL || val != 1)
+		return (error);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	rk_cdn_dp_reset_runtime_state(sc);
+	device_printf(sc->dev,
+	    "reset_state: stage rewound to ATTACHED, tunables cleared\n");
+	sx_sunlock(&sc->detach_sx);
+	return (0);
+}
+
 static void
 rk_cdn_dp_reset_runtime_state(struct rk_cdn_dp_softc *sc)
 {
@@ -4579,6 +5611,8 @@ rk_cdn_dp_reset_runtime_state(struct rk_cdn_dp_softc *sc)
 	 */
 	sc->skip_aux_swap = rk_cdn_dp_is_rockpro64(sc->dev) ? 1 : 0;
 	sc->aux_swap_value = RK_CDN_DP_AUX_HOST_INVERT;
+	sc->debug_reg_addr = 0;
+	sc->debug_reg_value = 0;
 	sc->dp_altmode_valid = 0;
 	sc->dp_altmode_ready = 0;
 	sc->dp_altmode_usb_ss = -1;
@@ -4617,7 +5651,12 @@ rk_cdn_dp_reset_runtime_state(struct rk_cdn_dp_softc *sc)
 	sc->sink_max_link_rate_khz = 0;
 	sc->link_plan_rate_code = 0;
 	sc->link_plan_lanes = 0;
+	sc->expected_link_bw_set = 0;
+	sc->expected_lane_count_set = 0;
 	memset(sc->link_status, 0, sizeof(sc->link_status));
+	sc->link_trained = false;
+	sc->fw_link_training_used = false;
+	sc->video_configured = false;
 	sc->fw_active = false;
 	sc->fw_version = 0;
 }
@@ -4646,6 +5685,8 @@ rk_cdn_dp_attach(device_t dev)
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
+	sc->aux_iicbus = NULL;
+	sc->aux_iic_adapter = NULL;
 	sc->node = ofw_bus_get_node(dev);
 	sc->rockpro64_typec0_only = rk_cdn_dp_is_rockpro64(dev);
 	sc->has_extcon = OF_hasprop(sc->node, "extcon");
@@ -4720,6 +5761,10 @@ rk_cdn_dp_attach(device_t dev)
 	    sc, 0, rk_cdn_dp_sysctl_stage, "I",
 	    "Bring-up stage (monotonic). 0=attached 1=power 2=handles 3=clocks 4=resets 5=phys 6=fw-get 7=fw-prep 8=fw-load 9=fw-active 10=hpd-sel 11=hpd-state 12=host-cap 13=dpcd-read 14=link-plan 15=link-train-start");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "reset_state", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_reset_state, "I",
+	    "Write 1 to rewind stage to ATTACHED + clear runtime state (lets you re-walk stages with new tunables; safer than kldunload)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "allow_phys", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    &sc->allow_phys, 0, rk_cdn_dp_sysctl_flag, "I",
 	    "Allow manual entry into stage 5 (PHY mode switch and enable)");
@@ -4738,6 +5783,10 @@ rk_cdn_dp_attach(device_t dev)
 	    sc, 0, rk_cdn_dp_sysctl_active_port, "I",
 	    "Active TYPE-C DP port override: -1=auto, otherwise 0..nphys-1");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "refresh_typec_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_refresh_typec, "I",
+	    "Write 1 to resnapshot Type-C / DP Alt Mode state from fusb302");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "hostcap_lanes", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    &sc->hostcap_lanes_override, 0, rk_cdn_dp_sysctl_hostcap_lanes,
 	    "I", "Host-cap lanes override: 0=auto, 2 or 4 explicit");
@@ -4752,6 +5801,9 @@ rk_cdn_dp_attach(device_t dev)
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "skip_aux_swap", CTLFLAG_RW, &sc->skip_aux_swap, 0,
 	    "Skip WRITE_REGISTER(AUX_SWAP_INVERSION_CONTROL) in host-cap (debug)");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "skip_dpcd", CTLFLAG_RW, &sc->skip_dpcd, 0,
+	    "1=bypass stage 13 DPCD read; synthesize 2-lane / 1.62Gbps DP 1.1 sink_caps");
 	SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "aux_swap_value", CTLFLAG_RW, &sc->aux_swap_value, 0,
 	    "Value for AUX_SWAP_INVERSION_CONTROL (0=none,1=invert,3=invert+init)");
@@ -4759,6 +5811,10 @@ rk_cdn_dp_attach(device_t dev)
 	    "aux_status", CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_aux_status, "I",
 	    "Read DPTX_GET_LAST_AUX_STATUS via mailbox (0=ACK 1=NACK 2=DEFER 4=I2C_NACK 8=I2C_DEFER)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "aux_dump_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_aux_dump, "I",
+	    "Write 1 to dump AUX engine MMIO (0x780-0x7A4 + 0x280c) via firmware READ_REGISTER mailbox");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "edid_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_edid_now, "I",
@@ -4775,6 +5831,26 @@ rk_cdn_dp_attach(device_t dev)
 	    "aux_probe_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_aux_probe, "I",
 	    "Write 1: WRITE_DPCD 0x600<-D0 + aux_status + READ_DPCD 0x000 (split diagnostic)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "framer_dump_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_framer_dump, "I",
+	    "Write 1 to dump Cadence framer/MSA registers via READ_REGISTER mailbox");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "debug_reg_addr", CTLTYPE_U32 | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_reg_addr, "IU",
+	    "Cadence mailbox register address for debug read/write");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "debug_reg_value", CTLTYPE_U32 | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_reg_value, "IU",
+	    "Cadence mailbox register value for debug read/write");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "debug_reg_read_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_reg_read, "I",
+	    "Write 1 to read debug_reg_addr via READ_REGISTER mailbox into debug_reg_value");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "debug_reg_write_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_reg_write, "I",
+	    "Write 1 to write debug_reg_value to debug_reg_addr via WRITE_REGISTER mailbox");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "dp_altmode_valid", CTLFLAG_RD, &sc->dp_altmode_valid, 0,
 	    "Last observed DP Alt Mode helper presence");
@@ -4883,6 +5959,7 @@ rk_cdn_dp_attach(device_t dev)
 	if (sc->extcon_dev != NULL)
 		device_printf(dev, "Type-C extcon provider: %s\n",
 		    device_get_nameunit(sc->extcon_dev));
+	rk_cdn_dp_snapshot_typec_state(sc, "attach typec snapshot");
 
 	defer = rk_cdn_dp_defer_enable();
 	device_printf(dev,
@@ -4894,6 +5971,20 @@ rk_cdn_dp_attach(device_t dev)
 		device_printf(dev,
 		    "automatic bring-up is intentionally disabled; use dev.rk_cdn_dp.%d.stage manually\n",
 		    device_get_unit(dev));
+
+	error = iic_dp_aux_add_bus(dev, "rk_cdn_dp_aux",
+	    rk_cdn_dp_aux_i2c_xfer, sc, &sc->aux_iicbus, &sc->aux_iic_adapter);
+	if (error != 0) {
+		device_printf(dev,
+		    "AUX-backed iicbus unavailable (%d); continuing without it\n",
+		    -error);
+		sc->aux_iicbus = NULL;
+		sc->aux_iic_adapter = NULL;
+	} else {
+		device_printf(dev, "AUX-backed iicbus registered: %s\n",
+		    sc->aux_iic_adapter != NULL ?
+		    device_get_nameunit(sc->aux_iic_adapter) : "unknown");
+	}
 
 	return (0);
 
@@ -4920,6 +6011,12 @@ rk_cdn_dp_release(device_t dev)
 
 	sc = device_get_softc(dev);
 	sc->detached = true;
+
+	if (sc->aux_iicbus != NULL) {
+		(void)device_delete_child(dev, sc->aux_iicbus);
+		sc->aux_iicbus = NULL;
+		sc->aux_iic_adapter = NULL;
+	}
 
 	if (sc->phys_enabled) {
 		for (i = 0; i < sc->nphys; i++)
