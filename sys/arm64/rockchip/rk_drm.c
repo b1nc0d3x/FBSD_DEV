@@ -141,7 +141,7 @@ static int rk_drm_sysctl_output_select(SYSCTL_HANDLER_ARGS);
 static bool rk_drm_hdmi_hpd_locked(struct rk_drm_softc *sc);
 static int rk_drm_output_route_locked(struct rk_drm_softc *sc);
 
-static int rk_drm_output_default = RK_DRM_OUTPUT_USBC_DP;
+static int rk_drm_output_default = RK_DRM_OUTPUT_AUTO;
 TUNABLE_INT("hw.rk_drm.output", &rk_drm_output_default);
 
 static int
