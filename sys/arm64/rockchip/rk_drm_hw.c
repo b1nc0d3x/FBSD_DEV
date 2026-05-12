@@ -71,7 +71,7 @@
 #define RK_DRM_VOP_WIN0_LB_MODE_RGB_1920X5 (4u << 5)
 #define RK_DRM_VOP_WIN0_DATA_FMT_XRGB8888 0x00000000u
 /*
- * Live read of working Armbian shows WIN0_CTRL0 = 0x3a000081 — lower 8 bits
+ * Live read of working the reference build shows WIN0_CTRL0 = 0x3a000081 — lower 8 bits
  * are enable+LB_MODE+fmt as before, but bits 25/27/28/29 in 0x3a000000 are
  * also set (likely csc_en + color-space + ymir/yuv-clip default state).
  * Mirror that so the scanout pipeline matches the working reference.
@@ -720,7 +720,7 @@ rk_drm_route_vop_to_hdmi(struct rk_drm_softc *sc)
 /*
  * Route VOP B (the big VOP) to drive both DP encoders.
  *  - SOC_CON20[5] = EDP_LCDC_SEL: 0 = VOP_BIG -> Analogix eDP
- *  - SOC_CON20[6] = HDMI_LCDC_SEL: 1 = VOP_LIT -> HDMI (live Armbian has this set
+ *  - SOC_CON20[6] = HDMI_LCDC_SEL: 1 = VOP_LIT -> HDMI (live the reference build has this set
  *                   even though display is on DP — routes HDMI off VOP_BIG)
  *  - SOC_CON9[12] = DP_SEL_VOP_LIT: 0 = VOP_BIG -> Cadence MHDP
  * Hiword-update: low half = value, high half = bit-mask.
@@ -802,7 +802,7 @@ rk_drm_vop_program_win0_opaque(struct rk_drm_softc *sc,
 	/*
 	 * The fixed boot framebuffer is allocated at the maximum 1920-wide
 	 * pitch, but the direct modeset path programs WIN0 before KMS has a
-	 * chance to rebind a GEM framebuffer with its own pitch.  Linux sets
+	 * chance to rebind a GEM framebuffer with its own pitch.  the reference driver sets
 	 * yrgb_vir from the actual visible buffer pitch, so mirror that here
 	 * instead of reusing the allocation pitch.
 	 */
@@ -932,9 +932,9 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	post_scl_ctrl = rk_drm_vop_read4(sc, 0x0180);
 
 	/*
-	 * Live read of working Armbian shows SYS_CTRL = 0x20801800: both
+	 * Live read of working the reference build shows SYS_CTRL = 0x20801800: both
 	 * dp_en (bit 11) and rgb_en (bit 12) set, plus reserved bits 23/29.
-	 * Despite Linux's output_type-switch in rockchip_drm_vop.c looking
+	 * Despite the reference driver's output_type-switch in rockchip_drm_vop.c looking
 	 * mutually-exclusive, the actual settled state on RK3399 vop_big with
 	 * a working Cadence DP path carries both bits — rgb_en here is the
 	 * internal parallel-RGB output-formatter the Cadence framer consumes,
@@ -951,7 +951,7 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	rk_drm_vop_write4(sc, 0x0008, sys_ctrl);
 
 	/*
-	 * Linux cdn_dp_atomic_check (cdn-dp-core.c:973) forces
+	 * the reference driver cdn_dp_atomic_check (cdn-dp-core.c:973) forces
 	 * `ROCKCHIP_OUT_MODE_AAAA` for the DP connector regardless of
 	 * pixel bus_format — the Cadence framer's input bus is 32-bit
 	 * with the alpha lane unused. P888 (24-bit packed) cycles VOP
@@ -963,12 +963,12 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	dsp_ctrl0 |= RK_DRM_VOP_DSP_OUT_MODE_AAAA;
 	/*
 	 * On RK3399 vop_big (VOP version 3.5) DSP_CTRL0 bits 4..6 are NOT
-	 * pin polarity — Linux's `.pin_pol = VOP_REG_VER(... bits 4..6, 3, 0, 1)`
+	 * pin polarity — the reference driver's `.pin_pol = VOP_REG_VER(... bits 4..6, 3, 0, 1)`
 	 * (rockchip_vop_reg.c:222) restricts that field to VOP 3.0/3.1.  On
 	 * 3.5, bit 5 is `p2i_en` and bits 4/6 are other functions.  DP pin
 	 * polarity lives in DSP_CTRL1[16:18] (handled below).
 	 *
-	 * Live read of working Armbian shows DSP_CTRL0 = 0x0f — only OUT_MODE
+	 * Live read of working the reference build shows DSP_CTRL0 = 0x0f — only OUT_MODE
 	 * bits set; bit 7 (DCLK_POL) is also 0.  Clear all the legacy
 	 * pin_pol/dclk_pol/p2i/interlace bits and don't set DCLK_POL.
 	 */
@@ -984,16 +984,16 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	rk_drm_vop_write4(sc, 0x0010, dsp_ctrl0);
 
 	/*
-	 * DSP_CTRL1 polarities for Cadence DP path (RK3399).  Per Linux
+	 * DSP_CTRL1 polarities for Cadence DP path (RK3399).  Per the reference driver
 	 * rockchip_vop_reg.c and rockchip_drm_vop.c:
 	 *   bits 18:16 = dp_pin_pol  (bit 0 = HSYNC_POSITIVE,
 	 *                             bit 1 = VSYNC_POSITIVE,
 	 *                             bit 2 = DEN_NEGATIVE)
-	 *   bit  19    = dp_dclk_pol (Linux's DP encoder_enable forces 0)
+	 *   bit  19    = dp_dclk_pol (the reference driver's DP encoder_enable forces 0)
 	 *   bits 20-31 are hdmi/edp/mipi pin+dclk polarity fields — clear
 	 *                them so prior HDMI/eDP state can't leak through.
 	 * For PHSYNC mode → set HSYNC_POSITIVE; for PVSYNC → set
-	 * VSYNC_POSITIVE.  NHSYNC/NVSYNC leave the bit cleared (Linux
+	 * VSYNC_POSITIVE.  NHSYNC/NVSYNC leave the bit cleared (the reference driver
 	 * rockchip_drm_vop.c:2885).
 	 */
 	dp_pin_pol = pin_pol;
@@ -1003,7 +1003,7 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	    RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL);
 	dsp_ctrl1 |= (dp_pin_pol & 0x7) << 16;	/* dp_dclk_pol forced low */
 	/*
-	 * Match Linux's RGB888 setup: no dither-down or pre-dither on the
+	 * Match the reference driver's RGB888 setup: no dither-down or pre-dither on the
 	 * 32-bit AAAA Cadence path, but leave the dither selector at Allegro.
 	 */
 	dsp_ctrl1 &= ~((1u << 3) | (1u << 2) | (1u << 1));
@@ -1011,7 +1011,7 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	rk_drm_vop_write4(sc, 0x0014, dsp_ctrl1);
 
 	/*
-	 * Keep the VOP->Cadence interface in plain RGB mode. Linux clears
+	 * Keep the VOP->Cadence interface in plain RGB mode. the reference driver clears
 	 * data-swap and post-scaler YUV output state here; stale values can
 	 * yield a trained link that never produces visible pixels.
 	 */
@@ -2013,7 +2013,7 @@ rk_drm_hw_vop_dump(struct rk_drm_softc *sc)
 		 * CON2 [31]    = LOCK
 		 * CON3 [9:8]   = PLL_MODE  (0=slow, 1=normal, 2=deepslow)
 		 *
-		 * Per Linux clk-rk3399.c:1267 `COMPOSITE(DCLK_VOP0_DIV, ...,
+		 * Per the reference driver clk-rk3399.c:1267 `COMPOSITE(DCLK_VOP0_DIV, ...,
 		 * RK3399_CLKSEL_CON(49), 8, 2, MFLAGS, 0, 8, DFLAGS, ...)`:
 		 *   CRU CLKSEL_CON49 = offset 0x01c4
 		 *     [7:0]  DCLK_VOP0_DIV  (8-bit divider, rockchip composite

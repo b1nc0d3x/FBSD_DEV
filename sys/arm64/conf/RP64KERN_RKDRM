@@ -25,15 +25,16 @@ options		ALT_BREAK_TO_DEBUGGER
 
 # rk3399_power must be compiled in: rk_cdn_dp resolves rk3399_power_enable_domain
 # as a direct kernel symbol (not through module dependency chain).
-# fusb302 left as module: had crashed when compiled in earlier; revisit later.
-# fbd / drm2 / rk_drm: re-enabled — armbsd board (.9) successfully boots
-# with these compiled in, contradicting the earlier SYSINIT-hang note.  If a
-# hang reappears with the cdn_dp work in place, recover via DDB / serial and
-# revert to the previous (drm2-disabled) variant.
+# fusb302 + rk_cdn_dp are now compiled in (was modules) so they attach during
+# normal device probe rather than at userland kld_list time — moves panel
+# bring-up earlier in boot by several seconds.  Revert to module form if a
+# probe-time hang reappears (kld_list slot in /etc/rc.conf still works fine).
 device		rk3399_power
 device		fbd
 device		drm2
 device		rk_drm
+device		fusb302
+device		rk_cdn_dp
 
 # HDMI audio path (Stage 3): pcm framework + DAI binder + I2S2 + a
 # placeholder codec.  audio_soc binds the CPU-side DAI (rk_i2s on

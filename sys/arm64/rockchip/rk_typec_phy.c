@@ -82,7 +82,7 @@
 #define	CMN_DIAG_PLL0_CP_TUNE		(0x1c6 << 2)
 #define	CMN_DIAG_PLL0_LF_PROG		(0x1c7 << 2)
 /*
- * CMN PLL1 register addresses must match Linux 4.4 BSP exactly — the historical
+ * CMN PLL1 register addresses must match reference vendor BSP exactly — the historical
  * port had these at +0x60 offsets which silently broke every HBR PLL
  * configuration write (writes landed in unrelated registers, leaving PLL1's
  * VCO uncalibrated). Matched against drivers/phy/rockchip/phy-rockchip-typec.c
@@ -126,7 +126,7 @@
 #define	TX_TXCC_MGNFS_MULT_110(lane)	((0x4056 | ((lane) << 9)) << 2)
 #define	TX_TXCC_MGNFS_MULT_111(lane)	((0x4057 | ((lane) << 9)) << 2)
 /*
- * CPOST_MULT_XX register addresses must match Linux 4.4 BSP exactly. The
+ * CPOST_MULT_XX register addresses must match reference vendor BSP exactly. The
  * historical port had CPOST at offset 0x405c-0x405f (+0x10 byte offset wrong)
  * AND swapped _00 ↔ _10 labels — every set_signal_levels CPOST_MULT_00 write
  * landed on the wrong register, leaving actual TX pre-emphasis at chip-default
@@ -135,7 +135,7 @@
  * at the WRONG address) but link partner never saw the pre-emphasis change,
  * EQ stalled at max-swing/pre_emp request indefinitely.
  *
- * Linux phy-rockchip-typec.c:161 / rk3399_tcphy_helper.c:103 use 0x404c.
+ * the reference driver phy-rockchip-typec.c:161 / rk3399_tcphy_helper.c:103 use 0x404c.
  */
 #define	TX_TXCC_CPOST_MULT_00(lane)	((0x404c | ((lane) << 9)) << 2)
 #define	TX_TXCC_CPOST_MULT_01(lane)	((0x404d | ((lane) << 9)) << 2)
@@ -544,12 +544,12 @@ rk_typec_phy_cfg_dp_pll(struct rk_typec_phy_softc *sc)
 	uint32_t hsclk;
 
 	/*
-	 * Linux's tcphy_cfg_dp_pll(tcphy, DP_DEFAULT_RATE=162000) loads the
+	 * the reference driver's tcphy_cfg_dp_pll(tcphy, DP_DEFAULT_RATE=162000) loads the
 	 * RBR PLL config at init.  We previously loaded a "base" config with
 	 * INTDIV=0x21c that doesn't correspond to any standard DP rate;
 	 * switching from there to HBR via tcphy_dp_set_link_rate would fail
 	 * because PLL_VCOCAL_START / INTDIV mismatched the rate.  Match
-	 * Linux: set DATA_RATE_RBR, HSCLK_SEL_PLL1_DIV2, and load the RBR
+	 * the reference driver: set DATA_RATE_RBR, HSCLK_SEL_PLL1_DIV2, and load the RBR
 	 * cfg table — set_link_rate transitions cleanly from RBR.
 	 */
 	RK_TYPEC_PHY_WRITE(sc, DP_CLK_CTL, DP_PLL_CLOCK_ENABLE |
@@ -557,7 +557,7 @@ rk_typec_phy_cfg_dp_pll(struct rk_typec_phy_softc *sc)
 
 	hsclk = RK_TYPEC_PHY_READ(sc, CMN_DIAG_HSCLK_SEL);
 	hsclk &= ~((0x3U << 4) | (0x3U << 0));
-	hsclk |= (3U << 4) | (0U << 0); /* CLK_PLL1_DIV2 (matches Linux RBR) */
+	hsclk |= (3U << 4) | (0U << 0); /* CLK_PLL1_DIV2 (matches the reference driver RBR) */
 	RK_TYPEC_PHY_WRITE(sc, CMN_DIAG_HSCLK_SEL, hsclk);
 
 	for (i = 0; i < nitems(rk3399_tcphy_dp_pll_rbr_cfg); i++)
@@ -585,7 +585,7 @@ rk_typec_phy_cfg_dp_lane(struct rk_typec_phy_softc *sc, u_int lane)
 	 * zeroing them at init clobbers chip defaults the AUX path needs —
 	 * hangs the dptx firmware after set_host_cap. set_voltages writes
 	 * MGNFS_000 + CPOST_00 per train iteration anyway; leave the rest
-	 * at chip default. Linux 4.4 tcphy_dp_cfg_lane writes none of
+	 * at chip default. reference vendor BSP tcphy_dp_cfg_lane writes none of
 	 * these.
 	 */
 
@@ -598,7 +598,7 @@ rk_typec_phy_cfg_dp_lane(struct rk_typec_phy_softc *sc, u_int lane)
 }
 
 /*
- * Per-lane USB3 TX configuration. Matches Linux 4.4 BSP
+ * Per-lane USB3 TX configuration. Matches reference vendor BSP
  * `tcphy_tx_usb3_cfg_lane`. Used for the lanes that carry USB3 traffic in
  * PIN_D/F mode (the other pair carries DP).
  */
@@ -614,7 +614,7 @@ rk_typec_phy_cfg_usb3_tx_lane(struct rk_typec_phy_softc *sc, u_int lane)
 }
 
 /*
- * Per-lane USB3 RX configuration. Matches Linux 4.4 BSP
+ * Per-lane USB3 RX configuration. Matches reference vendor BSP
  * `tcphy_rx_usb3_cfg_lane`. Used for the lanes that carry USB3 traffic in
  * PIN_D/F mode.
  */
@@ -973,9 +973,9 @@ rk_typec_phy_dp_set_link_rate(device_t dev, int link_rate, bool ssc_on)
 }
 
 /*
- * Empirically: live read of Armbian (Linux 4.4, working DP at 1400x1050) shows
+ * Empirically: live read of the reference build (reference vendor BSP, working DP at 1400x1050) shows
  * DP_MODE_CTL = 0x110 / 0x140 across boot and desktop modes — bits 15:12 are
- * always 0.  Even though Linux's tcphy_dp_set_lane_count() writes those bits,
+ * always 0.  Even though the reference driver's tcphy_dp_set_lane_count() writes those bits,
  * the final settled state has all lanes enabled.  Some other code path (PHY
  * re-init or a write we haven't traced) clears them after.  Treat lane count
  * as sink-side training state only and leave DP_MODE_CTL untouched.
@@ -1195,7 +1195,7 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 	 *   USB3 mode: SS lanes carry USB3 SuperSpeed → enable USB3 host.
 	 *   DP mode (PIN_C/E, 4-lane DP):  SS lanes are DP → force USB3 host
 	 *     into USB2-only so it can't drive interfering signals on the
-	 *     same physical wires as our DP TX.  Linux's `tcphy_phy_init` for
+	 *     same physical wires as our DP TX.  the reference driver's `tcphy_phy_init` for
 	 *     `MODE_DFP_DP` calls `tcphy_cfg_usb3_to_usb2_only(tcphy, true)`
 	 *     for exactly this reason (line 1179 in 4.4 BSP phy-rockchip-typec.c).
 	 *     Without this, the USB3 host's idle signaling on SS lanes leaks
@@ -1347,7 +1347,7 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 
 		rk_typec_phy_cfg_dp_pll(sc);
 		/*
-		 * Per-lane configuration matching Linux 4.4 BSP's PIN_D/F path
+		 * Per-lane configuration matching reference vendor BSP's PIN_D/F path
 		 * (`tcphy_phy_init` else-branch when MODE includes MODE_DFP_USB):
 		 *   flip=1 (CC2): USB3 TX on lane 3, USB3 RX on lane 2, DP on 0,1
 		 *   flip=0 (CC1): USB3 TX on lane 0, USB3 RX on lane 1, DP on 2,3
@@ -1356,7 +1356,7 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 		 * cfg_dp_lane`) conflicted with `PMA_LANE_CFG=PIN_ASSIGN_D_F`
 		 * (which says lanes 2,3 are USB3) — analog cross-coupling between
 		 * misconfigured DP-driven lanes and the actual DP lanes broke EQ.
-		 * Live ftrace capture from working Armbian 4.4 BSP confirmed Linux
+		 * Live ftrace capture from working the reference build 4.4 BSP confirmed the reference driver
 		 * uses this 2-USB3-+-2-DP per-lane split for our exact cable.
 		 */
 		if (sc->flip) {
@@ -1371,8 +1371,8 @@ rk_typec_phy_enable(struct phynode *phynode, bool enable)
 			rk_typec_phy_cfg_dp_lane(sc, 3);
 		}
 		/*
-		 * Pin Assignment selection.  Live read of Armbian shows
-		 * PMA_LANE_CFG = 0x51d9 (PIN_C_E), but Armbian's per-lane DP
+		 * Pin Assignment selection.  Live read of the reference build shows
+		 * PMA_LANE_CFG = 0x51d9 (PIN_C_E), but the reference build's per-lane DP
 		 * electrical config is keyed to the C_E lane map (PMA0..3 all DP,
 		 * with PMA0,1 internally = DP_LANE_2,3).  Our cfg_dp_lane() calls
 		 * still drive flip-aware on PMA lanes 0,1 (CC2) / 2,3 (CC1), which

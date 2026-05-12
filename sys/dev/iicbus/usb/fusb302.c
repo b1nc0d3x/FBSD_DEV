@@ -136,12 +136,12 @@
 #define	FUSB_CTL0_HOST_CUR_1A5	0x08	/* bits[3:2]=10 = 1.5A 180uA Rp    */
 #define	FUSB_CTL0_HOST_CUR_3A	0x0c	/* bits[3:2]=11 = 3.0A 330uA Rp    */
 /*
- * Linux 4.4 BSP `tcpm_init` calls `tcpm_select_rp_value(TYPEC_RP_USB)` →
+ * Reference vendor BSP `tcpm_init` calls `tcpm_select_rp_value(TYPEC_RP_USB)` →
  * sets HOST_CUR=01 (USB-default 80uA Rp) at chip init.  An earlier
- * comment claimed an Armbian regmap_reg_write trace showed 1A5 (180uA),
- * but that trace cannot be reproduced (Armbian 6.18 cdn-dp probe fails
- * — see project_cdn_dp_mainline_6_18_broken.md), and the Linux 4.4 BSP
- * source-of-truth is unambiguous: USB-default at init, escalated only
+ * comment claimed a reference regmap_reg_write trace showed 1A5 (180uA),
+ * but that trace cannot be reproduced on current reference builds (cdn-dp
+ * probe fails — see project_cdn_dp_mainline_6_18_broken.md), and the vendor
+ * BSP source-of-truth is unambiguous: USB-default at init, escalated only
  * when transitioning to ATTACHED_SRC if needed.  Path-C empirical test
  * 2026-05-09: flipping back to _USB to see if silent-PD partner ACKs.
  */
@@ -215,7 +215,7 @@
 
 /* Interrupt mask register initial values for PD operation */
 #define	FUSB_MASK1_ATTACHED	0x55	/* active session: also unmask BC_LVL change
-					   (Armbian's working value while DP altmode active) */
+					   (reference build's working value while DP altmode active) */
 #define	FUSB_MASK1_PD		0x75	/* unmask COLLISION, ALERT, VBUSOK
 					   (matches Linux i2c-rk3x init) */
 #define	FUSB_MASKA_PD		0xa2	/* unmask TOGDONE,TXSENT,HARDSENT,RETRYFAIL,HARDRST */
@@ -717,9 +717,11 @@ fusb302_fifo_write_locked(struct fusb302_softc *sc)
 		for (i = 0; i < pos && i < 40; i++)
 			n += snprintf(hex + n, sizeof(hex) - n,
 			    "%s%02x", i ? " " : "", senddata[i]);
-		device_printf(sc->dev,
-		    "fifo TX [%d B] hdr=0x%04x ndo=%d: %s\n",
-		    pos, sc->send_head, PD_HDR_CNT(sc->send_head), hex);
+		if (bootverbose)
+			device_printf(sc->dev,
+			    "fifo TX [%d B] hdr=0x%04x ndo=%d: %s\n",
+			    pos, sc->send_head, PD_HDR_CNT(sc->send_head),
+			    hex);
 	}
 
 	error = iicdev_writeto(sc->dev, FUSB_REG_FIFO, senddata, pos,
@@ -1589,8 +1591,8 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 			uint8_t sw1_set;
 			/*
 			 * Passive SRC: chip is now presenting Rp on the active
-			 * CC pin (PU_EN1+MEAS_CC1+VCONN_CC2). Match Armbian's
-			 * working SWITCHES1=0xd5 by setting POWER_ROLE=Source,
+			 * CC pin (PU_EN1+MEAS_CC1+VCONN_CC2). Match the reference
+			 * build's working SWITCHES1=0xd5 by setting POWER_ROLE=Source,
 			 * DATA_ROLE=DFP, AUTO_CRC=1, SPEC_REV=PD3.  AUTO_CRC is
 			 * critical: if the display sends Discover_Identity or any
 			 * other PD message, the chip auto-ACKs with GoodCRC at
@@ -1621,9 +1623,9 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 			    FUSB_SW1_AUTO_CRC | FUSB_SW1_SPECREV,
 			    sw1_set);
 
-			/* Match Armbian's MASK1 transition on attach: unmask
-			 * BC_LVL change (bit 5).  Idle init wrote 0x75; active
-			 * session value is 0x55. */
+			/* Match the reference build's MASK1 transition on attach:
+			 * unmask BC_LVL change (bit 5).  Idle init wrote 0x75;
+			 * active session value is 0x55. */
 			(void)fusb302_write_reg(sc, FUSB_REG_MASK1,
 			    FUSB_MASK1_ATTACHED);
 
@@ -1873,6 +1875,7 @@ fusb302_state_src_ready_locked(struct fusb302_softc *sc, uint32_t evt)
 	    sc->vdm_state < VDM_READY_ST);
 
 	if (evt & FUSB_EVT_CONTINUE)
+		if (bootverbose)
 		device_printf(sc->dev, "src_ready: vdm_active=%d vdm_state=%d\n",
 		    vdm_active, sc->vdm_state);
 
@@ -1888,7 +1891,7 @@ fusb302_state_src_ready_locked(struct fusb302_softc *sc, uint32_t evt)
 	}
 
 	/*
-	 * Skip Get_Sink_Cap entirely.  Linux's tcpm/fusb302 path does not
+	 * Skip Get_Sink_Cap entirely.  The reference tcpm/fusb302 path does not
 	 * issue Get_Sink_Cap before VDM altmode discovery on DFP/source role,
 	 * and many USB-C displays (the partner here is one) do not reply to
 	 * Get_Sink_Cap, leaving us indefinitely stuck in SRC_GET_SINK_CAPS
@@ -2164,10 +2167,10 @@ fusb302_state_snk_discovery_locked(struct fusb302_softc *sc, uint32_t evt)
 			fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
 		} else if (!sc->softrst_tried) {
 			/*
-			 * Linux precedent: try soft reset before hard reset.
+			 * Reference precedent: try soft reset before hard reset.
 			 * Some sources fail to resume Source_Capabilities
 			 * after a hard reset but recover after a soft reset
-			 * (PE_SNK_Send_Soft_Reset).  See linux tcpm.c
+			 * (PE_SNK_Send_Soft_Reset).  See the reference tcpm.c
 			 * SNK_WAIT_CAPABILITIES_TIMEOUT.
 			 */
 			sc->softrst_tried = true;
@@ -2610,8 +2613,8 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp,
 	if (error != 0)
 		return;
 
-	/* Surface every alert during VDM bring-up. */
-	if (intr | intra | intrb)
+	/* Verbose alert trace — useful for VDM bring-up debug only. */
+	if (bootverbose && (intr | intra | intrb))
 		device_printf(sc->dev,
 		    "alert: intr=%02x intra=%02x intrb=%02x\n",
 		    intr, intra, intrb);

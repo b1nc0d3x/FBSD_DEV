@@ -359,14 +359,14 @@ int iic_dp_aux_add_bus(device_t dev, const char *name,
 #define	RK_CDN_DP_DPTX_READ_EVENT	0x0a
 #define	RK_CDN_DP_DPTX_GET_LAST_AUX_STATUS	0x0e
 #define	RK_CDN_DP_DPTX_HPD_STATE	0x11
-/* Firmware-driven link training (Linux 4.4 cdn-dp-reg.h:368-370). */
+/* Firmware-driven link training (reference vendor BSP cdn-dp-reg.h:368-370). */
 #define	RK_CDN_DP_DPTX_TRAINING_CONTROL	0x09
 #define	RK_CDN_DP_DPTX_READ_LINK_STAT	0x0b
 #define	RK_CDN_DP_LINK_TRAINING_RUN	1
 /* DPTX_READ_EVENT response byte 1 bits (cdn-dp-reg.h:412,419). */
 #define	RK_CDN_DP_TRAINING_EVENT	(1U << 1)
 #define	RK_CDN_DP_EQ_PHASE_FINISHED	(1U << 3)
-/* Linux fixed timing constants (cdn-dp-reg.c:33-34). */
+/* the reference driver fixed timing constants (cdn-dp-reg.c:33-34). */
 #define	RK_CDN_DP_LINK_TRAINING_RETRY_MS	20
 #define	RK_CDN_DP_LINK_TRAINING_TIMEOUT_MS	500
 
@@ -995,6 +995,8 @@ rk_cdn_dp_mailbox_log_state(struct rk_cdn_dp_softc *sc, const char *tag)
 {
 
 	rk_cdn_dp_mailbox_capture_state(sc);
+	if (!bootverbose)
+		return;
 	device_printf(sc->dev,
 	    "%s: FULL=0x%x EMPTY=0x%x SW_EVENTS0=0x%x KEEP_ALIVE=0x%08x APB_INT_MASK=0x%08x HPD=%d last_hdr=0x%08x expect=0x%08x send_hdr=0x%08x send_size=%u send_written=%u full_first=0x%x full_last=0x%x full_polls=%u bad_hdr=%u\n",
 	    tag,
@@ -1340,17 +1342,12 @@ rk_cdn_dp_load_firmware(struct rk_cdn_dp_softc *sc)
 	iram_data = data + header_size;
 	dram_data = iram_data + iram_size;
 
-	device_printf(sc->dev,
-	    "fw-load: hdr=%u iram=%u dram=%u total=%u\n",
-	    header_size, iram_size, dram_size, size_bytes);
-
 	rk_cdn_dp_write_4(sc, RK_CDN_DP_APB_CTRL,
 	    RK_CDN_DP_APB_IRAM_PATH |
 	    RK_CDN_DP_APB_DRAM_PATH |
 	    RK_CDN_DP_APB_XT_RESET);
 
 	reg = rk_cdn_dp_read_4(sc, RK_CDN_DP_APB_CTRL);
-	device_printf(sc->dev, "fw-load: APB_CTRL after hold=%08x\n", reg);
 
 	for (i = 0; i < iram_size; i += 4) {
 		val = ((const uint32_t *)iram_data)[i / 4];
@@ -1363,16 +1360,12 @@ rk_cdn_dp_load_firmware(struct rk_cdn_dp_softc *sc)
 
 	/* verify first IMEM word was retained */
 	val = rk_cdn_dp_read_4(sc, RK_CDN_DP_ADDR_IMEM);
-	device_printf(sc->dev, "fw-load: IMEM[0] readback=0x%08x expected=0x%08x\n",
-	    val, ((const uint32_t *)iram_data)[0]);
 
 	reg = rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE);
-	device_printf(sc->dev, "fw-load: KEEP_ALIVE before release=%u\n", reg);
 
 	rk_cdn_dp_write_4(sc, RK_CDN_DP_APB_CTRL, 0);
 
 	reg = rk_cdn_dp_read_4(sc, RK_CDN_DP_APB_CTRL);
-	device_printf(sc->dev, "fw-load: APB_CTRL after release=%08x\n", reg);
 
 	for (i = 0; i < RK_CDN_DP_FW_ALIVE_TIMEOUT_US / 2000; i++) {
 		reg = rk_cdn_dp_read_4(sc, RK_CDN_DP_KEEP_ALIVE);
@@ -1384,7 +1377,6 @@ rk_cdn_dp_load_firmware(struct rk_cdn_dp_softc *sc)
 			    (i + 1) * 2);
 		DELAY(2000);
 	}
-	device_printf(sc->dev, "fw-load: KEEP_ALIVE final=%u (i=%u)\n", reg, i);
 	if (reg == 0)
 		return (ETIMEDOUT);
 
@@ -1487,9 +1479,6 @@ rk_cdn_dp_set_host_cap(struct rk_cdn_dp_softc *sc, uint8_t lanes, bool flip)
 	msg[6] = flip ? RK_CDN_DP_LANE_MAPPING_FLIPPED :
 	    RK_CDN_DP_LANE_MAPPING_NORMAL;
 	msg[7] = RK_CDN_DP_ENHANCED;
-	device_printf(sc->dev,
-	    "host_cap payload: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-	    msg[0], msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7]);
 
 	error = rk_cdn_dp_mailbox_send(sc, RK_CDN_DP_MB_MODULE_ID_DP_TX,
 	    RK_CDN_DP_DPTX_SET_HOST_CAPABILITIES, sizeof(msg), msg);
@@ -1500,7 +1489,7 @@ rk_cdn_dp_set_host_cap(struct rk_cdn_dp_softc *sc, uint8_t lanes, bool flip)
 		uint32_t aux_swap;
 
 		/*
-		 * Linux ALWAYS writes AUX_HOST_INVERT (0x3) regardless of
+		 * the reference driver ALWAYS writes AUX_HOST_INVERT (0x3) regardless of
 		 * cable orientation — see cdn_dp_set_host_cap in
 		 * drivers/gpu/drm/rockchip/cdn-dp-reg.c, which calls
 		 * cdn_dp_reg_write(DP_AUX_SWAP_INVERSION_CONTROL,
@@ -1518,9 +1507,6 @@ rk_cdn_dp_set_host_cap(struct rk_cdn_dp_softc *sc, uint8_t lanes, bool flip)
 		    RK_CDN_DP_DP_AUX_SWAP_INVERSION_CONTROL, aux_swap);
 		if (error != 0)
 			return (error);
-	} else {
-		device_printf(sc->dev,
-		    "host_cap: skipping AUX_SWAP write\n");
 	}
 
 	return (0);
@@ -1736,19 +1722,14 @@ rk_cdn_dp_mailbox_get_firmware(struct rk_cdn_dp_softc *sc)
 		RK_CDN_DP_FIRMWARE_BASENAME,
 		RK_CDN_DP_FIRMWARE_OLDNAME,
 	};
-	const char *loaded;
 	size_t i;
 
 	if (sc->fw != NULL)
 		return (0);
-
-	loaded = NULL;
 	for (i = 0; i < nitems(fw_names); i++) {
 		sc->fw = firmware_get_flags(fw_names[i], FIRMWARE_GET_NOWARN);
-		if (sc->fw != NULL) {
-			loaded = fw_names[i];
+		if (sc->fw != NULL)
 			break;
-		}
 	}
 	if (sc->fw == NULL) {
 		device_printf(sc->dev,
@@ -1757,8 +1738,6 @@ rk_cdn_dp_mailbox_get_firmware(struct rk_cdn_dp_softc *sc)
 		    RK_CDN_DP_FIRMWARE_BASENAME, RK_CDN_DP_FIRMWARE_OLDNAME);
 		return (ENOENT);
 	}
-	device_printf(sc->dev, "using firmware %s (%zu bytes)\n",
-	    loaded, sc->fw->datasize);
 
 	return (0);
 }
@@ -2743,9 +2722,6 @@ rk_cdn_dp_wait_sink_ready(struct rk_cdn_dp_softc *sc)
 		error = rk_cdn_dp_mailbox_dpcd_read_retry(sc,
 		    RK_CDN_DP_DPCD_SINK_COUNT, &sink_count, 1, 1);
 		if (error == 0) {
-			device_printf(sc->dev,
-			    "sink_count: raw=0x%02x count=%d (try %d)\n",
-			    sink_count, sink_count & 0x3f, i);
 			if ((sink_count & 0x3f) != 0)
 				return (0);
 			fw_dead_streak = 0;
@@ -2894,6 +2870,8 @@ rk_cdn_dp_log_typec_state(struct rk_cdn_dp_softc *sc, const char *tag)
 	have_altmode = rk_cdn_dp_get_altmode_status(sc, &altmode);
 	rk_cdn_dp_get_hostcap_config(sc, &lanes, &flip, &usb_ss);
 
+	if (!bootverbose)
+		return;
 	device_printf(sc->dev,
 	    "%s: extcon=%s typec=%s altmode=%s attached=%d role=%d orient=%d state_valid=%d dp_ready=%d pin=0x%x usb_ss=%d dp_status=0x%x host_lanes=%u host_flip=%u\n",
 	    tag,
@@ -3619,7 +3597,7 @@ static uint8_t
 rk_cdn_dp_select_chaneq_pattern(struct rk_cdn_dp_softc *sc)
 {
 	/*
-	 * Mirror Linux's Cadence training helper: use TPS3 whenever the sink
+	 * Mirror the reference driver's Cadence training helper: use TPS3 whenever the sink
 	 * advertises support, not only at HBR2.  Some sinks complete EQ at HBR
 	 * only when we present TPS3 during channel equalization.
 	 */
@@ -3714,13 +3692,13 @@ rk_cdn_dp_lower_rate(struct rk_cdn_dp_softc *sc)
 }
 
 /*
- * Firmware-driven link training fallback (Linux 4.4 cdn-dp-reg.c:564-639).
+ * Firmware-driven link training fallback (reference vendor BSP cdn-dp-reg.c:564-639).
  *
  * The Cadence dptx.bin firmware has its own internal CR+EQ state machine
- * that uses fixed PHY config values it ships with.  Linux uses this as a
+ * that uses fixed PHY config values it ships with.  the reference driver uses this as a
  * fallback when host-side DPCD-driven (software) training fails — the
  * firmware's analog tuning may succeed where ours doesn't, especially on
- * "boards with unique hardware design" (per Linux's comment).
+ * "boards with unique hardware design" (per the reference driver's comment).
  *
  * Protocol: send DPTX_TRAINING_CONTROL=LINK_TRAINING_RUN; poll READ_EVENT
  * until event[1] & EQ_PHASE_FINISHED; then DPTX_READ_LINK_STAT to learn
@@ -3835,7 +3813,7 @@ rk_cdn_dp_link_train(struct rk_cdn_dp_softc *sc)
 
 	for (;;) {
 		/*
-		 * Match Linux ordering on each attempt: re-rate the PHY first,
+		 * Match the reference driver ordering on each attempt: re-rate the PHY first,
 		 * then tell the sink the active link configuration.  That keeps
 		 * both ends in sync when we retry at a lower bandwidth.
 		 */
@@ -3885,7 +3863,7 @@ rk_cdn_dp_link_train(struct rk_cdn_dp_softc *sc)
 
 	/*
 	 * Software training failed — fall back to firmware-driven training
-	 * (Linux 4.4 cdn_dp_train_link does the same).  The dptx.bin firmware
+	 * (reference vendor BSP cdn_dp_train_link does the same).  The dptx.bin firmware
 	 * has its own internal CR+EQ FSM with fixed PHY tuning that may
 	 * succeed where our DPCD-driven max-swing/pre-emp doesn't.  Only log
 	 * if firmware training also fails.
@@ -4344,7 +4322,7 @@ rk_cdn_dp_config_video(struct rk_cdn_dp_softc *sc)
 		return (error);
 
 	/*
-	 * Final commit: clear DP_VB_ID[2] (NO_VIDEO).  Linux's cdn_dp_config_video
+	 * Final commit: clear DP_VB_ID[2] (NO_VIDEO).  the reference driver's cdn_dp_config_video
 	 * does this as the last write in the function (cdn-dp-reg.c:896) — it
 	 * tells the framer that the upcoming frames are real video, not blanking.
 	 * Without it the sink sees a valid link but never sees pixels.
@@ -4391,7 +4369,7 @@ rk_cdn_dp_set_video_status(struct rk_cdn_dp_softc *sc, bool active)
 /*
  * Exported entry point: lets rk_drm transition the dptx firmware framer
  * to VIDEO_VALID after the VOP modeset has actually programmed the VOP
- * to produce pixels. Mirrors Linux 4.4's cdn-dp-core.c flow where
+ * to produce pixels. Mirrors reference vendor BSP's cdn-dp-core.c flow where
  * cdn_dp_encoder_enable sends VIDEO_IDLE before config_video and
  * VIDEO_VALID after.  Stage 19 now leaves the framer in IDLE so that
  * the CRTC side performs the single final VALID edge once pixels are live.
@@ -4460,7 +4438,7 @@ rk_cdn_dp_auto_bringup_default(void)
  * signals it needs retraining via the LINK_STATUS_UPDATED bit / VDM
  * ATTENTION with HPD_IRQ.
  *
- * Mirrors Linux's cdn_dp_pd_event_work → cdn_dp_link_train path: the
+ * Mirrors the reference driver's cdn_dp_pd_event_work → cdn_dp_link_train path: the
  * framer (DP_FRAMER_GLOBAL_CONFIG, MSA, STREAM_CONFIG, DP_VB_ID) stays
  * exactly as auto_bringup_default left it.  We only re-do CR+EQ.
  *
@@ -4572,7 +4550,7 @@ rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 	}
 
 	/*
-	 * Slow path (first bring-up): mirror the Linux encoder path closely:
+	 * Slow path (first bring-up): mirror the the reference driver encoder path closely:
 	 * - reset runtime/link state
 	 * - derive mode from the DRM-selected mode
 	 * - enable/train/configure the Cadence block for that exact mode
@@ -4752,12 +4730,8 @@ rk_cdn_dp_get_phys(struct rk_cdn_dp_softc *sc)
 		device_printf(sc->dev, "no DP phys available\n");
 		return (ENXIO);
 	}
-	if (sc->rockpro64_typec0_only && sc->nphys > 1) {
-		device_printf(sc->dev,
-		    "board=rockpro64: restricting CDN-DP to TYPEC0/PHY0 (ignoring %d extra phys)\n",
-		    sc->nphys - 1);
+	if (sc->rockpro64_typec0_only && sc->nphys > 1)
 		sc->nphys = 1;
-	}
 
 	return (0);
 }
@@ -5175,13 +5149,8 @@ rk_cdn_dp_select_active_port(struct rk_cdn_dp_softc *sc)
 		    sc->extcon_dev != NULL ? "yes" : "no");
 		return (0);
 	}
-	if (sc->rockpro64_typec0_only) {
-		device_printf(sc->dev,
-		    "active-port=%d nphys=%d extcon=%s board=rockpro64-typec0\n",
-		    sc->active_port, sc->nphys,
-		    sc->extcon_dev != NULL ? "yes" : "no");
+	if (sc->rockpro64_typec0_only)
 		return (0);
-	}
 
 	if (rk_cdn_dp_get_typec_status(sc, &typec)) {
 		if (!typec.attached)
@@ -5191,8 +5160,6 @@ rk_cdn_dp_select_active_port(struct rk_cdn_dp_softc *sc)
 			sc->active_port = 1;
 	}
 
-	device_printf(sc->dev, "active-port=%d nphys=%d extcon=%s\n",
-	    sc->active_port, sc->nphys, sc->extcon_dev != NULL ? "yes" : "no");
 	return (0);
 }
 
@@ -5693,7 +5660,6 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			}
 			break;
 		case RK_CDN_DP_STAGE_HPD_SEL:
-			device_printf(sc->dev, "stage10: entering hpd-sel\n");
 			error = rk_cdn_dp_select_hpd(sc);
 			if (error != 0) {
 				sc->last_error = error;
@@ -5701,10 +5667,8 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				    error);
 				return (error);
 			}
-			device_printf(sc->dev, "stage10: hpd-sel done\n");
 			break;
 		case RK_CDN_DP_STAGE_HPD_STATE:
-			device_printf(sc->dev, "stage11: entering hpd-state\n");
 			error = rk_cdn_dp_mailbox_get_hpd_state(sc);
 			if (error != 0) {
 				sc->last_error = error;
@@ -5712,14 +5676,11 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				    error);
 				return (error);
 			}
-			device_printf(sc->dev, "stage11: hpd-state done\n");
 			break;
 		case RK_CDN_DP_STAGE_HOSTCAP:
 			/* No-op: set_host_cap moved to stage 13. */
-			device_printf(sc->dev, "stage12: no-op (set_host_cap in stage 13)\n");
 			break;
 		case RK_CDN_DP_STAGE_DPCD_READ:
-			device_printf(sc->dev, "stage13: entering hostcap+dpcd-read\n");
 			/*
 			 * set_host_cap is the last step of phy enable, immediately
 			 * followed by cdn_dp_get_sink_capability (poll sink_count +
@@ -5781,10 +5742,8 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				    "DPCD 1.1 / 1.62Gbps / 2-lane\n");
 				break;
 			}
-			device_printf(sc->dev, "stage13: dpcd-read done\n");
 			break;
 		case RK_CDN_DP_STAGE_LINK_PLAN:
-			device_printf(sc->dev, "stage14: entering link-plan\n");
 			error = rk_cdn_dp_plan_link(sc);
 			if (error != 0) {
 				sc->last_error = error;
@@ -5792,7 +5751,6 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				    error);
 				return (error);
 			}
-			device_printf(sc->dev, "stage14: link-plan done\n");
 			break;
 		case RK_CDN_DP_STAGE_LINK_TRAIN_START:
 			device_printf(sc->dev,
@@ -5821,7 +5779,6 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			    "stage16: link-train-full done\n");
 			break;
 		case RK_CDN_DP_STAGE_EDID:
-			device_printf(sc->dev, "stage17: entering edid\n");
 			error = rk_cdn_dp_read_edid(sc);
 			if (error != 0) {
 				sc->last_error = error;
@@ -5829,7 +5786,6 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				    "edid failed (%d)\n", error);
 				return (error);
 			}
-			device_printf(sc->dev, "stage17: edid done\n");
 			break;
 		case RK_CDN_DP_STAGE_CONFIG_VIDEO:
 			device_printf(sc->dev,

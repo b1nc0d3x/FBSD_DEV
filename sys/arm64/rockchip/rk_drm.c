@@ -408,32 +408,48 @@ rk_drm_mode_is_forced(const struct drm_display_mode *mode)
 static void
 rk_drm_prefer_usbc_dp_mode(struct rk_drm_softc *sc, struct drm_connector *connector)
 {
-	struct drm_display_mode *iter, *chosen;
+	struct drm_display_mode *iter, *forced;
 
 	if (sc == NULL || connector == NULL ||
 	    sc->output_select != RK_DRM_OUTPUT_USBC_DP)
 		return;
 
-	chosen = NULL;
-	list_for_each_entry(iter, &connector->probed_modes, head) {
-		if (rk_drm_mode_is_forced(iter)) {
-			chosen = iter;
-			break;
-		}
-	}
-	if (chosen == NULL)
-		return;
-
+	/*
+	 * Inject our forced DP mode (rk_dp_forced_mode.h) into the
+	 * connector's probed_modes list as the preferred timing.
+	 *
+	 * Why inject instead of just biasing the existing list:
+	 * - EDID-derived modes (e.g. CEA VIC 16 1920x1080p60 PHSYNC) are
+	 *   the ones the panel actually REJECTS — backlight stays off.
+	 * - Our custom DMT-style timing (NHSYNC+wide hsync 144) is what
+	 *   the panel actually accepts, but it isn't in the EDID.
+	 * - Userspace (Xorg, SLIM, fb_helper) picks a mode from
+	 *   connector->modes when allocating GEM framebuffers.  If our
+	 *   timing isn't in the list, Xorg falls back to a 1024x768
+	 *   default fb, scanning out 1024-wide content into a 1920-wide
+	 *   active area → fuzzy display.
+	 *
+	 * By injecting + marking preferred, we get Xorg to allocate a
+	 * 1920x1080 GEM fb with matching stride, and the scanout
+	 * pipeline ends up coherent end-to-end.
+	 */
 	list_for_each_entry(iter, &connector->probed_modes, head)
 		iter->type &= ~DRM_MODE_TYPE_PREFERRED;
-	chosen->type |= DRM_MODE_TYPE_PREFERRED;
-	if (rk_drm_hw_mode_valid(chosen))
-		chosen->status = MODE_OK;
+
+	forced = drm_mode_create(connector->dev);
+	if (forced == NULL) {
+		device_printf(sc->dev,
+		    "USB-C DP: drm_mode_create failed; falling back to EDID modes\n");
+		return;
+	}
+	rk_drm_fill_forced_dp_mode(forced);
+	forced->status = MODE_OK;
+	drm_mode_probed_add(connector, forced);
 
 	device_printf(sc->dev,
-	    "USB-C DP preferred probed mode: %s %ux%u@%d clock=%d type=0x%x\n",
-	    chosen->name, chosen->hdisplay, chosen->vdisplay,
-	    drm_mode_vrefresh(chosen), chosen->clock, chosen->type);
+	    "USB-C DP: injected forced mode %s %ux%u@%d clock=%d type=0x%x\n",
+	    forced->name, forced->hdisplay, forced->vdisplay,
+	    drm_mode_vrefresh(forced), forced->clock, forced->type);
 }
 
 static bool
@@ -635,22 +651,13 @@ rk_drm_mode_fill_default(struct drm_display_mode *mode)
 	memset(mode, 0, sizeof(*mode));
 	if (sc != NULL && sc->output_select == RK_DRM_OUTPUT_USBC_DP) {
 		/*
-		 * Match Linux's pre-EDID fallback on the working USB-C DP path.
-		 * Avoid driving an unsupported 1080p mode before the connector
-		 * mode list has been populated from EDID.
+		 * USB-C DP pre-EDID fallback.  Use the same forced mode as the
+		 * EDID-bound path so fbdev / Xorg sees a single coherent
+		 * resolution from boot onward.  Previous 1024x768 fallback
+		 * caused Xorg to allocate a 1024-wide GEM fb that didn't match
+		 * VOP's forced 1920-wide scanout — fuzzy display.
 		 */
-		mode->clock = 78750;
-		mode->hdisplay = 1024;
-		mode->hsync_start = 1040;
-		mode->hsync_end = 1136;
-		mode->htotal = 1312;
-		mode->vdisplay = 768;
-		mode->vsync_start = 769;
-		mode->vsync_end = 772;
-		mode->vtotal = 800;
-		mode->flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC;
-		mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
-		drm_mode_set_name(mode);
+		rk_drm_fill_forced_dp_mode(mode);
 		return;
 	}
 
@@ -841,7 +848,7 @@ rk_drm_sysctl_dp_modeset_now(SYSCTL_HANDLER_ARGS)
 	if (error == 0) {
 		/*
 		 * Re-arm the Cadence dptx framer now that VOP is producing
-		 * pixels. Mirrors Linux 4.4 cdn_dp_encoder_enable's final
+		 * pixels. Mirrors reference vendor BSP cdn_dp_encoder_enable's final
 		 * set_video_status(VIDEO_VALID) which runs as part of the
 		 * atomic commit alongside crtc enable. In our staged flow
 		 * stage 19 sent VALID *before* this modeset programmed VOP,
@@ -1229,10 +1236,6 @@ rk_drm_hw_set_scanout_locked(struct rk_drm_softc *sc, vm_paddr_t paddr,
 	int error;
 
 	mtx_lock(&sc->hw_lock);
-	device_printf(sc->dev,
-	    "scanout: set paddr=0x%jx stride=%u (%s)\n",
-	    (uintmax_t)paddr, stride,
-	    (paddr == sc->fb_pa) ? "boot-fb" : "non-boot-fb");
 	error = rk_drm_hw_set_scanout(sc, paddr, stride);
 	mtx_unlock(&sc->hw_lock);
 	return (error);
@@ -2210,11 +2213,6 @@ rk_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 		 * needing to inject our mode into DRM's connector mode list.
 		 */
 		rk_drm_fill_forced_dp_mode(&forced);
-		device_printf(sc->dev,
-		    "USB-C DP override: DRM asked %ux%u@%u, forcing %ux%u@%u kHz\n",
-		    active_mode->hdisplay, active_mode->vdisplay,
-		    active_mode->clock, forced.hdisplay, forced.vdisplay,
-		    forced.clock);
 		active_mode = &forced;
 		if (adjusted_mode != NULL)
 			*adjusted_mode = forced;
@@ -2271,11 +2269,6 @@ rk_drm_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	error = rk_drm_fb_get_paddr_stride(sc, crtc->fb, &paddr, &stride);
 	if (error != 0)
 		return (-error);
-	device_printf(sc->dev,
-	    "mode_set_base: fb=%p paddr=0x%jx stride=%u (%s)\n",
-	    crtc->fb, (uintmax_t)paddr, stride,
-	    (sc->fbdev != NULL && crtc->fb == &sc->fbdev->drm_fb) ?
-	    "boot-fbdev" : "gem");
 	error = rk_drm_hw_set_scanout_locked(sc, paddr, stride);
 	if (error != 0)
 		return (-error);
@@ -2551,7 +2544,7 @@ rk_drm_hpd_task(void *arg, int pending)
 	 *      VDM ATTENTION from the partner with bit 3 of dp_status set
 	 *      (the 0x08 in the familiar 0x8a value).
 	 *
-	 * Linux dispatches the retrain from cdn_dp_pd_event_work.  We're
+	 * the reference driver dispatches the retrain from cdn_dp_pd_event_work.  We're
 	 * polled (hpd_task runs every hz on taskqueue_thread), so we sample
 	 * fusb302's cached dp_status and react on the rising edge of
 	 * HPD_IRQ — that one edge per request, rather than retraining every
@@ -2653,11 +2646,6 @@ rk_drm_connector_get_modes(struct drm_connector *connector)
 		count = drm_add_edid_modes(connector, edid);
 		rk_drm_prefer_usbc_dp_mode(sc, connector);
 		drm_edid_to_eld(connector, edid);
-		if (sc != NULL) {
-			device_printf(sc->dev,
-			    "connector_get_modes: ddc edid v%u.%u ext=%u count=%d\n",
-			    edid->version, edid->revision, edid->extensions, count);
-		}
 		if (count > 0)
 			return (count);
 	}
@@ -2668,11 +2656,6 @@ rk_drm_connector_get_modes(struct drm_connector *connector)
 		count = drm_add_edid_modes(connector, edid);
 		rk_drm_prefer_usbc_dp_mode(sc, connector);
 		drm_edid_to_eld(connector, edid);
-		if (sc != NULL) {
-			device_printf(sc->dev,
-			    "connector_get_modes: cached edid v%u.%u ext=%u count=%d\n",
-			    edid->version, edid->revision, edid->extensions, count);
-		}
 		if (count > 0)
 			return (count);
 	}
