@@ -517,6 +517,9 @@ struct rk_cdn_dp_softc {
 	int			dp_altmode_usb_ss;
 	uint32_t		dp_altmode_pin_assignment;
 	uint32_t		dp_altmode_status;
+	/* Display / backlight on-off, last value pushed via DPCD writes. */
+	uint8_t			display_power_state;	/* 1=D0 awake, 0=D3 sleep */
+	uint8_t			backlight_state;	/* 1=on, 0=off */
 
 	/* Bring-up is staged so the module can be loaded safely. */
 	int			stage;
@@ -630,6 +633,7 @@ static int	rk_cdn_dp_read_edid(struct rk_cdn_dp_softc *sc);
 int		rk_cdn_dp_get_cached_edid(device_t dev, uint8_t *buf,
 		    size_t len);
 int		rk_cdn_dp_auto_bringup_default(void);
+int		rk_cdn_dp_retrain_default(void);
 int		rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 		    uint16_t hsync_start, uint16_t hsync_end, uint16_t htotal,
 		    uint16_t vdisplay, uint16_t vsync_start, uint16_t vsync_end,
@@ -681,6 +685,9 @@ static int	rk_cdn_dp_sysctl_reprobe(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_refresh_typec(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_framer_dump(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_probe_warm(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_retrain_now(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_display_power(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_backlight_power(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_get_clocks(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_enable_clocks(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_sysctl_reg_addr(SYSCTL_HANDLER_ARGS);
@@ -2137,6 +2144,110 @@ rk_cdn_dp_sysctl_aux_probe(SYSCTL_HANDLER_ARGS)
 	error = rk_cdn_dp_aux_probe(sc);
 	sx_sunlock(&sc->detach_sx);
 	return (error);
+}
+
+static int
+rk_cdn_dp_sysctl_retrain_now(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+	(void)sc;	/* retrain_default looks up softc itself */
+	return (rk_cdn_dp_retrain_default());
+}
+
+/*
+ * display_power: DPMS-style on/off via DPCD SET_POWER (DPCD addr 0x600).
+ *   write 0 -> D3 (sleep) — tells sink to power down
+ *   write 1 -> D0 (active) + auto retrain — wakes sink + re-establishes link
+ *
+ * Reading returns the last value we set (sc->display_power_state).  We don't
+ * query the sink because some DP sinks NAK reads of 0x600 while asleep.
+ */
+static int
+rk_cdn_dp_sysctl_display_power(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	uint8_t dpcd_val;
+	int error, val;
+
+	sc = arg1;
+	val = sc->display_power_state;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 0 && val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	dpcd_val = (val == 1) ? 0x01 /* D0 */ : 0x02 /* D3 */;
+	error = rk_cdn_dp_mailbox_dpcd_write(sc, 0x600, &dpcd_val, 1);
+	device_printf(sc->dev,
+	    "display_power: DPCD 0x600 <- 0x%02x (%s) result=%d\n",
+	    dpcd_val, (val == 1) ? "D0" : "D3", error);
+	sx_sunlock(&sc->detach_sx);
+	if (error != 0)
+		return (error);
+	sc->display_power_state = (uint8_t)val;
+	if (val == 1) {
+		/* Wake: re-train the link in case sink dropped CR/EQ in D3. */
+		DELAY(10000);
+		error = rk_cdn_dp_retrain_default();
+		if (error != 0)
+			device_printf(sc->dev,
+			    "display_power: wake retrain failed (%d)\n",
+			    error);
+	}
+	return (error);
+}
+
+/*
+ * backlight_power: AUX-channel backlight on/off via DPCD 0x720
+ * (EDP_DISPLAY_CONTROL_REGISTER, bit 0 = BL_ENABLE).  Defined in eDP 1.4+
+ * spec; many USB-C DP panels support the same register range.  If the
+ * sink doesn't, the write will NAK and we return the error untranslated
+ * so userspace can see it.
+ */
+static int
+rk_cdn_dp_sysctl_backlight_power(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	uint8_t dpcd_val;
+	int error, val;
+
+	sc = arg1;
+	val = sc->backlight_state;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 0 && val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	dpcd_val = (val == 1) ? 0x01 : 0x00;
+	error = rk_cdn_dp_mailbox_dpcd_write(sc, 0x720, &dpcd_val, 1);
+	device_printf(sc->dev,
+	    "backlight_power: DPCD 0x720 <- 0x%02x (%s) result=%d\n",
+	    dpcd_val, (val == 1) ? "on" : "off", error);
+	sx_sunlock(&sc->detach_sx);
+	if (error != 0)
+		return (error);
+	sc->backlight_state = (uint8_t)val;
+	return (0);
 }
 
 /*
@@ -3937,24 +4048,25 @@ static void
 rk_cdn_dp_fill_forced_mode(struct rk_cdn_dp_softc *sc)
 {
 	/*
-	 * Keep the Cadence framer in lock-step with rk_drm's current USB-C DP
-	 * test mode. Until both sides consume the same connector-selected mode,
-	 * stage18 must not keep advertising the first EDID DTD (1920x1080)
-	 * while VOP is scanning 1400x1050.
+	 * Keep the Cadence framer in lock-step with rk_drm's forced DP mode
+	 * (rk_drm_fill_forced_dp_mode).  Both sides MUST use the same values
+	 * or the sink will reject the stream.  Native panel timing per EDID:
+	 *   1920x1080 @ 60 Hz, pixclk 148.5 MHz, htotal 2200, vtotal 1125,
+	 *   sync polarity PHSYNC | NVSYNC (EDID byte 17 = 0x1a).
 	 */
-	sc->pixel_clock_khz = 121750;
-	sc->hdisplay = 1400;
-	sc->hblank = 464;
-	sc->htotal = 1864;
-	sc->hsync_start = 1488;
-	sc->hsync_end = 1632;
-	sc->vdisplay = 1050;
-	sc->vblank = 39;
-	sc->vtotal = 1089;
-	sc->vsync_start = 1053;
-	sc->vsync_end = 1057;
-	sc->h_sync_polarity = 0;
-	sc->v_sync_polarity = 1;
+	sc->pixel_clock_khz = 148500;
+	sc->hdisplay = 1920;
+	sc->hblank = 280;
+	sc->htotal = 2200;
+	sc->hsync_start = 1968;
+	sc->hsync_end = 2000;
+	sc->vdisplay = 1080;
+	sc->vblank = 45;
+	sc->vtotal = 1125;
+	sc->vsync_start = 1083;
+	sc->vsync_end = 1088;
+	sc->h_sync_polarity = 1;
+	sc->v_sync_polarity = 0;
 	device_printf(sc->dev,
 	    "forced video mode: %ux%u @ %u kHz htotal=%u hsync=%u..%u (pol=%u) vtotal=%u vsync=%u..%u (pol=%u)\n",
 	    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz, sc->htotal,
@@ -4255,6 +4367,59 @@ rk_cdn_dp_auto_bringup_default(void)
 	return (0);
 }
 
+/*
+ * Re-run DP link training against the already-configured Cadence framer
+ * without touching the µCPU, firmware, or framer state.  Intended to be
+ * invoked by an HPD_IRQ-driven loop (e.g. rk_drm_hpd_task) when the sink
+ * signals it needs retraining via the LINK_STATUS_UPDATED bit / VDM
+ * ATTENTION with HPD_IRQ.
+ *
+ * Mirrors Linux's cdn_dp_pd_event_work → cdn_dp_link_train path: the
+ * framer (DP_FRAMER_GLOBAL_CONFIG, MSA, STREAM_CONFIG, DP_VB_ID) stays
+ * exactly as auto_bringup_default left it.  We only re-do CR+EQ.
+ *
+ * Returns ENOTCONN if the link has never been trained yet (caller should
+ * not invoke retrain before initial bring-up completes).
+ */
+int
+rk_cdn_dp_retrain_default(void)
+{
+	devclass_t dc;
+	device_t dev;
+	struct rk_cdn_dp_softc *sc;
+	int error;
+
+	dc = devclass_find("rk_cdn_dp");
+	if (dc == NULL)
+		return (ENXIO);
+	dev = devclass_get_device(dc, 0);
+	if (dev == NULL)
+		return (ENXIO);
+	sc = device_get_softc(dev);
+	if (sc == NULL)
+		return (ENXIO);
+	if (!sc->sink_caps_valid || sc->link_plan_lanes == 0 ||
+	    sc->link_plan_rate_code == 0)
+		return (ENOTCONN);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	error = rk_cdn_dp_link_train(sc);
+	sx_sunlock(&sc->detach_sx);
+
+	if (error == 0)
+		device_printf(sc->dev,
+		    "retrain_default: link retrained (rate=0x%x lanes=%u)\n",
+		    sc->link_plan_rate_code, sc->link_plan_lanes);
+	else
+		device_printf(sc->dev,
+		    "retrain_default: failed (%d)\n", error);
+	return (error);
+}
+
 int
 rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
     uint16_t hsync_start, uint16_t hsync_end, uint16_t htotal,
@@ -4277,7 +4442,51 @@ rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 		return (ENXIO);
 
 	/*
-	 * Mirror the Linux encoder path closely:
+	 * Fast path: if we're already trained at VIDEO_ON and DRM is asking
+	 * for the same mode we last configured, no-op.  Saves the second
+	 * fw-load + link train on the post-EDID re-modeset.
+	 *
+	 * Slower fast path: if we're already at VIDEO_ON but DRM asks for a
+	 * different mode, re-derive the mode and re-run only stages 18-19
+	 * (config_video + video on).  Skips the destructive reset and
+	 * fw-reload — the link stays up, only MSA / DP_HORIZONTAL etc. change.
+	 */
+	if (sc->video_configured && sc->link_trained) {
+		if (sc->pixel_clock_khz == clock && sc->hdisplay == hdisplay &&
+		    sc->hsync_start == hsync_start &&
+		    sc->hsync_end == hsync_end && sc->htotal == htotal &&
+		    sc->vdisplay == vdisplay &&
+		    sc->vsync_start == vsync_start &&
+		    sc->vsync_end == vsync_end && sc->vtotal == vtotal) {
+			device_printf(sc->dev,
+			    "enable_mode: %ux%u already active, no-op\n",
+			    hdisplay, vdisplay);
+			return (0);
+		}
+		device_printf(sc->dev,
+		    "enable_mode: fast-path %ux%u@%u (skipping fw-reload, "
+		    "re-running config_video only)\n",
+		    hdisplay, vdisplay, clock);
+		rk_cdn_dp_fill_mode(sc, clock, hdisplay, hsync_start, hsync_end,
+		    htotal, vdisplay, vsync_start, vsync_end, vtotal, flags);
+		sc->video_configured = false;
+		/* Rewind so set_stage re-runs CONFIG_VIDEO then VIDEO_ON. */
+		sc->stage = RK_CDN_DP_STAGE_EDID;
+		error = rk_cdn_dp_set_stage(sc, RK_CDN_DP_STAGE_VIDEO_ON);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "enable_mode: fast-path config-video failed: %d\n",
+			    error);
+			return (error);
+		}
+		device_printf(sc->dev,
+		    "enable_mode: ready for %ux%u@%u kHz (fast-path)\n",
+		    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz);
+		return (0);
+	}
+
+	/*
+	 * Slow path (first bring-up): mirror the Linux encoder path closely:
 	 * - reset runtime/link state
 	 * - derive mode from the DRM-selected mode
 	 * - enable/train/configure the Cadence block for that exact mode
@@ -5675,6 +5884,8 @@ rk_cdn_dp_reset_runtime_state(struct rk_cdn_dp_softc *sc)
 	sc->dp_altmode_usb_ss = -1;
 	sc->dp_altmode_pin_assignment = 0;
 	sc->dp_altmode_status = 0;
+	sc->display_power_state = 1;	/* boot leaves sink in D0 */
+	sc->backlight_state = 1;	/* boot leaves backlight on */
 	sc->aux_trace_reads = false;
 	sc->aux_last_read_off = 0;
 	sc->aux_last_read_val = 0;
@@ -5897,6 +6108,21 @@ rk_cdn_dp_attach(device_t dev)
 	    sc, 0, rk_cdn_dp_sysctl_probe_warm, "I",
 	    "Write 1 to non-destructively enable cdn-dp clocks for MMIO readability "
 	    "(skips resets/fw — preserves U-Boot firmware state)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "retrain_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_retrain_now, "I",
+	    "Write 1 to re-run DP link training (CR+EQ) without resetting fw/framer; "
+	    "use when sink signals LINK_STATUS_UPDATED / HPD_IRQ");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "display_power", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_display_power, "I",
+	    "DPMS-style on/off: write 1 = DPCD SET_POWER D0 + auto retrain, "
+	    "write 0 = DPCD SET_POWER D3 (sleep)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "backlight_power", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_backlight_power, "I",
+	    "AUX-channel backlight on/off via DPCD 0x720 BL_ENABLE bit "
+	    "(eDP 1.4+ spec; sink may NAK if unsupported)");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "debug_reg_addr", CTLTYPE_U32 | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_reg_addr, "IU",

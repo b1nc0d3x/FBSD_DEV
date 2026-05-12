@@ -27,11 +27,21 @@
 #define RK_DRM_DEFAULT_CLOCK_KHZ     148500
 #define RK_DRM_DEFAULT_WIDTH         1920
 #define RK_DRM_DEFAULT_HEIGHT        1080
-#define RK_DRM_DEFAULT_HSYNC_START   2008
-#define RK_DRM_DEFAULT_HSYNC_END     2052
+/*
+ * Hardcoded XYM-display EDID DTD timing (test 2026-05-10).
+ * Cadence framer's stage-18 config-video parses these same values from
+ * EDID and writes them into the MSA. If VOP supplies different
+ * hsync/vsync placement the panel sees inconsistent stream-vs-MSA and
+ * reports "No Signal" even with a healthy link.
+ *   CEA 1080p60 (was):  HSYNC 2008..2052 (pulse 44), VSYNC 1084..1089
+ *   XYM panel DTD:      HSYNC 1968..2000 (pulse 32), VSYNC 1083..1088
+ * Long term: derive from cached EDID DTD via rk_cdn_dp_get_cached_edid.
+ */
+#define RK_DRM_DEFAULT_HSYNC_START   1968
+#define RK_DRM_DEFAULT_HSYNC_END     2000
 #define RK_DRM_DEFAULT_HTOTAL        2200
-#define RK_DRM_DEFAULT_VSYNC_START   1084
-#define RK_DRM_DEFAULT_VSYNC_END     1089
+#define RK_DRM_DEFAULT_VSYNC_START   1083
+#define RK_DRM_DEFAULT_VSYNC_END     1088
 #define RK_DRM_DEFAULT_VTOTAL        1125
 
 #define RK_DRM_MAX_WIDTH             1920
@@ -40,6 +50,9 @@
 #define RK_DRM_BPP                32
 #define RK_DRM_FB_BOOT_COLOR      0xff202040u
 #define RK_DRM_FB_DMA_LOWADDR_TEST 0x0fffffffu
+#define RK_DRM_OUTPUT_AUTO        0
+#define RK_DRM_OUTPUT_HDMI        1
+#define RK_DRM_OUTPUT_USBC_DP     2
 
 struct drm_display_mode;
 struct rk_drm_fbdev;
@@ -81,6 +94,10 @@ struct rk_drm_softc {
 	bool			hpd_state_valid;
 	bool			hpd_last_status;
 	bool			hpd_squelch;
+	int			output_select;
+	bool			dp_autobring_done;
+	bool			dp_hotplug_reprobe_done;
+	uint32_t		dp_last_altmode_status;	/* for HPD_IRQ rising-edge */
 	bool			pending_flip_put;
 	int			vblank_ticks;
 	struct drm_framebuffer	*pending_fb;
@@ -173,6 +190,7 @@ bool	rk_drm_hw_hpd(struct rk_drm_softc *sc);
 
 /* HDMI audio diagnostics -- dump the relevant TX register state to dmesg. */
 void	rk_drm_hw_audio_dump(struct rk_drm_softc *sc);
+void	rk_drm_hw_vop_dump(struct rk_drm_softc *sc);
 
 /* I2S2 controller register dump (for verifying clock/reset state). */
 void	rk_drm_hw_audio_i2s_probe(struct rk_drm_softc *sc);
