@@ -44,6 +44,7 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/rman.h>
+#include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 #include <machine/atomic.h>
@@ -135,13 +136,16 @@
 #define	FUSB_CTL0_HOST_CUR_1A5	0x08	/* bits[3:2]=10 = 1.5A 180uA Rp    */
 #define	FUSB_CTL0_HOST_CUR_3A	0x0c	/* bits[3:2]=11 = 3.0A 330uA Rp    */
 /*
- * Linux's running fusb302 on Armbian (verified via regmap_reg_write
- * trace) uses HOST_CUR=10 (1.5A / 180uA Rp) for advertise.  USB-PD
- * partners react better to the 180uA pull-up than the 80uA USB-default
- * one, particularly when the cable has ~10ohm series resistance.
- * Match Linux exactly.
+ * Linux 4.4 BSP `tcpm_init` calls `tcpm_select_rp_value(TYPEC_RP_USB)` →
+ * sets HOST_CUR=01 (USB-default 80uA Rp) at chip init.  An earlier
+ * comment claimed an Armbian regmap_reg_write trace showed 1A5 (180uA),
+ * but that trace cannot be reproduced (Armbian 6.18 cdn-dp probe fails
+ * — see project_cdn_dp_mainline_6_18_broken.md), and the Linux 4.4 BSP
+ * source-of-truth is unambiguous: USB-default at init, escalated only
+ * when transitioning to ATTACHED_SRC if needed.  Path-C empirical test
+ * 2026-05-09: flipping back to _USB to see if silent-PD partner ACKs.
  */
-#define	FUSB_CTL0_HOST_CUR_DEF	FUSB_CTL0_HOST_CUR_1A5
+#define	FUSB_CTL0_HOST_CUR_DEF	FUSB_CTL0_HOST_CUR_USB
 #define	FUSB_CTL0_INT_MASK	0x20
 
 /* CONTROL1 bits */
@@ -210,6 +214,8 @@
 #define	FUSB_INTRB_GCRCSENT	0x01
 
 /* Interrupt mask register initial values for PD operation */
+#define	FUSB_MASK1_ATTACHED	0x55	/* active session: also unmask BC_LVL change
+					   (Armbian's working value while DP altmode active) */
 #define	FUSB_MASK1_PD		0x75	/* unmask COLLISION, ALERT, VBUSOK
 					   (matches Linux i2c-rk3x init) */
 #define	FUSB_MASKA_PD		0xa2	/* unmask TOGDONE,TXSENT,HARDSENT,RETRYFAIL,HARDRST */
@@ -308,7 +314,7 @@
 /* Max hard-reset retries before giving up on PD and falling back to
  * Type-C default 5V (passive) operation. */
 #define	N_SNK_HARDRESET_RETRY	2
-#define	T_TYPEC_SEND_SRCCAP	100
+#define	T_TYPEC_SEND_SRCCAP	250
 
 /* Source capability PDO: 5V fixed, 900mA, USB comm capable */
 #define	FUSB_SRC_PDO_5V900MA	((1u << 26) | (100u << 10) | 90u)
@@ -342,6 +348,7 @@ enum fusb302_conn_state {
 	FUSB_ST_SNK_READY,
 	FUSB_ST_SNK_TRANSITION_DEFAULT,
 	FUSB_ST_SNK_SEND_HARDRST,
+	FUSB_ST_SNK_SEND_SOFTRST,
 	FUSB_ST_ROLE_DISCOVERY_SRC,
 };
 
@@ -363,7 +370,13 @@ enum fusb302_vdm_state {
  * ----------------------------------------------------------------------- */
 struct fusb302_softc {
 	device_t		dev;
-	struct mtx		mtx;
+	/*
+	 * Sleepable rwlock so the irq path can hold it across i2c
+	 * transactions (which sleep in rk_i2c_transfer).  The previous
+	 * MTX_DEF mutex hit propagate_priority panics whenever a second
+	 * thread contended on it while the holder was sleeping in i2c.
+	 */
+	struct sx		sx;
 	uint8_t			addr;
 	int			irq_rid;
 	struct resource		*irq_res;
@@ -371,6 +384,7 @@ struct fusb302_softc {
 	struct task		irq_task;
 	regulator_t		vbus_supply;
 	bool			vbus_enabled;
+	int			passive_src;	/* present Rp on CC, skip ALL regulator_enable paths */
 	bool			initialized;
 
 	/* CC detection legacy state */
@@ -473,6 +487,7 @@ struct fusb302_softc {
 	/* Retry/retry counters */
 	int			caps_counter;
 	int			hardrst_count;
+	bool			softrst_tried;	/* SNK: soft reset attempted */
 	int			pos_power;
 
 	/* Timers */
@@ -507,10 +522,12 @@ static int	fusb302_probe(device_t dev);
 static int	fusb302_attach(device_t dev);
 static int	fusb302_detach(device_t dev);
 static void	fusb302_irq_task(void *context, int pending);
+static void	fusb302_irq_ithread(void *context);
 static int	fusb302_intr(void *context);
 static void	fusb302_timer_state_cb(void *arg);
 extern const struct usbc_tcpc_ops fusb302_tcpc_ops;
 static int	fusb302_sysctl_slice_sdac(SYSCTL_HANDLER_ARGS);
+static int	fusb302_sysctl_reattach(SYSCTL_HANDLER_ARGS);
 int		fusb302_get_typec_status(device_t dev,
 		    struct fusb302_typec_status *status);
 int		fusb302_get_dp_altmode_state(device_t dev,
@@ -583,8 +600,14 @@ fusb302_probe_cc_pull_up_locked(struct fusb302_softc *sc, int polarity)
 	if (fusb302_read_reg(sc, FUSB_REG_SWITCHES0, &store) != 0)
 		return (0);
 
+	/*
+	 * Clear PDWN bits too — if the chip was in sink role when probe
+	 * runs, leaving PDWN set while applying PU forces CC to GND
+	 * (PDWN dominates) and produces a false "no Rd" result.
+	 */
 	sw0 = store & ~(FUSB_SW0_MEAS_CC1 | FUSB_SW0_MEAS_CC2 |
-	    FUSB_SW0_PU_EN1 | FUSB_SW0_PU_EN2);
+	    FUSB_SW0_PU_EN1 | FUSB_SW0_PU_EN2 |
+	    FUSB_SW0_PDWN1 | FUSB_SW0_PDWN2);
 	if (polarity == 0)
 		sw0 |= FUSB_SW0_MEAS_CC1 | FUSB_SW0_PU_EN1;
 	else
@@ -853,7 +876,7 @@ fusb302_build_header_locked(struct fusb302_softc *sc, int type, int data_cnt)
 	sc->send_head = (uint16_t)(
 	    ((sc->msg_id & 0x7) << 9) |
 	    ((sc->notify_power_role & 0x1) << 8) |
-	    (1 << 6) |				/* PD spec rev 1 */
+	    (0 << 6) |				/* PD spec rev 0 = PD 1.0 */
 	    ((sc->notify_data_role & 0x1) << 5) |
 	    ((data_cnt & 0x7) << 12) |
 	    (type & 0xf));
@@ -1376,13 +1399,13 @@ fusb302_notify_dp_locked(struct fusb302_softc *sc)
 	/*
 	 * usb_ss: 0 = DP-only (4-lane), 1 = USB3+DP (2-lane).
 	 *
-	 * RockPro64's working path reports pin_assignment=0x4 (Pin C)
-	 * while still following the 2-lane USB3+DP Cadence bring-up path, so
-	 * treat Pin C as usb_ss=1 here as well.
+	 * Per the RK3399 TC-PHY lane map, pin assignments C/E use the DP-only
+	 * lane configuration while D/F use the USB3+DP mixed configuration.
+	 * Treating Pin C as mixed mode forces the wrong PMA_LANE_CFG and breaks
+	 * AUX on simple USB-C displays that negotiate Pin C.
 	 */
 	sc->dp_altmode.usb_ss =
-	    ((sc->notify_pin_def & DP_PIN_MF_MASK) != 0 ||
-	    sc->notify_pin_def == DP_PIN_C) ? 1 : 0;
+	    ((sc->notify_pin_def & DP_PIN_MF_MASK) != 0) ? 1 : 0;
 
 	device_printf(sc->dev,
 	    "DP Alt Mode: dp_ready=%d pin=0x%x usb_ss=%d dp_status=0x%x\n",
@@ -1435,7 +1458,13 @@ fusb302_auto_vdm_machine_locked(struct fusb302_softc *sc, uint32_t evt)
  * several src_caps transmissions get RETRYFAIL even though the sink is
  * PD-capable.
  */
-#define	T_ATTACH_WAIT_MS	1500
+/*
+ * Wait after Type-C attach before driving PD.  USB-C PD spec tStartupSource
+ * is 50-275ms; 500ms keeps a comfortable margin for slow sinks while saving
+ * ~1s of boot-to-backlight latency vs the previous 1500ms.  Used by both
+ * the SRC (waiting for sink PD init) and SNK (waiting for VBUS) attach paths.
+ */
+#define	T_ATTACH_WAIT_MS	500
 
 static void
 fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
@@ -1477,7 +1506,7 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 		 * choice. When the user forces role_pref=SRC, honor it: trust
 		 * TOGSS, don't second-guess via VBUSOK.
 		 */
-		if (sc->role_pref == FUSB_ROLE_DRP &&
+		if (sc->role_pref == FUSB_ROLE_DRP && !sc->passive_src &&
 		    fusb302_read_reg(sc, FUSB_REG_STATUS0, &st0) == 0 &&
 		    (st0 & FUSB_ST0_VBUSOK) && !sc->vbus_enabled) {
 			device_printf(sc->dev,
@@ -1508,20 +1537,117 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 		sc->hardrst_count = 0;
 		sc->attached_as_sink = false;
 
-		/* Now that we are committed to Source, enable VBUS supply. */
-		if (sc->vbus_supply != NULL && !sc->vbus_enabled) {
-			error = regulator_enable(sc->vbus_supply);
-			if (error != 0) {
-				device_printf(sc->dev,
-				    "regulator_enable(vbus) failed: %d\n",
-				    error);
+		/*
+		 * Now that we are committed to Source, enable VBUS supply --
+		 * UNLESS the partner is already sourcing VBUS (VBUSOK set).
+		 * On RockPro64, partner-sourcing VBUS is the normal case for
+		 * a USB-C monitor that has its own PSU; enabling our SY6280AAC
+		 * switch on top of partner's 5V causes a hang in regulator_enable
+		 * (current limit / back-feed protection deadlock).  Treat the
+		 * present VBUS as supplied for our purposes.
+		 */
+		if (sc->passive_src) {
+			device_printf(sc->dev,
+			    "src attach: passive_src=%d, enabling VBUS regulator "
+			    "(present Rp on CC%d only)\n",
+			    sc->passive_src, polarity + 1);
+			if (sc->vbus_supply != NULL && !sc->vbus_enabled) {
+				error = regulator_enable(sc->vbus_supply);
+				if (error == 0)
+					sc->vbus_enabled = true;
+				else
+					device_printf(sc->dev,
+					    "regulator_enable(vbus) failed: %d\n",
+					    error);
 			} else {
 				sc->vbus_enabled = true;
+			}
+		} else if (sc->vbus_supply != NULL && !sc->vbus_enabled) {
+			if (st0 == 0)
+				(void)fusb302_read_reg(sc, FUSB_REG_STATUS0, &st0);
+			if (st0 & FUSB_ST0_VBUSOK) {
+				device_printf(sc->dev,
+				    "src attach: partner already sources VBUS, "
+				    "skipping our regulator_enable\n");
+				sc->vbus_enabled = true;
+			} else {
+				error = regulator_enable(sc->vbus_supply);
+				if (error != 0) {
+					device_printf(sc->dev,
+					    "regulator_enable(vbus) failed: %d\n",
+					    error);
+				} else {
+					sc->vbus_enabled = true;
+				}
 			}
 		}
 
 		sc->vconn_enabled = true;
 		fusb302_set_polarity_locked(sc, polarity);
+
+		if (sc->passive_src) {
+			uint8_t sw1_set;
+			/*
+			 * Passive SRC: chip is now presenting Rp on the active
+			 * CC pin (PU_EN1+MEAS_CC1+VCONN_CC2). Match Armbian's
+			 * working SWITCHES1=0xd5 by setting POWER_ROLE=Source,
+			 * DATA_ROLE=DFP, AUTO_CRC=1, SPEC_REV=PD3.  AUTO_CRC is
+			 * critical: if the display sends Discover_Identity or any
+			 * other PD message, the chip auto-ACKs with GoodCRC at
+			 * the BMC layer.  Without it, every incoming message is
+			 * dropped and the display gives up.
+			 *
+			 * Use fusb302_update_reg directly (single I2C RMW) rather
+			 * than calling fusb302_set_msg_header_locked +
+			 * fusb302_enable_rx_locked, which observed a witness
+			 * panic ("sleeping thread holds fusb3020") when invoked
+			 * from this state context.  set_polarity_locked above
+			 * already proved that fusb302_update_reg is safe here.
+			 *
+			 * Park after this: don't progress to SRC_SEND_CAPS (would
+			 * TX Source_Caps and loop on RETRYFAIL with a DP-only
+			 * partner that doesn't speak PD).  AUTO_CRC handles any
+			 * PD activity from the display in passive RX-only mode.
+			 */
+			sc->notify_is_cc = true;
+			sc->notify_power_role = 1;	/* Source */
+			sc->notify_data_role = 1;	/* DFP */
+
+			sw1_set = FUSB_SW1_POWERROLE | FUSB_SW1_DATAROLE |
+			    FUSB_SW1_AUTO_CRC |
+			    ((sc->pd_spec_rev & 0x3) << 5);
+			(void)fusb302_update_reg(sc, FUSB_REG_SWITCHES1,
+			    FUSB_SW1_POWERROLE | FUSB_SW1_DATAROLE |
+			    FUSB_SW1_AUTO_CRC | FUSB_SW1_SPECREV,
+			    sw1_set);
+
+			/* Match Armbian's MASK1 transition on attach: unmask
+			 * BC_LVL change (bit 5).  Idle init wrote 0x75; active
+			 * session value is 0x55. */
+			(void)fusb302_write_reg(sc, FUSB_REG_MASK1,
+			    FUSB_MASK1_ATTACHED);
+
+			if (sc->passive_src == 2) {
+				/* passive_src=2: regs set with AUTO_CRC, now fall
+				 * through to normal SRC progression (SRC_STARTUP
+				 * → SRC_SEND_CAPS → full PD negotiation). Use
+				 * this when partner can speak PD if we present
+				 * SRC + AUTO_CRC properly. */
+				device_printf(sc->dev, "attached as DFP on CC%d, "
+				    "VCONN on CC%d, AUTO_CRC set, proceeding "
+				    "to send_caps\n",
+				    polarity + 1, (polarity == 0) ? 2 : 1);
+				/* fall through to non-passive setup below */
+			} else {
+				device_printf(sc->dev, "attached as passive DFP on CC%d, "
+				    "VCONN on CC%d, AUTO_CRC+POWER+DATA roles set, "
+				    "idle (waiting for partner VDMs)\n",
+				    polarity + 1, (polarity == 0) ? 2 : 1);
+				sc->sub_state = 99;	/* park in default-no-op branch */
+				break;
+			}
+		}
+
 		device_printf(sc->dev, "attached as DFP on CC%d, VCONN on CC%d, "
 		    "waiting %dms for sink PD init\n",
 		    polarity + 1, (polarity == 0) ? 2 : 1, T_ATTACH_WAIT_MS);
@@ -1530,6 +1656,11 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 		break;
 
 	default:
+		if (sc->passive_src == 1) {
+			/* passive_src=1 ONLY: stay parked. passive_src=2 falls
+			 * through to normal SRC progression below. */
+			break;
+		}
 		if (evt & FUSB_EVT_TIMER_STATE)
 			fusb302_set_state_locked(sc, FUSB_ST_SRC_STARTUP);
 		break;
@@ -1572,6 +1703,25 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 		sc->sub_state++;
 		/* FALLTHROUGH */
 	case 1:
+		/*
+		 * Some partners reply immediately after seeing Source_Caps, but
+		 * this FUSB302 path occasionally never surfaces TXSENT first.
+		 * If we already have a received PD packet, treat that as proof
+		 * the caps frame made it onto the wire and advance to the
+		 * request-handling branch instead of spinning forever in BUSY.
+		 */
+		if ((evt & FUSB_EVT_RX) && sc->tx_state == FUSB_TX_BUSY) {
+			device_printf(sc->dev,
+			    "send_caps: RX arrived before TXSENT, assuming caps delivered\n");
+			sc->tx_state = FUSB_TX_SUCCESS;
+			sc->sub_state = 2;
+			device_printf(sc->dev, "send_caps: TXSENT, waiting for REQUEST\n");
+			sc->hardrst_count = 0;
+			sc->caps_counter = 0;
+			sc->is_pd_support = true;
+			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
+			break;
+		}
 		tmp = fusb302_policy_send_data_locked(sc);
 		if (tmp == FUSB_TX_SUCCESS) {
 			device_printf(sc->dev, "send_caps: TXSENT, waiting for REQUEST\n");
@@ -1601,18 +1751,35 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 			if (sc->caps_counter >= 50) {
 				/*
 				 * No GoodCRC from partner after N_CAPS_COUNT
-				 * attempts.  Per USB-PD, give up and leave the
-				 * DP altmode state untouched: a USB-C display
-				 * only enters DP altmode after a real VDM
-				 * exchange, and synthesizing fake altmode here
-				 * would mislead the DP TX driver into driving
-				 * AUX into an unswitched port.
+				 * attempts.  Per USB-PD R3.0 §6.8.3, the
+				 * source MAY issue a Hard_Reset to recover
+				 * from a Non-Responsive Sink.  This drops
+				 * VBUS for tHardResetComplete (~25-35ms) and
+				 * forces the partner's PD chip out of any
+				 * stuck state.  After Hard_Reset completes,
+				 * we re-enter SRC_STARTUP and try caps again.
 				 */
-				device_printf(sc->dev,
-				    "send_caps: giving up after %d attempts on "
-				    "CC%d (no PD partner)\n",
-				    sc->caps_counter, sc->cc_polarity + 1);
-				fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
+				if (sc->hardrst_count <= 0) {
+					device_printf(sc->dev,
+					    "send_caps: %d RETRYFAILs on CC%d, "
+					    "issuing Hard_Reset to wake "
+					    "non-responsive sink\n",
+					    sc->caps_counter,
+					    sc->cc_polarity + 1);
+					sc->caps_counter = 0;
+					fusb302_set_state_locked(sc,
+					    FUSB_ST_SRC_SEND_HARDRST);
+				} else {
+					device_printf(sc->dev,
+					    "send_caps: giving up after %d "
+					    "attempts on CC%d "
+					    "(no PD partner, Hard_Reset "
+					    "didn't help)\n",
+					    sc->caps_counter,
+					    sc->cc_polarity + 1);
+					fusb302_set_state_locked(sc,
+					    FUSB_ST_DISABLED);
+				}
 			}
 			else {
 				fusb302_start_state_timer(sc,
@@ -1720,9 +1887,15 @@ fusb302_state_src_ready_locked(struct fusb302_softc *sc, uint32_t evt)
 		}
 	}
 
-	if (!sc->partner_cap[0])
-		fusb302_set_state_locked(sc, FUSB_ST_SRC_GET_SINK_CAPS);
-	else if (vdm_active)
+	/*
+	 * Skip Get_Sink_Cap entirely.  Linux's tcpm/fusb302 path does not
+	 * issue Get_Sink_Cap before VDM altmode discovery on DFP/source role,
+	 * and many USB-C displays (the partner here is one) do not reply to
+	 * Get_Sink_Cap, leaving us indefinitely stuck in SRC_GET_SINK_CAPS
+	 * and never starting VDM Discover_Identity.  partner_cap is only
+	 * consumed by the SNK path, so it is fine to leave it unpopulated.
+	 */
+	if (vdm_active)
 		fusb302_auto_vdm_machine_locked(sc, evt);
 }
 
@@ -1893,6 +2066,7 @@ fusb302_state_attached_sink_locked(struct fusb302_softc *sc, uint32_t evt)
 		sc->notify_power_role = 0;	/* sink */
 		sc->notify_data_role = 0;	/* UFP */
 		sc->hardrst_count = 0;
+		sc->softrst_tried = false;
 		sc->attached_as_sink = true;
 
 		fusb302_set_polarity_locked(sc, polarity);
@@ -1922,6 +2096,32 @@ fusb302_state_snk_startup_locked(struct fusb302_softc *sc,
 	fusb302_set_msg_header_locked(sc);
 	fusb302_set_polarity_locked(sc, sc->cc_polarity);
 	fusb302_enable_rx_locked(sc, true);
+
+	if (sc->skip_pd) {
+		/*
+		 * DP-only partner: display does not run a PD message engine
+		 * (no GoodCRC for any of our TX). Skip the entire
+		 * SNK_DISCOVERY -> wait-caps -> hard/soft-reset escalation
+		 * and synthesize the dp_altmode struct directly with the
+		 * RockPro64-canonical Pin C / 4-lane DP-only defaults, then
+		 * notify the policy SM so rk_cdn_dp can bring up the DP TX.
+		 */
+		sc->dp_altmode.valid = true;
+		sc->dp_altmode.dp_ready = true;
+		sc->dp_altmode.pin_assignment = DP_PIN_C;
+		sc->dp_altmode.usb_ss = 0;	/* Pin C is 4-lane DP-only */
+		/* DP_Status VDO bit 7 = HPD; cdn_dp's altmode_signature_ok
+		 * requires it set before it will run mailbox bring-up. */
+		sc->dp_altmode.dp_status = (1u << 7);
+		device_printf(sc->dev,
+		    "snk_startup: skip_pd=1, DP-only attach on CC%d, "
+		    "synthesizing Pin C 4-lane DP\n", sc->cc_polarity + 1);
+		if (sc->policy != NULL)
+			usbc_pd_policy_event(sc->policy,
+			    USBC_PD_E_PORT_ENABLE);
+		fusb302_set_state_locked(sc, FUSB_ST_SNK_READY);
+		return;
+	}
 
 	device_printf(sc->dev,
 	    "snk_startup: PD init done, listening for src caps\n");
@@ -1962,6 +2162,21 @@ fusb302_state_snk_discovery_locked(struct fusb302_softc *sc, uint32_t evt)
 			    "(no DP altmode without real VDM)\n",
 			    sc->cc_polarity + 1);
 			fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
+		} else if (!sc->softrst_tried) {
+			/*
+			 * Linux precedent: try soft reset before hard reset.
+			 * Some sources fail to resume Source_Capabilities
+			 * after a hard reset but recover after a soft reset
+			 * (PE_SNK_Send_Soft_Reset).  See linux tcpm.c
+			 * SNK_WAIT_CAPABILITIES_TIMEOUT.
+			 */
+			sc->softrst_tried = true;
+			device_printf(sc->dev,
+			    "snk: no src caps within %dms; trying soft "
+			    "reset before hard reset\n",
+			    T_TYPEC_SINK_WAIT_CAP);
+			fusb302_set_state_locked(sc,
+			    FUSB_ST_SNK_SEND_SOFTRST);
 		} else if (sc->hardrst_count <= N_SNK_HARDRESET_RETRY) {
 			device_printf(sc->dev,
 			    "snk: no src caps within %dms; sending hard "
@@ -1984,6 +2199,37 @@ fusb302_state_snk_discovery_locked(struct fusb302_softc *sc, uint32_t evt)
 			    N_SNK_HARDRESET_RETRY + 1, sc->cc_polarity + 1);
 			fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
 		}
+	}
+}
+
+/*
+ * SNK_SEND_SOFTRST: transmit a PD Soft_Reset control message and return to
+ * SNK_DISCOVERY to listen for Source_Capabilities. If the partner accepts
+ * the soft reset, it should resend caps. If TX fails or no caps arrive
+ * before the SNK_DISCOVERY timer fires again, softrst_tried is now set so
+ * SNK_DISCOVERY will escalate to a hard reset on the next cycle.
+ */
+static void
+fusb302_state_snk_send_softrst_locked(struct fusb302_softc *sc, uint32_t evt)
+{
+	int tmp;
+
+	switch (sc->sub_state) {
+	case 0:
+		fusb302_set_mesg_ctrl_locked(sc, PD_CMT_SOFTRESET);
+		sc->tx_state = FUSB_TX_IDLE;
+		sc->sub_state++;
+		/* FALLTHROUGH */
+	case 1:
+		tmp = fusb302_policy_send_data_locked(sc);
+		if (tmp == FUSB_TX_SUCCESS) {
+			fusb302_reset_pd_params_locked(sc);
+			fusb302_set_state_locked(sc, FUSB_ST_SNK_DISCOVERY);
+		} else if (tmp == FUSB_TX_FAILED) {
+			fusb302_set_state_locked(sc,
+			    FUSB_ST_SNK_SEND_HARDRST);
+		}
+		break;
 	}
 }
 
@@ -2364,14 +2610,10 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp,
 	if (error != 0)
 		return;
 
-	/*
-	 * Diagnostic: surface every ACTIVITY (0x40) and CRC_CHK (0x10)
-	 * event so we can tell whether the partner is electrically alive
-	 * during the post-TX GoodCRC window.  Quiet for normal events.
-	 */
-	if (intr & (0x40u | 0x10u))
+	/* Surface every alert during VDM bring-up. */
+	if (intr | intra | intrb)
 		device_printf(sc->dev,
-		    "alert: intr=%02x intra=%02x intrb=%02x (ACT/CRC)\n",
+		    "alert: intr=%02x intra=%02x intrb=%02x\n",
 		    intr, intra, intrb);
 
 	/* Refresh legacy status for sysctl */
@@ -2571,6 +2813,9 @@ fusb302_run_state_locked(struct fusb302_softc *sc, uint32_t evt)
 	case FUSB_ST_SNK_SEND_HARDRST:
 		fusb302_state_snk_send_hardrst_locked(sc, evt);
 		break;
+	case FUSB_ST_SNK_SEND_SOFTRST:
+		fusb302_state_snk_send_softrst_locked(sc, evt);
+		break;
 	case FUSB_ST_ROLE_DISCOVERY_SRC:
 		fusb302_state_role_discovery_src_locked(sc, evt);
 		break;
@@ -2594,19 +2839,21 @@ fusb302_timer_state_cb(void *arg)
 
 
 /* -----------------------------------------------------------------------
- * IRQ task (runs in taskqueue_thread)
+ * IRQ work body (called from both ithread and taskqueue contexts)
+ *
+ * sc->mtx serializes the two callers so the body itself need not care
+ * which path invoked it. Hardware-IRQ wakeups arrive via fusb302_irq_ithread
+ * with the GPIO source masked by INTRNG; software wakeups (timers, retry
+ * re-arming) arrive via fusb302_irq_task on the system taskqueue.
  * ----------------------------------------------------------------------- */
 static void
-fusb302_irq_task(void *context, int pending __unused)
+fusb302_do_work(struct fusb302_softc *sc)
 {
-	struct fusb302_softc *sc;
 	uint32_t evt, pd_evt;
 
-	sc = context;
-
-	mtx_lock(&sc->mtx);
+	sx_xlock(&sc->sx);
 	if (!sc->initialized) {
-		mtx_unlock(&sc->mtx);
+		sx_xunlock(&sc->sx);
 		return;
 	}
 
@@ -2619,7 +2866,7 @@ fusb302_irq_task(void *context, int pending __unused)
 	sc->work_continue = 0;
 
 	if (evt == 0 && pd_evt == 0) {
-		mtx_unlock(&sc->mtx);
+		sx_xunlock(&sc->sx);
 		return;
 	}
 
@@ -2664,7 +2911,7 @@ fusb302_irq_task(void *context, int pending __unused)
 		taskqueue_enqueue(taskqueue_thread, &sc->irq_task);
 
 out:
-	mtx_unlock(&sc->mtx);
+	sx_xunlock(&sc->sx);
 
 	/*
 	 * Deliver accumulated events to the policy SM.  Done outside
@@ -2682,23 +2929,66 @@ out:
 			bits &= ~b;
 		}
 	}
+}
 
-	/* Re-enable the interrupt now that IRQ flags are cleared. */
-	if (sc->initialized && sc->irq_res != NULL)
-		bus_resume_intr(sc->dev, sc->irq_res);
+/* Hardware IRQ path: just enqueue the taskqueue task and return. ALL real
+ * work (including i2c which sleeps) runs in the taskqueue thread, NEVER in
+ * the ithread. This avoids the witness panic that fired when ithread was
+ * doing i2c (sleeping) while another thread tried to acquire sc->mtx:
+ *
+ *   panic: sleeping thread holds fusb3020
+ *   fusb302_do_work -> iicdev_readfrom -> _sleep (with sc->mtx held)
+ *   another thread: __mtx_lock_sleep on sc->mtx, propagate_priority panics
+ *
+ * INTRNG masks the GPIO source for the duration of this ithread call
+ * (which is microseconds). After we return, INTRNG unmasks. If the chip's
+ * INT_N is still asserted (taskqueue hasn't run yet), GIC re-fires this
+ * ithread, which re-enqueues — taskqueue_enqueue is idempotent for queued
+ * tasks, so no harm. The taskqueue eventually runs do_work which drains the
+ * chip's INTERRUPT regs and INT_N goes high.
+ */
+static void
+fusb302_irq_ithread(void *context)
+{
+	struct fusb302_softc *sc = context;
+
+	/*
+	 * Run the work synchronously in the ithread.  Reading the chip's
+	 * INTERRUPT/A/B registers (in fusb302_do_work -> tcpc_alert_locked)
+	 * deasserts INT_N.  INTRNG only calls pic_post_ithread *after* this
+	 * function returns, so the GPIO source stays masked until INT_N is
+	 * high — no storm.  Safe now because sc->sx is sx(9), which can be
+	 * held across the i2c sleep.  Concurrent timer-driven callers go
+	 * through fusb302_irq_task and contend on sc->sx by sleeping, which
+	 * sx tolerates (the old MTX_DEF would propagate_priority panic).
+	 */
+	fusb302_do_work(sc);
+}
+
+/* Single-threaded work body. Holds sc->mtx during i2c (MTX_DEF tolerates
+ * this when only ONE thread takes the mutex; the witness panic only fires
+ * when a second thread contends on it). Timers and IRQ both route here. */
+static void
+fusb302_irq_task(void *context, int pending __unused)
+{
+	fusb302_do_work(context);
 }
 
 static int
-fusb302_intr(void *context)
+fusb302_intr(void *context __unused)
 {
-	struct fusb302_softc *sc;
-
-	sc = context;
-	/* Run as a filter (no ithread): mask at GIC to stop the level-triggered
-	 * storm, then hand off to the taskqueue for register I/O. */
-	bus_suspend_intr(sc->dev, sc->irq_res);
-	taskqueue_enqueue(taskqueue_thread, &sc->irq_task);
-	return (FILTER_HANDLED);
+	/*
+	 * FUSB302 INT_N is level-low. Returning FILTER_SCHEDULE_THREAD makes
+	 * INTRNG mask the GPIO source until the ithread completes and the
+	 * chip-side INTERRUPT regs have been read (which deasserts INT_N).
+	 *
+	 * Earlier design used FILTER_HANDLED + manual bus_suspend_intr +
+	 * taskqueue. bus_suspend_intr is a no-op for GPIO-routed IRQs on
+	 * INTRNG, so the line stormed at ~210 kHz and starved the task
+	 * entirely (verified via fbt:fusb302:fusb302_intr dtrace count vs.
+	 * fusb302_irq_task count).
+	 */
+	return (FILTER_SCHEDULE_THREAD);
 }
 
 /* -----------------------------------------------------------------------
@@ -3138,6 +3428,41 @@ fusb302_sysctl_vbus_cycle(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
+/*
+ * reattach_now: force the Type-C state machine back to UNATTACHED and
+ * restart toggle/CC detection. This is the software equivalent of a
+ * cable replug for role_pref/skip_pd experiments and avoids kldunload
+ * while the controller is active.
+ */
+static int
+fusb302_sysctl_reattach(SYSCTL_HANDLER_ARGS)
+{
+	struct fusb302_softc *sc;
+	int error, val;
+
+	sc = arg1;
+	val = 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_xlock(&sc->sx);
+	if (!sc->initialized) {
+		sx_xunlock(&sc->sx);
+		return (ENXIO);
+	}
+	device_printf(sc->dev,
+	    "reattach_now: forcing detach/re-toggle (role_pref=%d skip_pd=%d)\n",
+	    sc->role_pref, sc->skip_pd);
+	fusb302_set_state_unattached_locked(sc);
+	sx_xunlock(&sc->sx);
+
+	taskqueue_enqueue(taskqueue_thread, &sc->irq_task);
+	return (0);
+}
+
 static void
 fusb302_add_sysctls(struct fusb302_softc *sc)
 {
@@ -3173,7 +3498,12 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	    "Toggle role pref: 0=DRP 1=src-only 2=snk-only (effective on next detach)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "skip_pd",
 	    CTLFLAG_RW, &sc->skip_pd, 0,
-	    "1=skip PD negotiation as sink, jump straight to passive DP defaults");
+	    "1=DP-only partner: skip PD negotiation, synthesize Pin C 4-lane "
+	    "DP altmode, notify cdn_dp directly");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "passive_src",
+	    CTLFLAG_RWTUN, &sc->passive_src, 0,
+	    "1=passive SRC: present Rp on CC, never call regulator_enable "
+	    "(use when partner sources VBUS but we want to advertise as Source)");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "slice_sdac",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    fusb302_sysctl_slice_sdac, "I",
@@ -3187,6 +3517,22 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "attached_as_sink",
 	    CTLFLAG_RD, (int *)&sc->attached_as_sink, 0,
 	    "1 if currently attached as UFP/sink, 0 otherwise");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "dp_altmode_valid",
+	    CTLFLAG_RD, (int *)&sc->dp_altmode.valid, 0,
+	    "1 when a DisplayPort Alt Mode snapshot is available");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "dp_altmode_ready",
+	    CTLFLAG_RD, (int *)&sc->dp_altmode.dp_ready, 0,
+	    "1 when DisplayPort Alt Mode is ready for the DP controller");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "dp_altmode_usb_ss",
+	    CTLFLAG_RD, &sc->dp_altmode.usb_ss, 0,
+	    "Alt Mode USB_SS flag: 0=DP-only, 1=USB3+DP");
+	SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "dp_altmode_pin_assignment", CTLFLAG_RD,
+	    &sc->dp_altmode.pin_assignment, 0,
+	    "Alt Mode pin assignment snapshot");
+	SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "dp_altmode_status", CTLFLAG_RD, &sc->dp_altmode.dp_status, 0,
+	    "Alt Mode DP status VDO snapshot");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "pos_power",
 	    CTLFLAG_RD, &sc->pos_power, 0,
 	    "Selected partner-source PDO position (sink role)");
@@ -3195,6 +3541,11 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    fusb302_sysctl_vbus_cycle, "I",
 	    "Write 1 to drop VBUS for 1.5s then re-enable, forcing the attached USB-C display through a power-cycle");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "reattach_now",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    fusb302_sysctl_reattach, "I",
+	    "Write 1 to force detach and restart Type-C attach detection");
 }
 
 /* -----------------------------------------------------------------------
@@ -3281,7 +3632,7 @@ fusb302_attach(device_t dev)
 	sc->dev = dev;
 	sc->addr = iicbus_get_addr(dev);
 	sc->irq_rid = 0;
-	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_DEF);
+	sx_init(&sc->sx, device_get_nameunit(dev));
 	TASK_INIT(&sc->irq_task, 0, fusb302_irq_task, sc);
 	callout_init(&sc->timer_state, 1 /* MPSAFE */);
 
@@ -3327,6 +3678,19 @@ fusb302_attach(device_t dev)
 	TUNABLE_INT_FETCH("hw.fusb302.skip_pd", &sc->skip_pd);
 	if (sc->skip_pd)
 		device_printf(dev, "skip_pd=1: passive DP defaults on SNK attach\n");
+
+	/*
+	 * Default passive_src=2: explicit AUTO_CRC + role-bit programming in
+	 * ATTACHED_SRC sub_state 0 before falling through to SRC_STARTUP →
+	 * SRC_SEND_CAPS.  Empirical fix for silent-PD partner: ensures
+	 * SWITCHES1 (POWERROLE/DATAROLE/AUTO_CRC/SPECREV) and MASK1 are
+	 * written explicitly before the first BMC TX, instead of relying on
+	 * the order in which the standard SRC path writes them.
+	 */
+	sc->passive_src = 2;
+	TUNABLE_INT_FETCH("hw.fusb302.passive_src", &sc->passive_src);
+	if (sc->passive_src < 0 || sc->passive_src > 2)
+		sc->passive_src = 2;
 
 	/*
 	 * Run init_locked WITHOUT taking sc->mtx. init_locked does ~100 I2C
@@ -3405,11 +3769,13 @@ fusb302_attach(device_t dev)
 			    &sc->irq_rid, RF_ACTIVE);
 	}
 	if (sc->irq_res != NULL) {
-		/* Filter-only: no ithread, avoids ithread lifecycle races on
-		 * hot-swap (kldunload/kldload). */
+		/* Filter + ithread: filter returns FILTER_SCHEDULE_THREAD so
+		 * INTRNG masks the GPIO source for the duration of the
+		 * ithread. Required because FUSB302 INT_N is level-low and
+		 * bus_suspend_intr does not mask GPIO-routed IRQs. */
 		error = bus_setup_intr(dev, sc->irq_res,
-		    INTR_TYPE_MISC | INTR_MPSAFE, fusb302_intr, NULL, sc,
-		    &sc->irq_cookie);
+		    INTR_TYPE_MISC | INTR_MPSAFE, fusb302_intr,
+		    fusb302_irq_ithread, sc, &sc->irq_cookie);
 		if (error != 0) {
 			device_printf(dev, "cannot setup irq: %d\n", error);
 			bus_release_resource(dev, SYS_RES_IRQ, sc->irq_rid,
@@ -3475,7 +3841,7 @@ fail:
 		regulator_disable(sc->vbus_supply);
 	if (sc->vbus_supply != NULL)
 		regulator_release(sc->vbus_supply);
-	mtx_destroy(&sc->mtx);
+	sx_destroy(&sc->sx);
 	return (ENXIO);
 }
 
@@ -3557,7 +3923,7 @@ fusb302_detach(device_t dev)
 		regulator_release(sc->vbus_supply);
 
 	OF_device_register_xref(OF_xref_from_node(ofw_bus_get_node(dev)), NULL);
-	mtx_destroy(&sc->mtx);
+	sx_destroy(&sc->sx);
 	return (0);
 }
 
@@ -3808,6 +4174,11 @@ fusb302_tcpc_set_vbus_source(struct usbc_tcpc *t, bool en)
 	struct fusb302_softc *sc = t->softc;
 	int err;
 
+	if (sc->passive_src) {
+		/* In passive SRC mode, never touch the regulator. The partner
+		 * is sourcing VBUS; we only care about presenting Rp on CC. */
+		return (0);
+	}
 	if (sc->vbus_supply == NULL)
 		return (ENXIO);
 	if (en && !sc->vbus_enabled) {
