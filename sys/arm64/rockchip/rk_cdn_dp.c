@@ -680,6 +680,9 @@ static int	rk_cdn_dp_sysctl_active_port(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_reprobe(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_refresh_typec(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_framer_dump(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_probe_warm(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_get_clocks(struct rk_cdn_dp_softc *sc);
+static int	rk_cdn_dp_enable_clocks(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_sysctl_reg_addr(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_reg_value(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_reg_read(SYSCTL_HANDLER_ARGS);
@@ -2132,6 +2135,60 @@ rk_cdn_dp_sysctl_aux_probe(SYSCTL_HANDLER_ARGS)
 		return (ENXIO);
 	}
 	error = rk_cdn_dp_aux_probe(sc);
+	sx_sunlock(&sc->detach_sx);
+	return (error);
+}
+
+/*
+ * probe_warm: minimal non-destructive bring-up so userspace can read
+ * cdn-dp APB / mailbox MMIO without (a) advancing the stage machine,
+ * (b) resetting the µCPU, or (c) cycling cdn-dp resets.  Used to capture
+ * U-Boot leftover firmware/framer state via memread32 while the panel
+ * is still being driven by U-Boot's setup.
+ *
+ *   - clk_enable() is reference-counted in FreeBSD's clk framework, so
+ *     calling it on an already-enabled clk is a no-op increment.
+ *   - We skip rk_cdn_dp_deassert_resets() because it asserts then
+ *     deasserts — that's a hard reset cycle that would clobber state.
+ *   - power domain is already on at boot (verified in dmesg).
+ */
+static int
+rk_cdn_dp_sysctl_probe_warm(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	if (sc->clks[0] == NULL) {
+		error = rk_cdn_dp_get_clocks(sc);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "probe_warm: get_clocks failed (%d)\n", error);
+			goto out;
+		}
+	}
+	if (!sc->clks_enabled) {
+		error = rk_cdn_dp_enable_clocks(sc);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "probe_warm: enable_clocks failed (%d)\n", error);
+			goto out;
+		}
+	}
+	device_printf(sc->dev,
+	    "probe_warm: clocks ready (skip resets/fw); APB MMIO at 0xfec02000+ now readable\n");
+out:
 	sx_sunlock(&sc->detach_sx);
 	return (error);
 }
@@ -5835,6 +5892,11 @@ rk_cdn_dp_attach(device_t dev)
 	    "framer_dump_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_framer_dump, "I",
 	    "Write 1 to dump Cadence framer/MSA registers via READ_REGISTER mailbox");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "probe_warm", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_probe_warm, "I",
+	    "Write 1 to non-destructively enable cdn-dp clocks for MMIO readability "
+	    "(skips resets/fw — preserves U-Boot firmware state)");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "debug_reg_addr", CTLTYPE_U32 | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_reg_addr, "IU",
