@@ -1008,12 +1008,10 @@ rk_drm_sysctl_signal_dump(SYSCTL_HANDLER_ARGS)
 	if (fdev != NULL && get_status != NULL &&
 	    get_status(fdev, &astat) == 0 && astat.valid) {
 		device_printf(sc->dev,
-		    "signal_dump: fusb302 attached=%d role=%d orient=%d "
-		    "dp_ready=%d pin=0x%x dp_status=0x%x host_lanes=%d "
-		    "host_flip=%d\n",
-		    astat.attached, astat.role, astat.orient,
-		    astat.dp_ready, astat.pin_assign, astat.dp_status,
-		    astat.host_lanes, astat.host_flip);
+		    "signal_dump: fusb302 valid=%d dp_ready=%d usb_ss=%d "
+		    "pin_assignment=0x%x dp_status=0x%x\n",
+		    astat.valid, astat.dp_ready, astat.usb_ss,
+		    astat.pin_assignment, astat.dp_status);
 	} else {
 		device_printf(sc->dev,
 		    "signal_dump: fusb302 altmode state unavailable\n");
