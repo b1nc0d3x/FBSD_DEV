@@ -2366,6 +2366,31 @@ rk_drm_hw_audio_dump(struct rk_drm_softc *sc)
  * lanes off) and TXPWRON, return the previous PHY_CONF0 in *prev.
  */
 int
+rk_drm_hw_scanout_blank(struct rk_drm_softc *sc)
+{
+	if (sc->vop_va == 0 || sc->fb_va == 0)
+		return (ENXIO);
+	/* Save the current scanout DMA address. */
+	sc->dpms_yrgb_mst_save = rk_drm_vop_read4(sc, 0x0040);
+	/* Zero our local stash framebuffer and point VOP at it. */
+	memset((void *)sc->fb_va, 0, sc->fb_size);
+	rk_drm_vop_write4(sc, 0x0040, (uint32_t)sc->fb_pa);
+	rk_drm_vop_write4(sc, 0x0000, 0x00010001);	/* CFG_DONE commit */
+	return (0);
+}
+
+int
+rk_drm_hw_scanout_unblank(struct rk_drm_softc *sc)
+{
+	if (sc->vop_va == 0 || sc->dpms_yrgb_mst_save == 0)
+		return (ENXIO);
+	rk_drm_vop_write4(sc, 0x0040, sc->dpms_yrgb_mst_save);
+	rk_drm_vop_write4(sc, 0x0000, 0x00010001);
+	sc->dpms_yrgb_mst_save = 0;
+	return (0);
+}
+
+int
 rk_drm_hw_fb_save(struct rk_drm_softc *sc)
 {
 	if (sc->fb_va == 0 || sc->fb_size == 0)

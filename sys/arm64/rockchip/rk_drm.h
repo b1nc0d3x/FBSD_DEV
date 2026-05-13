@@ -102,6 +102,16 @@ struct rk_drm_softc {
 	bool			hpd_last_status;
 	bool			hpd_squelch;
 	int			output_select;
+	int			dpms_route_save;	/* route at DPMS-off; -1 if
+						 * not in DPMS-off state.
+						 * Restored at DPMS-on so the
+						 * sleeping route is what wakes,
+						 * not whatever AUTO would pick
+						 * fresh. */
+	uint32_t		dpms_yrgb_mst_save;	/* VOP_BIG WIN0
+						 * YRGB_MST value before DPMS-
+						 * off swap-to-black-buffer.
+						 * 0 = not saved. */
 	bool			dp_autobring_done;
 	bool			dp_hotplug_reprobe_done;
 	uint32_t		dp_last_altmode_status;	/* for HPD_IRQ rising-edge */
@@ -234,6 +244,15 @@ void	rk_drm_hw_signal_dump(struct rk_drm_softc *sc);
  */
 int	rk_drm_hw_fb_save(struct rk_drm_softc *sc);
 int	rk_drm_hw_fb_restore(struct rk_drm_softc *sc);
+
+/*
+ * Swap VOP_BIG WIN0's scanout buffer for an all-zero buffer (DPMS-off
+ * effect on routes that can't tolerate stream loss), and restore the
+ * original buffer back.  Saves the old YRGB_MST in sc->dpms_yrgb_mst_
+ * save.  Returns 0 on success, ENXIO if VOP isn't mapped.
+ */
+int	rk_drm_hw_scanout_blank(struct rk_drm_softc *sc);
+int	rk_drm_hw_scanout_unblank(struct rk_drm_softc *sc);
 
 /* HDMI audio diagnostics -- dump the relevant TX register state to dmesg. */
 void	rk_drm_hw_audio_dump(struct rk_drm_softc *sc);

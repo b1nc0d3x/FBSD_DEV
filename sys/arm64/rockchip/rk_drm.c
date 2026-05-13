@@ -2536,12 +2536,96 @@ rk_drm_crtc_dpms(struct drm_crtc *crtc, int mode)
 
 	sc = device_get_softc(crtc->dev->dev);
 	if (mode != DRM_MODE_DPMS_ON) {
+		int route;
+
 		rk_drm_cancel_page_flip(sc, NULL);
-		rk_drm_hw_disable_locked(sc);
+		route = rk_drm_output_route_locked(sc);
+		sc->dpms_route_save = route;
+
+		if (route == RK_DRM_OUTPUT_USBC_DP) {
+			/*
+			 * XYM USB-C DP input is fragile — losing signal
+			 * puts the panel into a stuck state that needs a
+			 * physical reattach to recover.  So for DPMS-off
+			 * on the DP route we CANNOT stop VOP scanout.
+			 * Instead, point VOP's WIN0 scanout DMA address
+			 * at our local fb_pa buffer (zeroed), save the
+			 * original DMA address, and CFG_DONE commit.
+			 * The link stays trained, panel stays awake (sees
+			 * a valid all-black stream), and DPMS-on swaps
+			 * the original buffer back.
+			 */
+			(void)rk_drm_hw_scanout_blank(sc);
+			device_printf(sc->dev,
+			    "DPMS off (DP route): scanout swapped to "
+			    "black buffer (saved route=%d)\n",
+			    sc->dpms_route_save);
+		} else {
+			rk_drm_hw_disable_locked(sc);
+			device_printf(sc->dev,
+			    "DPMS off (HDMI route): VOP stopped "
+			    "(saved route=%d)\n", sc->dpms_route_save);
+		}
 		return;
+	}
+	/*
+	 * DPMS-on for DP route: scanout was pointed at a black buffer;
+	 * just swap the original DMA address back via CFG_DONE.  No
+	 * modeset, no cdn_enable_mode, no risk of triggering the
+	 * panel's "lost signal" trap.
+	 */
+	if (sc->dpms_route_save == RK_DRM_OUTPUT_USBC_DP) {
+		(void)rk_drm_hw_scanout_unblank(sc);
+		device_printf(sc->dev,
+		    "DPMS on (DP route): scanout restored\n");
+		sc->dpms_route_save = -1;
+		return;
+	}
+	/*
+	 * DPMS-on: if we stored a route at DPMS-off, pin output_select
+	 * to it across the modeset so AUTO doesn't switch outputs
+	 * underneath the user (e.g., USB-C altmode coming up mid-sleep
+	 * would otherwise make AUTO pick DP at wake even if HDMI was
+	 * the asleep route).
+	 */
+	if (sc->dpms_route_save == RK_DRM_OUTPUT_HDMI ||
+	    sc->dpms_route_save == RK_DRM_OUTPUT_USBC_DP) {
+		sc->output_select = sc->dpms_route_save;
+		device_printf(sc->dev,
+		    "DPMS on: restoring saved route %d\n", sc->output_select);
+		sc->dpms_route_save = -1;
 	}
 	if (rk_drm_output_enabled_locked(sc))
 		return;
+
+	/*
+	 * For the USB-C DP route, also re-arm the Cadence MHDP framer
+	 * via cdn_enable_mode() — mirrors what crtc_mode_set does on a
+	 * fresh modeset.  Without this the VOP restarts scanning but
+	 * the framer remains in its post-disable idle state and the
+	 * sink stays dark even though pixels are flowing into the
+	 * framer's input port.
+	 */
+	if (rk_drm_output_route_locked(sc) == RK_DRM_OUTPUT_USBC_DP) {
+		int (*cdn_enable_mode)(uint32_t, uint16_t, uint16_t,
+		    uint16_t, uint16_t, uint16_t, uint16_t, uint16_t,
+		    uint16_t, uint32_t);
+		struct drm_display_mode forced;
+
+		rk_drm_fill_forced_dp_mode(&forced);
+		cdn_enable_mode = rk_drm_lookup_cdn_enable_mode();
+		if (cdn_enable_mode != NULL) {
+			error = cdn_enable_mode(forced.clock,
+			    forced.hdisplay, forced.hsync_start,
+			    forced.hsync_end, forced.htotal,
+			    forced.vdisplay, forced.vsync_start,
+			    forced.vsync_end, forced.vtotal,
+			    forced.flags);
+			device_printf(sc->dev,
+			    "DPMS on (DP route): cdn_enable_mode err=%d\n",
+			    error);
+		}
+	}
 
 	active_mode = &crtc->hwmode;
 	if (!rk_drm_hw_mode_valid(active_mode)) {
