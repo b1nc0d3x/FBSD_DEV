@@ -137,6 +137,7 @@ static int (*rk_drm_lookup_cdn_enable_mode(void))(uint32_t clock,
 static int (*rk_drm_lookup_set_video_active(void))(bool);
 static void rk_drm_try_usbc_autobringup(struct rk_drm_softc *sc);
 static int rk_drm_sysctl_hdmi_modeset_now(SYSCTL_HANDLER_ARGS);
+static int rk_drm_sysctl_input_wink(SYSCTL_HANDLER_ARGS);
 static int rk_drm_sysctl_output_select(SYSCTL_HANDLER_ARGS);
 static bool rk_drm_hdmi_hpd_locked(struct rk_drm_softc *sc);
 static int rk_drm_output_route_locked(struct rk_drm_softc *sc);
@@ -885,6 +886,67 @@ rk_drm_sysctl_dp_modeset_now(SYSCTL_HANDLER_ARGS)
 		}
 	}
 	return (error);
+}
+
+/*
+ * Wink one of the two output paths: cut its outgoing signal for a
+ * short window then restore it.  Useful for forcing a dual-input
+ * panel that auto-selects its input to fall through to the other
+ * side (e.g., briefly drop USB-C DP so the panel re-detects and
+ * switches to HDMI, or vice versa).
+ *
+ *  write 0 -> wink HDMI: clear PDDQ on HDMI PHY (TMDS off), 500ms,
+ *                        restore.
+ *  write 1 -> wink USB-C DP: tell Cadence framer set_video_active=false,
+ *                            500ms, set_video_active=true.
+ */
+static int
+rk_drm_sysctl_input_wink(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+
+	if (val == 0) {
+		uint8_t prev;
+
+		mtx_lock(&sc->hw_lock);
+		prev = rk_drm_hw_hdmi_phy_blank(sc);
+		mtx_unlock(&sc->hw_lock);
+		device_printf(sc->dev,
+		    "input_wink: HDMI TMDS off (PHY_CONF0 was %#x)\n", prev);
+		pause("hdmiwink", hz / 2);
+		mtx_lock(&sc->hw_lock);
+		rk_drm_hw_hdmi_phy_restore(sc, prev);
+		mtx_unlock(&sc->hw_lock);
+		device_printf(sc->dev,
+		    "input_wink: HDMI TMDS restored\n");
+		return (0);
+	}
+	if (val == 1) {
+		int (*set_video_active)(bool);
+
+		set_video_active = rk_drm_lookup_set_video_active();
+		if (set_video_active == NULL) {
+			device_printf(sc->dev,
+			    "input_wink: rk_cdn_dp set_video_active not "
+			    "resolved\n");
+			return (ENXIO);
+		}
+		(void)set_video_active(false);
+		device_printf(sc->dev,
+		    "input_wink: DP video_active=false (8s)\n");
+		pause("dpwink", hz * 8);
+		(void)set_video_active(true);
+		device_printf(sc->dev,
+		    "input_wink: DP video_active=true\n");
+		return (0);
+	}
+	return (EINVAL);
 }
 
 static int
@@ -2206,11 +2268,10 @@ rk_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 		/*
 		 * USB-C DP override.  DRM may have picked any timing from
 		 * the EDID-derived connector mode list (or our forced mode if
-		 * it happens to match by hdisplay/vdisplay/pclk).  For
-		 * investigation, IGNORE DRM's choice and always drive the
-		 * exact values from rk_dp_forced_mode.h — this guarantees
-		 * VOP + cdn-dp framer both see the same custom timing without
-		 * needing to inject our mode into DRM's connector mode list.
+		 * it happens to match by hdisplay/vdisplay/pclk).  Always
+		 * drive the exact values from rk_dp_forced_mode.h so VOP +
+		 * cdn-dp framer see the same custom timing without needing
+		 * the mode to be in DRM's connector mode list.
 		 */
 		rk_drm_fill_forced_dp_mode(&forced);
 		active_mode = &forced;
@@ -2369,7 +2430,15 @@ rk_drm_crtc_prepare(struct drm_crtc *crtc)
 	if (pipe >= 0)
 		drm_vblank_pre_modeset(&sc->drm_dev, pipe);
 	rk_drm_cancel_page_flip(sc, NULL);
-	rk_drm_hw_disable_locked(sc);
+	/*
+	 * Do NOT call rk_drm_hw_disable_locked here.  Disabling SYS_CTRL
+	 * ENABLE bit + RGB/HDMI/EDP_EN takes the VOP off the bus, which
+	 * stream-sensing panels like XYM W156F1 read as "no signal" and
+	 * sleep on.  The mode-change registers are shadow-banked and the
+	 * follow-up CFG_DONE pulse in mode_set/commit atomically swaps in
+	 * the new state at the next vblank — scanout never has to stop.
+	 * Reserve hw_disable for genuine DPMS-off / final detach.
+	 */
 }
 
 static void
@@ -2946,6 +3015,12 @@ rk_drm_attach(device_t dev)
 		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 		    sc, 0, rk_drm_sysctl_dp_modeset_now, "I",
 		    "Write 1 to drive VOP -> eDP path with 1080p60 and select USB-C DP (run rk_cdn_dp stages 1..19 first)");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "input_wink",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_input_wink, "I",
+		    "Briefly drop one output's signal to force a dual-input sink to fall through: 0=HDMI, 1=USB-C DP");
 
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "audio_dump",

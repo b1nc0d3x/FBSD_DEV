@@ -24,25 +24,25 @@
  * but runtime modeset is now driven from EDID for the subset of modes whose
  * clocks and HDMI PHY settings are implemented in rk_drm_hw.c.
  */
-#define RK_DRM_DEFAULT_CLOCK_KHZ     148500
-#define RK_DRM_DEFAULT_WIDTH         1920
-#define RK_DRM_DEFAULT_HEIGHT        1080
 /*
- * Hardcoded XYM-display EDID DTD timing (test 2026-05-10).
- * Cadence framer's stage-18 config-video parses these same values from
- * EDID and writes them into the MSA. If VOP supplies different
- * hsync/vsync placement the panel sees inconsistent stream-vs-MSA and
- * reports "No Signal" even with a healthy link.
- *   CEA 1080p60 (was):  HSYNC 2008..2052 (pulse 44), VSYNC 1084..1089
- *   XYM panel DTD:      HSYNC 1968..2000 (pulse 32), VSYNC 1083..1088
- * Long term: derive from cached EDID DTD via rk_cdn_dp_get_cached_edid.
+ * HDMI default mode parameters live in rk_hdmi_forced_mode.h.
+ * USB-C DP default mode parameters live in rk_dp_forced_mode.h.
+ * Each output has its own header so we can tune timings for one
+ * without touching the other.  The RK_DRM_DEFAULT_* aliases below
+ * forward to the HDMI header (the HDMI path is the "default" for
+ * non-route-specific paths like initial attach modeset).
  */
-#define RK_DRM_DEFAULT_HSYNC_START   1968
-#define RK_DRM_DEFAULT_HSYNC_END     2000
-#define RK_DRM_DEFAULT_HTOTAL        2200
-#define RK_DRM_DEFAULT_VSYNC_START   1083
-#define RK_DRM_DEFAULT_VSYNC_END     1088
-#define RK_DRM_DEFAULT_VTOTAL        1125
+#include <arm64/rockchip/rk_hdmi_forced_mode.h>
+
+#define RK_DRM_DEFAULT_CLOCK_KHZ     RK_HDMI_FORCED_CLOCK_KHZ
+#define RK_DRM_DEFAULT_WIDTH         RK_HDMI_FORCED_HDISPLAY
+#define RK_DRM_DEFAULT_HEIGHT        RK_HDMI_FORCED_VDISPLAY
+#define RK_DRM_DEFAULT_HSYNC_START   RK_HDMI_FORCED_HSYNC_START
+#define RK_DRM_DEFAULT_HSYNC_END     RK_HDMI_FORCED_HSYNC_END
+#define RK_DRM_DEFAULT_HTOTAL        RK_HDMI_FORCED_HTOTAL
+#define RK_DRM_DEFAULT_VSYNC_START   RK_HDMI_FORCED_VSYNC_START
+#define RK_DRM_DEFAULT_VSYNC_END     RK_HDMI_FORCED_VSYNC_END
+#define RK_DRM_DEFAULT_VTOTAL        RK_HDMI_FORCED_VTOTAL
 
 #define RK_DRM_MAX_WIDTH             1920
 #define RK_DRM_MAX_HEIGHT            1080
@@ -89,6 +89,9 @@ struct rk_drm_softc {
 	bool			drm_registered;
 	bool			hw_attached;
 	bool			output_enabled;
+	bool			vop_scanning;	/* VOP scanout is live; skip
+						 * destructive dclk reset on
+						 * subsequent modesets. */
 	bool			hpd_task_running;
 	bool			vblank_task_running;
 	bool			hpd_state_valid;
@@ -187,6 +190,15 @@ int	rk_drm_hw_set_scanout(struct rk_drm_softc *sc, vm_paddr_t paddr,
 
 /* Sample HDMI hot-plug-detect status (true = sink connected). */
 bool	rk_drm_hw_hpd(struct rk_drm_softc *sc);
+
+/*
+ * Blank the HDMI PHY TMDS lanes (drop signal to the sink) and return
+ * the previous PHY_CONF0 value.  Caller pairs this with hdmi_phy_restore
+ * to recover the original drive state.  Used by the input_wink sysctl
+ * to force a dual-input sink to fall through to its other input.
+ */
+uint8_t	rk_drm_hw_hdmi_phy_blank(struct rk_drm_softc *sc);
+void	rk_drm_hw_hdmi_phy_restore(struct rk_drm_softc *sc, uint8_t prev);
 
 /* HDMI audio diagnostics -- dump the relevant TX register state to dmesg. */
 void	rk_drm_hw_audio_dump(struct rk_drm_softc *sc);

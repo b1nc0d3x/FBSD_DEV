@@ -71,14 +71,17 @@
 #define RK_DRM_VOP_WIN0_LB_MODE_RGB_1920X5 (4u << 5)
 #define RK_DRM_VOP_WIN0_DATA_FMT_XRGB8888 0x00000000u
 /*
- * Live read of working the reference build shows WIN0_CTRL0 = 0x3a000081 — lower 8 bits
- * are enable+LB_MODE+fmt as before, but bits 25/27/28/29 in 0x3a000000 are
- * also set (likely csc_en + color-space + ymir/yuv-clip default state).
- * Mirror that so the scanout pipeline matches the working reference.
+ * WIN0_CTRL0 upper bits encode csc_en + color-space + yuv-clip state.
+ * Live read of working the reference build with display on USB-C DP
+ * shows these set to 0x3a000000 — needed so the Cadence framer sees
+ * pixels with the right CSC.  HDMI's RGB-out pipeline reads "No
+ * Support" if these are set (the pre-USB-C HDMI path had them at 0).
+ * Caller passes the right upper value per output route.
  */
-#define RK_DRM_VOP_WIN0_CTRL0_UPPER 0x3a000000u
-#define RK_DRM_VOP_WIN0_CTRL0_ENABLE  (RK_DRM_VOP_WIN0_CTRL0_UPPER | \
-    RK_DRM_VOP_WIN0_LB_MODE_RGB_1920X5 | \
+#define RK_DRM_VOP_WIN0_CTRL0_UPPER_DP   0x3a000000u
+#define RK_DRM_VOP_WIN0_CTRL0_UPPER_HDMI 0x00000000u
+#define RK_DRM_VOP_WIN0_CTRL0_LOWER \
+    (RK_DRM_VOP_WIN0_LB_MODE_RGB_1920X5 | \
     RK_DRM_VOP_WIN0_DATA_FMT_XRGB8888 | 0x00000001u)
 #define RK_DRM_VOP_WIN0_CTRL2_PRIMARY 0x00000021u
 #define RK_DRM_VOP_WIN0_SRC_ALPHA_CTRL_OPAQUE 0x00ff0000u
@@ -792,20 +795,44 @@ rk_drm_vop_pulse_dclk_reset(struct rk_drm_softc *sc)
 	DELAY(1000);
 }
 
+enum rk_drm_win0_route {
+	RK_DRM_WIN0_ROUTE_HDMI,
+	RK_DRM_WIN0_ROUTE_DP,
+};
+
 static void
 rk_drm_vop_program_win0_opaque(struct rk_drm_softc *sc,
     const struct drm_display_mode *mode, uint32_t hact_start,
-    uint32_t vact_start)
+    uint32_t vact_start, enum rk_drm_win0_route route)
 {
 	uint32_t stride_bytes, stride_words;
+	uint32_t ctrl0_upper;
+	bool write_alpha;
 
-	/*
-	 * The fixed boot framebuffer is allocated at the maximum 1920-wide
-	 * pitch, but the direct modeset path programs WIN0 before KMS has a
-	 * chance to rebind a GEM framebuffer with its own pitch.  the reference driver sets
-	 * yrgb_vir from the actual visible buffer pitch, so mirror that here
-	 * instead of reusing the allocation pitch.
-	 */
+	switch (route) {
+	case RK_DRM_WIN0_ROUTE_HDMI:
+		/*
+		 * Pre-USB-C HDMI path wrote only the lower bits of
+		 * WIN0_CTRL0 and never touched the alpha-control regs.
+		 * Match that exactly: HDMI sinks (e.g. XYM W156F1) report
+		 * "No Support" when CSC bits (0x3a000000) or forced-opaque
+		 * alpha (0x00ff0000 in SRC_ALPHA) are set.
+		 */
+		ctrl0_upper = RK_DRM_VOP_WIN0_CTRL0_UPPER_HDMI;
+		write_alpha = false;
+		break;
+	case RK_DRM_WIN0_ROUTE_DP:
+	default:
+		/*
+		 * Cadence DP framer needs CSC bits + force-opaque alpha
+		 * (mirrors reference vendor BSP state observed when display
+		 * is on USB-C DP).  Without these, the framer drops pixels.
+		 */
+		ctrl0_upper = RK_DRM_VOP_WIN0_CTRL0_UPPER_DP;
+		write_alpha = true;
+		break;
+	}
+
 	stride_bytes = roundup2(mode->hdisplay, 16) * (RK_DRM_BPP / 8);
 	stride_words = stride_bytes / 4;
 
@@ -820,18 +847,19 @@ rk_drm_vop_program_win0_opaque(struct rk_drm_softc *sc,
 	    ((uint32_t)mode->hdisplay - 1));
 	rk_drm_vop_write4(sc, 0x0050,
 	    (vact_start << 16) | hact_start);
-	/*
-	 * XRGB8888 primary plane: force opaque blending state so stale
-	 * bootloader alpha registers cannot black-hole the scanout.
-	 */
-	rk_drm_vop_write4(sc, 0x0060, RK_DRM_VOP_WIN0_SRC_ALPHA_CTRL_OPAQUE);
-	rk_drm_vop_write4(sc, 0x0064, RK_DRM_VOP_WIN0_DST_ALPHA_CTRL_OPAQUE);
+	if (write_alpha) {
+		rk_drm_vop_write4(sc, 0x0060,
+		    RK_DRM_VOP_WIN0_SRC_ALPHA_CTRL_OPAQUE);
+		rk_drm_vop_write4(sc, 0x0064,
+		    RK_DRM_VOP_WIN0_DST_ALPHA_CTRL_OPAQUE);
+	}
 	rk_drm_vop_write4(sc, 0x006c, RK_DRM_VOP_WIN0_CTRL2_PRIMARY);
 	rk_drm_vop_write4(sc, RK_DRM_VOP_POST_DSP_HACT_INFO,
 	    (hact_start << 16) | (hact_start + mode->hdisplay));
 	rk_drm_vop_write4(sc, RK_DRM_VOP_POST_DSP_VACT_INFO,
 	    (vact_start << 16) | (vact_start + mode->vdisplay));
-	rk_drm_vop_write4(sc, 0x0030, RK_DRM_VOP_WIN0_CTRL0_ENABLE);
+	rk_drm_vop_write4(sc, 0x0030,
+	    ctrl0_upper | RK_DRM_VOP_WIN0_CTRL0_LOWER);
 }
 
 static void
@@ -847,11 +875,18 @@ rk_drm_vop_init_mode(struct rk_drm_softc *sc,
 	if (rk_drm_program_vpll(sc, mode->clock) != 0)
 		device_printf(sc->dev, "VPLL setup failed, continuing\n");
 
+	/*
+	 * CRU CLKSEL_CON47/49 setup for the HDMI path.  Pre-USB-C values
+	 * (bit 6 in CON47 low half + 0x0000 in CON49 low half) drive DCLK
+	 * via the path the XYM W156F1 panel accepts.  USB-C bring-up
+	 * inadvertently mutated these to bit 7 / 0x0100 — the DP variant
+	 * below kept the original; HDMI did not.  Restored.
+	 */
 	rk_drm_cru_write4(sc, 0x01bc,
 	    ((((0x1fu << 8) | (0x3u << 6) | 0x1fu) << 16) |
-	    ((3u << 8) | (1u << 7) | 1u)));
+	    ((3u << 8) | (1u << 6) | 1u)));
 	rk_drm_cru_write4(sc, 0x01c4,
-	    ((((1u << 11) | (0x3u << 8) | 0xffu) << 16) | 0x0100u));
+	    ((((1u << 11) | (0x3u << 8) | 0xffu) << 16) | 0x0000u));
 
 	sys_ctrl = rk_drm_vop_read4(sc, 0x0008);
 	dsp_ctrl0 = rk_drm_vop_read4(sc, 0x0010);
@@ -859,7 +894,6 @@ rk_drm_vop_init_mode(struct rk_drm_softc *sc,
 
 	sys_ctrl &= ~(RK_DRM_VOP_SYS_CTRL_STANDBY |
 	    RK_DRM_VOP_SYS_CTRL_MMU_EN |
-	    RK_DRM_VOP_SYS_CTRL_EDP_EN |
 	    RK_DRM_VOP_SYS_CTRL_MIPI_EN |
 	    RK_DRM_VOP_SYS_CTRL_MIPI_DUAL);
 	sys_ctrl |= RK_DRM_VOP_SYS_CTRL_ENABLE |
@@ -871,13 +905,29 @@ rk_drm_vop_init_mode(struct rk_drm_softc *sc,
 	dsp_ctrl0 |= RK_DRM_VOP_DSP_OUT_MODE_AAAA;
 	rk_drm_vop_write4(sc, 0x0010, dsp_ctrl0);
 
-	dsp_ctrl1 &= ~(RK_DRM_VOP_DSP_CTRL1_HDMI_PIN_POL_MASK |
-	    RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL);
-	dsp_ctrl1 |= RK_DRM_VOP_DSP_CTRL1_HDMI_PIN_POL_POS |
-	    RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL;
+	/*
+	 * HDMI pin polarity: bits 20:22 of DSP_CTRL1 encode HSYNC_POSITIVE
+	 * (bit 20), VSYNC_POSITIVE (bit 21), DEN_NEGATIVE (bit 22).  Drive
+	 * those from mode->flags so the XYM W156F1 (and other DMT-leaning
+	 * sinks) get the negative HSYNC they expect — the previously
+	 * hard-coded POS value only worked for CEA-style PHSYNC modes.
+	 */
+	{
+		uint32_t hdmi_pin_pol = 0;
+
+		if ((mode->flags & DRM_MODE_FLAG_NHSYNC) == 0)
+			hdmi_pin_pol |= (1u << 0);
+		if ((mode->flags & DRM_MODE_FLAG_NVSYNC) == 0)
+			hdmi_pin_pol |= (1u << 1);
+		dsp_ctrl1 &= ~(RK_DRM_VOP_DSP_CTRL1_HDMI_PIN_POL_MASK |
+		    RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL);
+		dsp_ctrl1 |= (hdmi_pin_pol & 0x7) << 20 |
+		    RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL;
+	}
 	rk_drm_vop_write4(sc, 0x0014, dsp_ctrl1);
 
-	rk_drm_vop_program_win0_opaque(sc, mode, hact_start, vact_start);
+	rk_drm_vop_program_win0_opaque(sc, mode, hact_start, vact_start,
+	    RK_DRM_WIN0_ROUTE_HDMI);
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_HTOTAL_HS_END,
 	    ((uint32_t)mode->htotal << 16) | rk_drm_mode_hsync_len(mode));
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_HACT_ST_END,
@@ -886,16 +936,12 @@ rk_drm_vop_init_mode(struct rk_drm_softc *sc,
 	    ((uint32_t)mode->vtotal << 16) | rk_drm_mode_vsync_len(mode));
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_VACT_ST_END,
 	    (vact_start << 16) | (vact_start + mode->vdisplay));
-	/*
-	 * REG_CFG_DONE (offset 0x0000) is hiword-update: mask in upper 16
-	 * bits, value in lower. Writing 0x1 alone (mask bit clear) is a
-	 * silent no-op — the commit never fires, so all the staged VOP
-	 * register writes above stay in the shadow bank and never reach
-	 * the live registers. Correct form: 0x10001.
-	 */
 	rk_drm_vop_write4(sc, 0x0000, 0x00010001);
-	rk_drm_vop_pulse_dclk_reset(sc);
-	DELAY(40000);
+	if (!sc->vop_scanning) {
+		rk_drm_vop_pulse_dclk_reset(sc);
+		DELAY(40000);
+	}
+	sc->vop_scanning = true;
 }
 
 /*
@@ -942,7 +988,6 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	 */
 	sys_ctrl &= ~(RK_DRM_VOP_SYS_CTRL_STANDBY |
 	    RK_DRM_VOP_SYS_CTRL_MMU_EN |
-	    RK_DRM_VOP_SYS_CTRL_HDMI_EN |
 	    RK_DRM_VOP_SYS_CTRL_EDP_EN |
 	    RK_DRM_VOP_SYS_CTRL_MIPI_EN |
 	    RK_DRM_VOP_SYS_CTRL_MIPI_DUAL);
@@ -1021,7 +1066,8 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	rk_drm_vop_write4(sc, 0x0180, post_scl_ctrl);
 	rk_drm_vop_write4(sc, 0x0018, 0x00000000);	/* dsp_background = 0 */
 
-	rk_drm_vop_program_win0_opaque(sc, mode, hact_start, vact_start);
+	rk_drm_vop_program_win0_opaque(sc, mode, hact_start, vact_start,
+	    RK_DRM_WIN0_ROUTE_DP);
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_HTOTAL_HS_END,
 	    ((uint32_t)mode->htotal << 16) | rk_drm_mode_hsync_len(mode));
 	rk_drm_vop_write4(sc, RK_DRM_VOP_DSP_HACT_ST_END,
@@ -1038,8 +1084,11 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	 * the live registers. Correct form: 0x10001.
 	 */
 	rk_drm_vop_write4(sc, 0x0000, 0x00010001);
-	rk_drm_vop_pulse_dclk_reset(sc);
-	DELAY(40000);
+	if (!sc->vop_scanning) {
+		rk_drm_vop_pulse_dclk_reset(sc);
+		DELAY(40000);
+	}
+	sc->vop_scanning = true;
 }
 
 /*
@@ -1128,6 +1177,7 @@ rk_drm_hw_disable(struct rk_drm_softc *sc)
 	    RK_DRM_HDMI_PHY_CONF0_PDDQ |
 	    RK_DRM_HDMI_PHY_CONF0_ENHPDRXSENSE);
 	sc->output_enabled = false;
+	sc->vop_scanning = false;
 }
 
 static void
@@ -2103,6 +2153,32 @@ rk_drm_hw_audio_dump(struct rk_drm_softc *sc)
 	device_printf(sc->dev,
 	    "audio_dump: aic0=0x%02x aic1=0x%02x aic2=0x%02x aic3=0x%02x audsv=0x%02x\n",
 	    aic0, aic1, aic2, aic3, audsv);
+}
+
+/*
+ * Briefly drop HDMI TMDS output: clear PDDQ (which gates the PHY data
+ * lanes off) and TXPWRON, return the previous PHY_CONF0 in *prev.
+ */
+uint8_t
+rk_drm_hw_hdmi_phy_blank(struct rk_drm_softc *sc)
+{
+	uint8_t conf0, off;
+
+	if (sc->hdmi_va == 0)
+		return (0);
+	conf0 = rk_drm_hdmi_read1(sc, RK_DRM_HDMI_PHY_CONF0);
+	off = (uint8_t)((conf0 & ~RK_DRM_HDMI_PHY_CONF0_TXPWRON) |
+	    RK_DRM_HDMI_PHY_CONF0_PDDQ);
+	rk_drm_hdmi_write1(sc, RK_DRM_HDMI_PHY_CONF0, off);
+	return (conf0);
+}
+
+void
+rk_drm_hw_hdmi_phy_restore(struct rk_drm_softc *sc, uint8_t prev)
+{
+	if (sc->hdmi_va == 0)
+		return;
+	rk_drm_hdmi_write1(sc, RK_DRM_HDMI_PHY_CONF0, prev);
 }
 
 int
