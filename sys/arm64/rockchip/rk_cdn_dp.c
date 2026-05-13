@@ -319,6 +319,39 @@ int iic_dp_aux_add_bus(device_t dev, const char *name,
 #define	RK_CDN_DP_DPTX_GET_EDID		0x02
 #define	RK_CDN_DP_DPTX_READ_DPCD	0x03
 #define	RK_CDN_DP_DPTX_SET_VIDEO	0x0c
+#define	RK_CDN_DP_DPTX_SET_AUDIO	0x0d
+
+/*
+ * Audio sub-block MMIO registers (within the cdn-dp 0xfec00000..fed00000
+ * range mapped via RK_CDN_DP_RES_MEM).  Offsets from RK3399 Linux 4.4
+ * BSP cdn-dp-reg.h.
+ */
+#define	RK_CDN_DP_AUDIO_SRC_CNTL	0x30000
+#define	RK_CDN_DP_AUDIO_SRC_CNFG	0x30004
+#define	RK_CDN_DP_COM_CH_STTS_BITS	0x30008
+#define	RK_CDN_DP_STTS_BIT_CH(x)	(0x3000c + ((x) << 2))
+#define	RK_CDN_DP_SPDIF_CTRL_ADDR	0x3004c
+#define	RK_CDN_DP_SMPL2PKT_CNTL		0x30080
+#define	RK_CDN_DP_SMPL2PKT_CNFG		0x30084
+#define	RK_CDN_DP_FIFO_CNTL		0x30088
+#define	RK_CDN_DP_AUDIO_PACK_CONTROL	0x2214	/* mailbox write target */
+#define	RK_CDN_DP_DP_VB_ID		0x2258	/* mailbox bit access */
+
+/* Audio config bit fields. */
+#define	RK_CDN_DP_AUDIO_PACK_EN		(1U << 8)
+#define	RK_CDN_DP_AUDIO_SW_RST		(1U << 0)
+#define	RK_CDN_DP_SMPL2PKT_EN		(1U << 1)
+#define	RK_CDN_DP_I2S_DEC_START		(1U << 1)
+#define	RK_CDN_DP_SYNC_WR_TO_CH_ZERO	(1U << 1)
+#define	RK_CDN_DP_AUDIO_TYPE_LPCM	(2U << 7)
+#define	RK_CDN_DP_TRANS_SMPL_WIDTH_32	(2U << 11)
+#define	RK_CDN_DP_MAX_NUM_CH(x)		((((x) & 0x1f) - 1) & 0x1f)
+#define	RK_CDN_DP_NUM_OF_I2S_PORTS(x)	((((x) / 2 - 1) & 0x3) << 5)
+#define	RK_CDN_DP_CFG_SUB_PCKT_NUM(x)	((((x) - 1) & 0x7) << 11)
+#define	RK_CDN_DP_AUDIO_CH_NUM(x)	((((x) - 1) & 0x1f) << 2)
+#define	RK_CDN_DP_I2S_DEC_PORT_EN(x)	(((x) & 0xf) << 17)
+#define	RK_CDN_DP_SAMPLING_FREQ(x)	(((x) & 0xf) << 16)
+#define	RK_CDN_DP_ORIGINAL_SAMP_FREQ(x)	(((x) & 0xf) << 24)
 #define	RK_CDN_DP_DPTX_WRITE_FIELD	0x08
 #define	RK_CDN_DP_MAX_EDID_BLOCKS	2
 
@@ -635,6 +668,10 @@ int		rk_cdn_dp_get_cached_edid(device_t dev, uint8_t *buf,
 		    size_t len);
 int		rk_cdn_dp_auto_bringup_default(void);
 int		rk_cdn_dp_retrain_default(void);
+int		rk_cdn_dp_audio_mute(bool mute);
+int		rk_cdn_dp_audio_start(int channels, int sample_rate,
+		    int sample_width);
+int		rk_cdn_dp_audio_stop(void);
 int		rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 		    uint16_t hsync_start, uint16_t hsync_end, uint16_t htotal,
 		    uint16_t vdisplay, uint16_t vsync_start, uint16_t vsync_end,
@@ -2142,6 +2179,34 @@ rk_cdn_dp_sysctl_retrain_now(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 	(void)sc;	/* retrain_default looks up softc itself */
 	return (rk_cdn_dp_retrain_default());
+}
+
+static int
+rk_cdn_dp_sysctl_audio_start_now(SYSCTL_HANDLER_ARGS)
+{
+	int error, val = 0;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+	(void)arg1;
+	return (rk_cdn_dp_audio_start(2, 48000, 16));
+}
+
+static int
+rk_cdn_dp_sysctl_audio_stop_now(SYSCTL_HANDLER_ARGS)
+{
+	int error, val = 0;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+	(void)arg1;
+	return (rk_cdn_dp_audio_stop());
 }
 
 /*
@@ -4484,6 +4549,164 @@ rk_cdn_dp_retrain_default(void)
 	return (error);
 }
 
+/*
+ * USB-C DP audio bring-up — I2S input path (HDMI audio also runs via
+ * I2S2 today, so reusing the same data wires).  Ported from the
+ * Rockchip 4.4 BSP cdn-dp-reg.c (cdn_dp_audio_config_i2s + helpers).
+ * Caller fixes 2-channel LPCM, 48 kHz, 16-bit for the first cut;
+ * tunables for other rates can come later.
+ */
+static int
+rk_cdn_dp_audio_config_i2s_locked(struct rk_cdn_dp_softc *sc,
+    int channels, int sample_rate, int sample_width, int lanes)
+{
+	uint32_t val;
+	int sub_pckt_num = 1;
+	int i2s_port_en_val = 0xf;
+	int i;
+
+	if (channels == 2) {
+		sub_pckt_num = (lanes == 1) ? 2 : 4;
+		i2s_port_en_val = 1;
+	} else if (channels == 4) {
+		i2s_port_en_val = 3;
+	}
+
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SPDIF_CTRL_ADDR, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_FIFO_CNTL,
+	    RK_CDN_DP_SYNC_WR_TO_CH_ZERO);
+
+	val = RK_CDN_DP_MAX_NUM_CH(channels) |
+	    RK_CDN_DP_NUM_OF_I2S_PORTS(channels) |
+	    RK_CDN_DP_AUDIO_TYPE_LPCM |
+	    RK_CDN_DP_CFG_SUB_PCKT_NUM(sub_pckt_num);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SMPL2PKT_CNFG, val);
+
+	if (sample_width == 16)
+		val = 0;
+	else if (sample_width == 24)
+		val = (1U << 9);
+	else
+		val = (2U << 9);
+	val |= RK_CDN_DP_AUDIO_CH_NUM(channels) |
+	    RK_CDN_DP_I2S_DEC_PORT_EN(i2s_port_en_val) |
+	    RK_CDN_DP_TRANS_SMPL_WIDTH_32;
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNFG, val);
+
+	/* Per-channel IEC 60958 status bits. */
+	for (i = 0; i < (channels + 1) / 2; i++) {
+		if (sample_width == 16)
+			val = (0x02 << 8) | (0x02 << 20);
+		else
+			val = (0x0b << 8) | (0x0b << 20);
+		val |= ((2 * i) << 4) | ((2 * i + 1) << 16);
+		rk_cdn_dp_write_4(sc, RK_CDN_DP_STTS_BIT_CH(i), val);
+	}
+
+	/* Sample-rate / original-frequency channel status. */
+	switch (sample_rate) {
+	case 32000:  val = RK_CDN_DP_SAMPLING_FREQ(3)   | RK_CDN_DP_ORIGINAL_SAMP_FREQ(0xc); break;
+	case 44100:  val = RK_CDN_DP_SAMPLING_FREQ(0)   | RK_CDN_DP_ORIGINAL_SAMP_FREQ(0xf); break;
+	case 48000:  val = RK_CDN_DP_SAMPLING_FREQ(2)   | RK_CDN_DP_ORIGINAL_SAMP_FREQ(0xd); break;
+	case 88200:  val = RK_CDN_DP_SAMPLING_FREQ(8)   | RK_CDN_DP_ORIGINAL_SAMP_FREQ(7);   break;
+	case 96000:  val = RK_CDN_DP_SAMPLING_FREQ(0xa) | RK_CDN_DP_ORIGINAL_SAMP_FREQ(5);   break;
+	case 176400: val = RK_CDN_DP_SAMPLING_FREQ(0xc) | RK_CDN_DP_ORIGINAL_SAMP_FREQ(3);   break;
+	case 192000: val = RK_CDN_DP_SAMPLING_FREQ(0xe) | RK_CDN_DP_ORIGINAL_SAMP_FREQ(1);   break;
+	default:
+		device_printf(sc->dev,
+		    "audio_config: unsupported sample rate %d\n", sample_rate);
+		return (EINVAL);
+	}
+	val |= 4;
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_COM_CH_STTS_BITS, val);
+
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SMPL2PKT_CNTL,
+	    RK_CDN_DP_SMPL2PKT_EN);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNTL,
+	    RK_CDN_DP_I2S_DEC_START);
+
+	return (rk_cdn_dp_mailbox_reg_write(sc,
+	    RK_CDN_DP_AUDIO_PACK_CONTROL, RK_CDN_DP_AUDIO_PACK_EN));
+}
+
+int
+rk_cdn_dp_audio_mute(bool mute)
+{
+	devclass_t dc;
+	device_t dev;
+	struct rk_cdn_dp_softc *sc;
+
+	dc = devclass_find("rk_cdn_dp");
+	dev = dc != NULL ? devclass_get_device(dc, 0) : NULL;
+	sc = dev != NULL ? device_get_softc(dev) : NULL;
+	if (sc == NULL)
+		return (ENXIO);
+	return (rk_cdn_dp_mailbox_reg_write_bit(sc,
+	    RK_CDN_DP_DP_VB_ID, 4, 1, mute ? 1 : 0));
+}
+
+int
+rk_cdn_dp_audio_start(int channels, int sample_rate, int sample_width)
+{
+	devclass_t dc;
+	device_t dev;
+	struct rk_cdn_dp_softc *sc;
+	int error;
+
+	dc = devclass_find("rk_cdn_dp");
+	dev = dc != NULL ? devclass_get_device(dc, 0) : NULL;
+	sc = dev != NULL ? device_get_softc(dev) : NULL;
+	if (sc == NULL)
+		return (ENXIO);
+
+	(void)rk_cdn_dp_audio_mute(true);
+	error = rk_cdn_dp_audio_config_i2s_locked(sc, channels,
+	    sample_rate, sample_width, sc->link_plan_lanes);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "audio_start: config failed %d\n", error);
+		return (error);
+	}
+	(void)rk_cdn_dp_audio_mute(false);
+	device_printf(sc->dev,
+	    "audio_start: I2S %dch %dHz %dbit unmuted\n",
+	    channels, sample_rate, sample_width);
+	return (0);
+}
+
+int
+rk_cdn_dp_audio_stop(void)
+{
+	devclass_t dc;
+	device_t dev;
+	struct rk_cdn_dp_softc *sc;
+
+	dc = devclass_find("rk_cdn_dp");
+	dev = dc != NULL ? devclass_get_device(dc, 0) : NULL;
+	sc = dev != NULL ? device_get_softc(dev) : NULL;
+	if (sc == NULL)
+		return (ENXIO);
+
+	(void)rk_cdn_dp_audio_mute(true);
+	(void)rk_cdn_dp_mailbox_reg_write(sc,
+	    RK_CDN_DP_AUDIO_PACK_CONTROL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SPDIF_CTRL_ADDR, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNTL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNFG, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNTL,
+	    RK_CDN_DP_AUDIO_SW_RST);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNTL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SMPL2PKT_CNTL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SMPL2PKT_CNTL,
+	    RK_CDN_DP_AUDIO_SW_RST);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SMPL2PKT_CNTL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_FIFO_CNTL,
+	    RK_CDN_DP_AUDIO_SW_RST);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_FIFO_CNTL, 0);
+	device_printf(sc->dev, "audio_stop: muted + reset\n");
+	return (0);
+}
+
 int
 rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
     uint16_t hsync_start, uint16_t hsync_end, uint16_t htotal,
@@ -6155,6 +6378,14 @@ rk_cdn_dp_attach(device_t dev)
 	    sc, 0, rk_cdn_dp_sysctl_retrain_now, "I",
 	    "Write 1 to re-run DP link training (CR+EQ) without resetting fw/framer; "
 	    "use when sink signals LINK_STATUS_UPDATED / HPD_IRQ");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "audio_start_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_audio_start_now, "I",
+	    "Write 1 to configure + unmute DP audio (I2S2, 2ch 48kHz 16bit)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "audio_stop_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_audio_stop_now, "I",
+	    "Write 1 to mute + reset DP audio packetizer");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "display_power", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_display_power, "I",

@@ -143,6 +143,10 @@ struct rk_drm_softc {
 	struct callout		audio_refill_co;
 	vm_offset_t		i2s2_va;
 	bool			audio_refill_running;
+	bool			audio_sine_running;	/* refill writes sine
+						 * wave samples instead of
+						 * silence — DP audio test */
+	uint32_t		audio_sine_phase;
 
 	bus_space_handle_t	vop_bsh;
 	bus_space_handle_t	vop_lit_bsh;	/* VOP_LIT @ 0xff8f0000 (dual-VOP) */

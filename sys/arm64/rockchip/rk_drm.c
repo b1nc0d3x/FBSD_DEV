@@ -1386,6 +1386,36 @@ rk_drm_sysctl_audio_refill(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * rk_drm_sysctl_audio_sine
+ *
+ * Toggle a 480 Hz test tone (sine table, ~-12 dBFS, stereo) inside
+ * the existing I2S2 refill callout.  Useful for verifying a freshly
+ * configured DP audio path actually emits packets the sink can play.
+ * Requires audio_refill=1 first so the callout is alive; this just
+ * tells the callout to write sine samples instead of silence.
+ */
+static int
+rk_drm_sysctl_audio_sine(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val;
+
+	sc = arg1;
+	val = sc->audio_sine_running ? 1 : 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 0 && val != 1)
+		return (EINVAL);
+	sc->audio_sine_running = (val != 0);
+	if (sc->audio_sine_running)
+		sc->audio_sine_phase = 0;
+	device_printf(sc->dev, "audio_sine: %s\n",
+	    sc->audio_sine_running ? "ON (480 Hz)" : "off");
+	return (0);
+}
+
+/*
  * rk_drm_sysctl_audio_i2s_start
  *
  * Sysctl handler for `dev.rk_drm.<unit>.audio_i2s_start`.  Writing 1
@@ -3324,6 +3354,12 @@ rk_drm_attach(device_t dev)
 		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 		    sc, 0, rk_drm_sysctl_audio_refill, "I",
 		    "Write 1 to start continuous I2S2 silence refill, 0 to stop");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "audio_sine",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_audio_sine, "I",
+		    "Write 1 to make audio_refill write a 480 Hz sine tone instead of silence");
 	}
 
 	return (0);

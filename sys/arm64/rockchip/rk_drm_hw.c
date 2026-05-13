@@ -2014,6 +2014,27 @@ rk_drm_hw_audio_i2s_probe(struct rk_drm_softc *sc)
  * Caller (sysctl handler) must serialize start/stop so this routine
  * does not race with callout teardown.
  */
+/*
+ * 100-entry sine table, signed 16-bit, amplitude 8000 (~ -12 dBFS).
+ * At 48 kHz sample rate one cycle / 100 samples = 480 Hz test tone.
+ * Kept here so the refill callout never touches floats / m_sin().
+ */
+static const int16_t rk_drm_sine_table[100] = {
+	     0,   502,  1003,  1502,  1996,  2486,  2969,  3445,
+	  3912,  4370,  4818,  5253,  5677,  6086,  6481,  6860,
+	  7223,  7568,  7896,  8204,  8493,  8763,  9012,  9239,
+	  9446,  9630,  9793,  9933, 10050, 10145, 10217, 10266,
+	 10291, 10293, 10272, 10227, 10160, 10069,  9956,  9821,
+	  9663,  9484,  9285,  9065,  8826,  8568,  8292,  7999,
+	  7689,  7363,  7022,  6668,  6300,  5919,  5527,  5125,
+	  4713,  4292,  3863,  3428,  2987,  2541,  2092,  1640,
+	  1186,   731,   276,  -180,  -634, -1088, -1539, -1988,
+	 -2433, -2873, -3308, -3736, -4156, -4569, -4972, -5365,
+	 -5747, -6117, -6474, -6818, -7148, -7462, -7761, -8042,
+	 -8307, -8552, -8779, -8985, -9171, -9335, -9477, -9595,
+	 -9690, -9760, -9805, -9826
+};
+
 static void
 rk_drm_hw_audio_i2s_refill(void *arg)
 {
@@ -2026,8 +2047,20 @@ rk_drm_hw_audio_i2s_refill(void *arg)
 
 	level = *(volatile uint32_t *)(sc->i2s2_va + 0x000c) & 0x3f;
 	free = 32 - (int)level;
-	for (i = 0; i < free; i++)
-		*(volatile uint32_t *)(sc->i2s2_va + 0x0024) = 0;
+	if (sc->audio_sine_running) {
+		for (i = 0; i < free; i++) {
+			uint32_t phase = sc->audio_sine_phase % 100;
+			int16_t s = rk_drm_sine_table[phase];
+			/* Pack stereo: same sample on L and R. */
+			uint32_t word = ((uint32_t)(uint16_t)s) |
+			    ((uint32_t)(uint16_t)s << 16);
+			*(volatile uint32_t *)(sc->i2s2_va + 0x0024) = word;
+			sc->audio_sine_phase = phase + 1;
+		}
+	} else {
+		for (i = 0; i < free; i++)
+			*(volatile uint32_t *)(sc->i2s2_va + 0x0024) = 0;
+	}
 
 	callout_reset_sbt(&sc->audio_refill_co, SBT_1MS / 2, 0,
 	    rk_drm_hw_audio_i2s_refill, sc, 0);
