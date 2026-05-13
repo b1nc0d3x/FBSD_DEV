@@ -118,6 +118,9 @@ struct rk_drm_softc {
 	vm_paddr_t		fb_pa;
 	size_t			fb_size;
 	uint32_t		stride;
+	void			*fb_stash;	/* alloc'd at attach, fb-sized
+						 * snapshot buffer for
+						 * fb_save / fb_restore */
 
 	/*
 	 * Stage-2 silence refill: callout reseeds I2S2's TX FIFO with
@@ -186,6 +189,15 @@ int	rk_drm_hw_modeset(struct rk_drm_softc *sc,
 int	rk_drm_hw_modeset_dp(struct rk_drm_softc *sc,
 	    const struct drm_display_mode *mode);
 
+/*
+ * Phase 1.2 dual-VOP: drive HDMI from VOP_LIT instead of VOP_BIG, so
+ * USB-C DP on VOP_BIG can coexist.  Flips the GRF mux + reprograms
+ * VOP_LIT timing.  Caller must arrange the GRF state at attach if
+ * they want USB-C DP to keep working concurrently.
+ */
+int	rk_drm_hw_modeset_hdmi_lit(struct rk_drm_softc *sc,
+	    const struct drm_display_mode *mode);
+
 /* Fill `mode` with our 1080p60 baseline -- used as the default at boot. */
 void	rk_drm_default_mode_fill(struct drm_display_mode *mode);
 
@@ -213,6 +225,15 @@ void	rk_drm_hw_hdmi_phy_restore(struct rk_drm_softc *sc, uint8_t prev);
  * sysctl.  Reads-only, no register modifications.
  */
 void	rk_drm_hw_signal_dump(struct rk_drm_softc *sc);
+
+/*
+ * Snapshot the active framebuffer into sc->fb_stash, or restore from
+ * the snapshot back into the scanout buffer.  Lets userspace
+ * preserve the on-screen image across mode/route flips that would
+ * otherwise wipe the GEM buffer.
+ */
+int	rk_drm_hw_fb_save(struct rk_drm_softc *sc);
+int	rk_drm_hw_fb_restore(struct rk_drm_softc *sc);
 
 /* HDMI audio diagnostics -- dump the relevant TX register state to dmesg. */
 void	rk_drm_hw_audio_dump(struct rk_drm_softc *sc);

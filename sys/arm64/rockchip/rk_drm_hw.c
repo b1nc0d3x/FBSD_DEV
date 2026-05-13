@@ -97,6 +97,7 @@
 #define RK_DRM_CRU_CLKGATE_CON28     0x0370
 #define RK_DRM_CRU_SOFTRST_CON17     0x0444
 #define RK_DRM_CRU_DRESETN_VOP0_REQ  (1u << 8)
+#define RK_DRM_CRU_DRESETN_VOP1_REQ  (1u << 9)
 #define RK_DRM_CRU_VPLL_CON2_LOCK    (1u << 31)
 #define RK_DRM_CRU_PLL_MODE_SLOW     (0u << 8)
 #define RK_DRM_CRU_PLL_MODE_NORMAL   (1u << 8)
@@ -957,6 +958,196 @@ rk_drm_vop_init_mode(struct rk_drm_softc *sc,
 		DELAY(40000);
 	}
 	sc->vop_scanning = true;
+}
+
+/*
+ * Phase 1.2: VOP setup for the HDMI output path running on VOP_LIT
+ * instead of VOP_BIG.  Mirrors rk_drm_vop_init_mode() (the HDMI variant
+ * for VOP_BIG) register-by-register but writes via rk_drm_vop_lit_*.
+ *
+ * Notes from signal_dump on the live board:
+ *   - U-Boot leaves VOP_LIT enabled (SYS_CTRL bits 11+RGB_EN already
+ *     set), so we don't need to bring the block up from cold or hit
+ *     the CRU reset path.  The pulse_dclk_reset + 40ms hard reset
+ *     path is skipped — we just reprogram timing in place.
+ *   - DCLK_VOP1 lives in CLKSEL_CON48 (0x01c0), not CON47.  Since
+ *     U-Boot already configured it for whatever idle scanout it
+ *     showed, leave the CRU writes off until we need to retune.
+ *
+ * GRF mux routing (HDMI_LCDC_SEL=1 → HDMI consumes VOP_LIT) is the
+ * caller's responsibility — set it before calling this function.
+ */
+static void
+rk_drm_vop_lit_init_mode_hdmi(struct rk_drm_softc *sc,
+    const struct drm_display_mode *mode)
+{
+	uint32_t hact_start, vact_start;
+	uint32_t sys_ctrl, dsp_ctrl0, dsp_ctrl1;
+	uint32_t stride_bytes, stride_words;
+
+	hact_start = rk_drm_mode_hact_start(mode);
+	vact_start = rk_drm_mode_vact_start(mode);
+
+	/*
+	 * VPLL programming (shared with VOP_BIG path).  This sets the
+	 * pixel-clock reference; both DCLK_VOP0 and DCLK_VOP1 source from
+	 * VPLL when their CLKSEL_CON*'s PLL_SEL bits are set.
+	 */
+	if (rk_drm_program_vpll(sc, mode->clock) != 0)
+		device_printf(sc->dev, "VPLL setup failed, continuing\n");
+
+	/*
+	 * VOP_LIT clock setup, per RK3399 TRM V1.4:
+	 *   CRU_CLKSEL_CON48 (0x01c0) — ACLK_VOP1 + HCLK_VOP1 (bus clocks)
+	 *   CRU_CLKSEL_CON50 (0x01c8) — DCLK_VOP1 (pixel clock!)
+	 *
+	 * Mirror the working VOP_BIG values:
+	 *   CON48 low: aclk_vop1_div_con=0x01, aclk_vop1_pll_sel=01 (CPLL),
+	 *              hclk_vop1_div_con=0x03 (the same layout the
+	 *              working VOP_BIG HDMI path uses on CON47).
+	 *   CON50 low: dclk_vop1_div_con=0x00 (/1), dclk_vop1_pll_sel=00
+	 *              (VPLL), dclk_vop1_dclk_sel=0 (divout).  Same as
+	 *              CON49 for DCLK_VOP0 in the working HDMI path.
+	 */
+	rk_drm_cru_write4(sc, 0x01c0,
+	    ((((0x1fu << 8) | (0x3u << 6) | 0x1fu) << 16) |
+	    ((3u << 8) | (1u << 6) | 1u)));
+	rk_drm_cru_write4(sc, 0x01c8,
+	    ((((1u << 11) | (0x3u << 8) | 0xffu) << 16) | 0x0000u));
+
+	/*
+	 * Pulse DCLK_VOP1 reset so the new CLKSEL_CON50 divider/PLL_SEL
+	 * actually latches into the divider state machine.  CRU SOFTRST
+	 * CON17 bit 9 = dresetn_vop1_req (per RK3399 TRM V1.4).
+	 */
+	rk_drm_cru_write4(sc, RK_DRM_CRU_SOFTRST_CON17,
+	    (RK_DRM_CRU_DRESETN_VOP1_REQ << 16) | RK_DRM_CRU_DRESETN_VOP1_REQ);
+	DELAY(1000);
+	rk_drm_cru_write4(sc, RK_DRM_CRU_SOFTRST_CON17,
+	    (RK_DRM_CRU_DRESETN_VOP1_REQ << 16));
+	DELAY(1000);
+
+	sys_ctrl = rk_drm_vop_lit_read4(sc, 0x0008);
+	dsp_ctrl0 = rk_drm_vop_lit_read4(sc, 0x0010);
+	dsp_ctrl1 = rk_drm_vop_lit_read4(sc, 0x0014);
+
+	sys_ctrl &= ~(RK_DRM_VOP_SYS_CTRL_STANDBY |
+	    RK_DRM_VOP_SYS_CTRL_MMU_EN |
+	    RK_DRM_VOP_SYS_CTRL_MIPI_EN |
+	    RK_DRM_VOP_SYS_CTRL_MIPI_DUAL);
+	sys_ctrl |= RK_DRM_VOP_SYS_CTRL_ENABLE |
+	    RK_DRM_VOP_SYS_CTRL_RGB_EN |
+	    RK_DRM_VOP_SYS_CTRL_HDMI_EN;
+	rk_drm_vop_lit_write4(sc, 0x0008, sys_ctrl);
+
+	dsp_ctrl0 &= ~RK_DRM_VOP_DSP_OUT_MODE_MASK;
+	dsp_ctrl0 |= RK_DRM_VOP_DSP_OUT_MODE_AAAA;
+	rk_drm_vop_lit_write4(sc, 0x0010, dsp_ctrl0);
+
+	{
+		uint32_t hdmi_pin_pol = 0;
+
+		if ((mode->flags & DRM_MODE_FLAG_NHSYNC) == 0)
+			hdmi_pin_pol |= (1u << 0);
+		if ((mode->flags & DRM_MODE_FLAG_NVSYNC) == 0)
+			hdmi_pin_pol |= (1u << 1);
+		dsp_ctrl1 &= ~(RK_DRM_VOP_DSP_CTRL1_HDMI_PIN_POL_MASK |
+		    RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL);
+		dsp_ctrl1 |= (hdmi_pin_pol & 0x7) << 20 |
+		    RK_DRM_VOP_DSP_CTRL1_HDMI_DCLK_POL;
+	}
+	rk_drm_vop_lit_write4(sc, 0x0014, dsp_ctrl1);
+
+	/*
+	 * WIN0 program — clone of rk_drm_vop_program_win0_opaque body
+	 * with HDMI route (no CSC upper bits, no alpha writes).  Uses
+	 * the shared GEM framebuffer (mirror mode for Phase 1.2).
+	 */
+	stride_bytes = roundup2(mode->hdisplay, 16) * (RK_DRM_BPP / 8);
+	stride_words = stride_bytes / 4;
+	rk_drm_vop_lit_write4(sc, 0x0038, 0x00000000);
+	rk_drm_vop_lit_write4(sc, 0x003c, stride_words);
+	rk_drm_vop_lit_write4(sc, 0x0040, (uint32_t)sc->fb_pa);
+	rk_drm_vop_lit_write4(sc, 0x0048,
+	    (((uint32_t)mode->vdisplay - 1) << 16) |
+	    ((uint32_t)mode->hdisplay - 1));
+	rk_drm_vop_lit_write4(sc, 0x004c,
+	    (((uint32_t)mode->vdisplay - 1) << 16) |
+	    ((uint32_t)mode->hdisplay - 1));
+	rk_drm_vop_lit_write4(sc, 0x0050,
+	    (vact_start << 16) | hact_start);
+	rk_drm_vop_lit_write4(sc, 0x006c, RK_DRM_VOP_WIN0_CTRL2_PRIMARY);
+	rk_drm_vop_lit_write4(sc, RK_DRM_VOP_POST_DSP_HACT_INFO,
+	    (hact_start << 16) | (hact_start + mode->hdisplay));
+	rk_drm_vop_lit_write4(sc, RK_DRM_VOP_POST_DSP_VACT_INFO,
+	    (vact_start << 16) | (vact_start + mode->vdisplay));
+	rk_drm_vop_lit_write4(sc, 0x0030,
+	    RK_DRM_VOP_WIN0_CTRL0_UPPER_HDMI |
+	    RK_DRM_VOP_WIN0_CTRL0_LOWER);
+
+	rk_drm_vop_lit_write4(sc, RK_DRM_VOP_DSP_HTOTAL_HS_END,
+	    ((uint32_t)mode->htotal << 16) | rk_drm_mode_hsync_len(mode));
+	rk_drm_vop_lit_write4(sc, RK_DRM_VOP_DSP_HACT_ST_END,
+	    (hact_start << 16) | (hact_start + mode->hdisplay));
+	rk_drm_vop_lit_write4(sc, RK_DRM_VOP_DSP_VTOTAL_VS_END,
+	    ((uint32_t)mode->vtotal << 16) | rk_drm_mode_vsync_len(mode));
+	rk_drm_vop_lit_write4(sc, RK_DRM_VOP_DSP_VACT_ST_END,
+	    (vact_start << 16) | (vact_start + mode->vdisplay));
+	rk_drm_vop_lit_write4(sc, 0x0000, 0x00010001);
+	sc->vop_lit_scanning = true;
+}
+
+/* Forward declarations — definitions live further down in this file. */
+static void rk_drm_dw_hdmi_init_mode(struct rk_drm_softc *sc,
+    const struct drm_display_mode *mode);
+static void rk_drm_dw_hdmi_finish_mode(struct rk_drm_softc *sc,
+    const struct drm_display_mode *mode);
+static int rk_drm_hdmi_phy_init(struct rk_drm_softc *sc,
+    const struct drm_display_mode *mode);
+static void rk_drm_hdmi_enable_hdmi_mode(struct rk_drm_softc *sc,
+    const struct drm_display_mode *mode);
+static void rk_drm_hdmi_configure_audio(struct rk_drm_softc *sc,
+    const struct drm_display_mode *mode);
+
+/*
+ * Phase 1.2: HDMI on VOP_LIT entry point.  Flips the GRF mux so HDMI
+ * consumes VOP_LIT's pixel stream (instead of VOP_BIG), reprograms
+ * VOP_LIT for the requested mode, then runs the existing dw-hdmi
+ * controller bring-up — that side of the pipeline is downstream of
+ * the GRF mux and works the same regardless of which VOP feeds it.
+ */
+int
+rk_drm_hw_modeset_hdmi_lit(struct rk_drm_softc *sc,
+    const struct drm_display_mode *mode)
+{
+	int error;
+
+	if (!sc->hw_attached)
+		return (ENXIO);
+	if (mode == NULL || !rk_drm_hw_mode_valid(mode))
+		return (EINVAL);
+
+	/* GRF SOC_CON20[6] = HDMI_LCDC_SEL: 1 = VOP_LIT -> HDMI. */
+	rk_drm_grf_write4(sc, RK_DRM_SYS_GRF_SOC_CON20,
+	    (RK_DRM_GRF_HDMI_LCDC_SEL << 16) | RK_DRM_GRF_HDMI_LCDC_SEL);
+
+	rk_drm_vop_lit_init_mode_hdmi(sc, mode);
+	rk_drm_dw_hdmi_init_mode(sc, mode);
+	error = rk_drm_hdmi_phy_init(sc, mode);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "HDMI-on-VOP_LIT: PHY init failed: %d\n", error);
+		return (error);
+	}
+	rk_drm_dw_hdmi_finish_mode(sc, mode);
+	rk_drm_hdmi_enable_hdmi_mode(sc, mode);
+	rk_drm_hdmi_configure_audio(sc, mode);
+
+	device_printf(sc->dev,
+	    "HDMI-on-VOP_LIT: modeset %ux%u@%u kHz active\n",
+	    mode->hdisplay, mode->vdisplay, mode->clock);
+	sc->hdmi_active = true;
+	return (0);
 }
 
 /*
@@ -2174,6 +2365,31 @@ rk_drm_hw_audio_dump(struct rk_drm_softc *sc)
  * Briefly drop HDMI TMDS output: clear PDDQ (which gates the PHY data
  * lanes off) and TXPWRON, return the previous PHY_CONF0 in *prev.
  */
+int
+rk_drm_hw_fb_save(struct rk_drm_softc *sc)
+{
+	if (sc->fb_va == 0 || sc->fb_size == 0)
+		return (ENXIO);
+	if (sc->fb_stash == NULL) {
+		sc->fb_stash = malloc(sc->fb_size, M_DEVBUF, M_WAITOK);
+		if (sc->fb_stash == NULL)
+			return (ENOMEM);
+	}
+	memcpy(sc->fb_stash, (void *)sc->fb_va, sc->fb_size);
+	return (0);
+}
+
+int
+rk_drm_hw_fb_restore(struct rk_drm_softc *sc)
+{
+	if (sc->fb_va == 0 || sc->fb_size == 0)
+		return (ENXIO);
+	if (sc->fb_stash == NULL)
+		return (ENOENT);
+	memcpy((void *)sc->fb_va, sc->fb_stash, sc->fb_size);
+	return (0);
+}
+
 void
 rk_drm_hw_signal_dump(struct rk_drm_softc *sc)
 {

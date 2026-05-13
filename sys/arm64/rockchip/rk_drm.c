@@ -140,6 +140,9 @@ static int rk_drm_sysctl_hdmi_modeset_now(SYSCTL_HANDLER_ARGS);
 static int rk_drm_sysctl_input_wink(SYSCTL_HANDLER_ARGS);
 static int rk_drm_sysctl_output_select(SYSCTL_HANDLER_ARGS);
 static int rk_drm_sysctl_signal_dump(SYSCTL_HANDLER_ARGS);
+static int rk_drm_sysctl_hdmi_lit_modeset_now(SYSCTL_HANDLER_ARGS);
+static int rk_drm_sysctl_fb_save(SYSCTL_HANDLER_ARGS);
+static int rk_drm_sysctl_fb_restore(SYSCTL_HANDLER_ARGS);
 static bool rk_drm_hdmi_hpd_locked(struct rk_drm_softc *sc);
 static int rk_drm_output_route_locked(struct rk_drm_softc *sc);
 
@@ -962,6 +965,73 @@ rk_drm_sysctl_input_wink(SYSCTL_HANDLER_ARGS)
 		return (0);
 	}
 	return (EINVAL);
+}
+
+/*
+ * fb_save / fb_restore: snapshot the scanout framebuffer into a
+ * kernel-side stash and restore it later.  Lets userspace preserve
+ * what's on screen across destructive route/mode flips that would
+ * otherwise wipe the GEM buffer.  Usage:
+ *     sysctl dev.rk_drm.0.fb_save=1     # before the flip
+ *     <do the flip>
+ *     sysctl dev.rk_drm.0.fb_restore=1  # after, image returns
+ */
+static int
+rk_drm_sysctl_fb_save(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+	return (rk_drm_hw_fb_save(sc));
+}
+
+static int
+rk_drm_sysctl_fb_restore(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+	return (rk_drm_hw_fb_restore(sc));
+}
+
+/*
+ * hdmi_lit_modeset_now: Phase 1.2 manual test entry.  Writes the
+ * default HDMI mode to VOP_LIT and flips the GRF HDMI mux to
+ * VOP_LIT, leaving VOP_BIG untouched so USB-C DP (if running) keeps
+ * scanning out from VOP_BIG.  Use to validate dual-VOP coexistence
+ * before wiring this into the AUTO route logic.
+ */
+static int
+rk_drm_sysctl_hdmi_lit_modeset_now(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	struct drm_display_mode mode;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	rk_drm_mode_fill_default(&mode);
+	mtx_lock(&sc->hw_lock);
+	error = rk_drm_hw_modeset_hdmi_lit(sc, &mode);
+	mtx_unlock(&sc->hw_lock);
+	return (error);
 }
 
 /*
@@ -3105,6 +3175,24 @@ rk_drm_attach(device_t dev)
 		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 		    sc, 0, rk_drm_sysctl_signal_dump, "I",
 		    "Write 1 to dump current state of both VOP/HDMI/DP pipelines to dmesg");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "hdmi_lit_modeset_now",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_hdmi_lit_modeset_now, "I",
+		    "Phase 1.2: write 1 to route HDMI through VOP_LIT (leaves VOP_BIG free for USB-C DP)");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "fb_save",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_fb_save, "I",
+		    "Write 1 to snapshot the active framebuffer into a kernel stash");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "fb_restore",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_fb_restore, "I",
+		    "Write 1 to restore the framebuffer from the stash");
 
 		SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "dual_vop",
