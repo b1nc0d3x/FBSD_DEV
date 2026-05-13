@@ -92,6 +92,10 @@ struct rk_drm_softc {
 	bool			vop_scanning;	/* VOP scanout is live; skip
 						 * destructive dclk reset on
 						 * subsequent modesets. */
+	bool			vop_lit_scanning;
+	bool			dual_vop_enabled; /* tunable mirror */
+	bool			hdmi_active;	/* dual mode: HDMI on VOP_LIT */
+	bool			dp_active;	/* dual mode: DP on VOP_BIG */
 	bool			hpd_task_running;
 	bool			vblank_task_running;
 	bool			hpd_state_valid;
@@ -128,17 +132,21 @@ struct rk_drm_softc {
 	bool			audio_refill_running;
 
 	bus_space_handle_t	vop_bsh;
+	bus_space_handle_t	vop_lit_bsh;	/* VOP_LIT @ 0xff8f0000 (dual-VOP) */
 	bus_space_handle_t	grf_bsh;
 	bus_space_handle_t	pmu_bsh;
 	bus_space_handle_t	pmucru_bsh;
 	bus_space_handle_t	cru_bsh;
 	vm_offset_t		vop_va;
+	vm_offset_t		vop_lit_va;	/* dual-VOP path */
 	vm_offset_t		grf_va;
 	vm_offset_t		pmu_va;
 	vm_offset_t		pmucru_va;
 	vm_offset_t		cru_va;
 	vm_offset_t		hdmi_va;
 	vm_paddr_t		vop_pa;
+	vm_paddr_t		vop_lit_pa;	/* dual-VOP path */
+	size_t			vop_lit_size;
 	vm_paddr_t		grf_pa;
 	vm_paddr_t		pmu_pa;
 	vm_paddr_t		pmucru_pa;
@@ -199,6 +207,12 @@ bool	rk_drm_hw_hpd(struct rk_drm_softc *sc);
  */
 uint8_t	rk_drm_hw_hdmi_phy_blank(struct rk_drm_softc *sc);
 void	rk_drm_hw_hdmi_phy_restore(struct rk_drm_softc *sc, uint8_t prev);
+
+/*
+ * Dump VOP_BIG + VOP_LIT scanout state to dmesg for the signal_dump
+ * sysctl.  Reads-only, no register modifications.
+ */
+void	rk_drm_hw_signal_dump(struct rk_drm_softc *sc);
 
 /* HDMI audio diagnostics -- dump the relevant TX register state to dmesg. */
 void	rk_drm_hw_audio_dump(struct rk_drm_softc *sc);

@@ -350,6 +350,21 @@ rk_drm_vop_write4(struct rk_drm_softc *sc, size_t off, uint32_t val)
 	    BUS_SPACE_BARRIER_WRITE);
 }
 
+/* VOP_LIT MMIO read/write — same register layout as VOP_BIG, different base. */
+static inline uint32_t
+rk_drm_vop_lit_read4(struct rk_drm_softc *sc, size_t off)
+{
+	return (bus_space_read_4(fdtbus_bs_tag, sc->vop_lit_bsh, off));
+}
+
+static inline void
+rk_drm_vop_lit_write4(struct rk_drm_softc *sc, size_t off, uint32_t val)
+{
+	bus_space_write_4(fdtbus_bs_tag, sc->vop_lit_bsh, off, val);
+	bus_space_barrier(fdtbus_bs_tag, sc->vop_lit_bsh, off, 4,
+	    BUS_SPACE_BARRIER_WRITE);
+}
+
 static inline void
 rk_drm_grf_write4(struct rk_drm_softc *sc, size_t off, uint32_t val)
 {
@@ -2159,6 +2174,69 @@ rk_drm_hw_audio_dump(struct rk_drm_softc *sc)
  * Briefly drop HDMI TMDS output: clear PDDQ (which gates the PHY data
  * lanes off) and TXPWRON, return the previous PHY_CONF0 in *prev.
  */
+void
+rk_drm_hw_signal_dump(struct rk_drm_softc *sc)
+{
+	uint32_t big_sys, big_win, big_ht, big_va;
+	uint32_t lit_sys, lit_win, lit_ht, lit_va;
+	uint32_t grf_con9, grf_con20;
+
+	if (sc->vop_va == 0) {
+		device_printf(sc->dev,
+		    "signal_dump: VOP_BIG not mapped\n");
+		return;
+	}
+	big_sys = rk_drm_vop_read4(sc, 0x0008);
+	big_win = rk_drm_vop_read4(sc, 0x0030);
+	big_ht  = rk_drm_vop_read4(sc, RK_DRM_VOP_DSP_HTOTAL_HS_END);
+	big_va  = rk_drm_vop_read4(sc, RK_DRM_VOP_DSP_VACT_ST_END);
+	device_printf(sc->dev,
+	    "signal_dump: VOP_BIG SYS_CTRL=%#x WIN0=%#x HTOTAL=%#x VACT=%#x\n",
+	    big_sys, big_win, big_ht, big_va);
+	device_printf(sc->dev,
+	    "signal_dump: VOP_BIG decode ENABLE=%d STANDBY=%d RGB_EN=%d "
+	    "HDMI_EN=%d EDP_EN=%d\n",
+	    !!(big_sys & RK_DRM_VOP_SYS_CTRL_ENABLE),
+	    !!(big_sys & RK_DRM_VOP_SYS_CTRL_STANDBY),
+	    !!(big_sys & RK_DRM_VOP_SYS_CTRL_RGB_EN),
+	    !!(big_sys & RK_DRM_VOP_SYS_CTRL_HDMI_EN),
+	    !!(big_sys & RK_DRM_VOP_SYS_CTRL_EDP_EN));
+
+	if (sc->vop_lit_va != 0) {
+		lit_sys = rk_drm_vop_lit_read4(sc, 0x0008);
+		lit_win = rk_drm_vop_lit_read4(sc, 0x0030);
+		lit_ht  = rk_drm_vop_lit_read4(sc,
+		    RK_DRM_VOP_DSP_HTOTAL_HS_END);
+		lit_va  = rk_drm_vop_lit_read4(sc,
+		    RK_DRM_VOP_DSP_VACT_ST_END);
+		device_printf(sc->dev,
+		    "signal_dump: VOP_LIT SYS_CTRL=%#x WIN0=%#x "
+		    "HTOTAL=%#x VACT=%#x\n",
+		    lit_sys, lit_win, lit_ht, lit_va);
+		device_printf(sc->dev,
+		    "signal_dump: VOP_LIT decode ENABLE=%d STANDBY=%d "
+		    "RGB_EN=%d HDMI_EN=%d EDP_EN=%d\n",
+		    !!(lit_sys & RK_DRM_VOP_SYS_CTRL_ENABLE),
+		    !!(lit_sys & RK_DRM_VOP_SYS_CTRL_STANDBY),
+		    !!(lit_sys & RK_DRM_VOP_SYS_CTRL_RGB_EN),
+		    !!(lit_sys & RK_DRM_VOP_SYS_CTRL_HDMI_EN),
+		    !!(lit_sys & RK_DRM_VOP_SYS_CTRL_EDP_EN));
+	} else {
+		device_printf(sc->dev,
+		    "signal_dump: VOP_LIT not mapped\n");
+	}
+
+	grf_con9  = rk_drm_grf_read4(sc, RK_DRM_SYS_GRF_SOC_CON9);
+	grf_con20 = rk_drm_grf_read4(sc, RK_DRM_SYS_GRF_SOC_CON20);
+	device_printf(sc->dev,
+	    "signal_dump: GRF SOC_CON9=%#x SOC_CON20=%#x "
+	    "(DP_SEL_VOP_LIT=%d EDP_LCDC_SEL=%d HDMI_LCDC_SEL=%d)\n",
+	    grf_con9, grf_con20,
+	    !!(grf_con9 & RK_DRM_GRF_DP_SEL_VOP_LIT),
+	    !!(grf_con20 & RK_DRM_GRF_EDP_LCDC_SEL),
+	    !!(grf_con20 & RK_DRM_GRF_HDMI_LCDC_SEL));
+}
+
 uint8_t
 rk_drm_hw_hdmi_phy_blank(struct rk_drm_softc *sc)
 {
@@ -2236,6 +2314,8 @@ rk_drm_hw_unmap(struct rk_drm_softc *sc)
 		bus_space_unmap(fdtbus_bs_tag, sc->grf_bsh, sc->grf_size);
 	if (sc->vop_va != 0)
 		bus_space_unmap(fdtbus_bs_tag, sc->vop_bsh, sc->vop_size);
+	if (sc->vop_lit_va != 0)
+		bus_space_unmap(fdtbus_bs_tag, sc->vop_lit_bsh, sc->vop_lit_size);
 
 	sc->hdmi_va = 0;
 	sc->cru_va = 0;
@@ -2243,6 +2323,7 @@ rk_drm_hw_unmap(struct rk_drm_softc *sc)
 	sc->pmu_va = 0;
 	sc->grf_va = 0;
 	sc->vop_va = 0;
+	sc->vop_lit_va = 0;
 }
 
 int
@@ -2268,6 +2349,22 @@ rk_drm_hw_attach(struct rk_drm_softc *sc)
 		goto fail;
 	}
 	sc->vop_va = (vm_offset_t)sc->vop_bsh;
+
+	/*
+	 * VOP_LIT @ 0xff8f0000 — second VOP, register layout identical to
+	 * VOP_BIG.  Used by the dual-VOP coexistence path so HDMI can run
+	 * on VOP_LIT while USB-C DP runs on VOP_BIG independently.
+	 * Mapping unconditionally is cheap (one page) even when the
+	 * tunable hw.rk_drm.dual_vop is 0.
+	 */
+	sc->vop_lit_pa = 0xff8f0000;
+	sc->vop_lit_size = 0x10000;
+	if (bus_space_map(fdtbus_bs_tag, sc->vop_lit_pa, sc->vop_lit_size, 0,
+	    &sc->vop_lit_bsh) != 0) {
+		error = ENXIO;
+		goto fail;
+	}
+	sc->vop_lit_va = (vm_offset_t)sc->vop_lit_bsh;
 
 	sc->grf_pa = 0xff770000;
 	sc->grf_size = 0x10000;

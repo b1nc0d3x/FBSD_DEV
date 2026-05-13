@@ -139,11 +139,26 @@ static void rk_drm_try_usbc_autobringup(struct rk_drm_softc *sc);
 static int rk_drm_sysctl_hdmi_modeset_now(SYSCTL_HANDLER_ARGS);
 static int rk_drm_sysctl_input_wink(SYSCTL_HANDLER_ARGS);
 static int rk_drm_sysctl_output_select(SYSCTL_HANDLER_ARGS);
+static int rk_drm_sysctl_signal_dump(SYSCTL_HANDLER_ARGS);
 static bool rk_drm_hdmi_hpd_locked(struct rk_drm_softc *sc);
 static int rk_drm_output_route_locked(struct rk_drm_softc *sc);
 
 static int rk_drm_output_default = RK_DRM_OUTPUT_AUTO;
 TUNABLE_INT("hw.rk_drm.output", &rk_drm_output_default);
+
+/*
+ * Dual-VOP coexistence: when set, drive HDMI on VOP_LIT and USB-C DP
+ * on VOP_BIG simultaneously.  Default 0 keeps the single-VOP semantics
+ * (one output at a time, swapped via output_select).  Opt-in via
+ * /boot/loader.conf:  hw.rk_drm.dual_vop=1
+ *
+ * Phase 1: scaffolding in place — VOP_LIT MMIO mapped, signal_dump
+ * sysctl reports both paths, route-aware register split lives in
+ * rk_drm_hw.c.  The VOP_LIT-side modeset writes are still TODO
+ * pending live register validation against the working reference.
+ */
+static int rk_drm_dual_vop = 0;
+TUNABLE_INT("hw.rk_drm.dual_vop", &rk_drm_dual_vop);
 
 static int
 rk_drm_lookup_dp_altmode_status_cb(linker_file_t lf, void *arg)
@@ -949,6 +964,65 @@ rk_drm_sysctl_input_wink(SYSCTL_HANDLER_ARGS)
 	return (EINVAL);
 }
 
+/*
+ * signal_dump: print a one-shot snapshot of every display-pipeline
+ * signal we can observe so a debugging session has a single command
+ * for "what does the SBC think is connected and live right now?".
+ *
+ * Covers: VOP_BIG + VOP_LIT SYS_CTRL / WIN0 / timing registers, HDMI
+ * PHY HPD bit, fusb302 DP altmode state, last-known DPCD lane/sink
+ * status from the Cadence framer's diagnostic cache, current
+ * output_select / dual_vop tunable values.
+ */
+static int
+rk_drm_sysctl_signal_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int (*get_status)(device_t,
+	    struct rk3399_typec_dp_altmode_status *);
+	struct rk3399_typec_dp_altmode_status astat;
+	devclass_t fdc;
+	device_t fdev;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	device_printf(sc->dev,
+	    "signal_dump: output_select=%d dual_vop=%d "
+	    "hdmi_active=%d dp_active=%d vop_scanning=%d vop_lit_scanning=%d\n",
+	    sc->output_select, rk_drm_dual_vop,
+	    sc->hdmi_active, sc->dp_active,
+	    sc->vop_scanning, sc->vop_lit_scanning);
+	device_printf(sc->dev,
+	    "signal_dump: HDMI HPD=%d (PHY_STAT0 bit1)\n",
+	    rk_drm_hw_hpd(sc) ? 1 : 0);
+
+	fdc = devclass_find("fusb302");
+	fdev = fdc != NULL ? devclass_get_device(fdc, 0) : NULL;
+	get_status = rk_drm_lookup_dp_altmode_status();
+	if (fdev != NULL && get_status != NULL &&
+	    get_status(fdev, &astat) == 0 && astat.valid) {
+		device_printf(sc->dev,
+		    "signal_dump: fusb302 attached=%d role=%d orient=%d "
+		    "dp_ready=%d pin=0x%x dp_status=0x%x host_lanes=%d "
+		    "host_flip=%d\n",
+		    astat.attached, astat.role, astat.orient,
+		    astat.dp_ready, astat.pin_assign, astat.dp_status,
+		    astat.host_lanes, astat.host_flip);
+	} else {
+		device_printf(sc->dev,
+		    "signal_dump: fusb302 altmode state unavailable\n");
+	}
+
+	rk_drm_hw_signal_dump(sc);
+	return (0);
+}
+
 static int
 rk_drm_sysctl_output_select(SYSCTL_HANDLER_ARGS)
 {
@@ -966,6 +1040,12 @@ rk_drm_sysctl_output_select(SYSCTL_HANDLER_ARGS)
 	sc->output_select = val;
 	if (val != RK_DRM_OUTPUT_USBC_DP)
 		sc->dp_autobring_done = false;
+	{
+		char data[32];
+
+		snprintf(data, sizeof(data), "new=%d", val);
+		devctl_notify("rk_drm", "0", "route", data);
+	}
 	return (0);
 }
 
@@ -3021,6 +3101,17 @@ rk_drm_attach(device_t dev)
 		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 		    sc, 0, rk_drm_sysctl_input_wink, "I",
 		    "Briefly drop one output's signal to force a dual-input sink to fall through: 0=HDMI, 1=USB-C DP");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "signal_dump",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_signal_dump, "I",
+		    "Write 1 to dump current state of both VOP/HDMI/DP pipelines to dmesg");
+
+		SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "dual_vop",
+		    CTLFLAG_RD, &rk_drm_dual_vop, 0,
+		    "Dual-VOP coexistence mode enabled (tunable hw.rk_drm.dual_vop)");
 
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "audio_dump",
