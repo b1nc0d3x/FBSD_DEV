@@ -163,6 +163,29 @@ TUNABLE_INT("hw.rk_drm.output", &rk_drm_output_default);
 static int rk_drm_dual_vop = 0;
 TUNABLE_INT("hw.rk_drm.dual_vop", &rk_drm_dual_vop);
 
+/*
+ * Settling delay between cdn-dp stage 19 returning and the auto-bringup
+ * modeset + video_active edge.  Without this, the framer goes IDLE→VALID
+ * while the DP link is still settling from training, and the panel
+ * shows transient black tears / flicker during USB-C boot.  500ms is
+ * empirically enough on the XYM W156F1.  Set to 0 to skip the delay.
+ */
+static int rk_drm_dp_settle_ms = 500;
+TUNABLE_INT("hw.rk_drm.dp_settle_ms", &rk_drm_dp_settle_ms);
+
+/*
+ * Pin WIN0 to the DMA-coherent boot framebuffer during the boot-time
+ * DP modeset, instead of letting it retarget to whatever crtc->fb the
+ * DRM core has bound (typically a vt(4)/fbdev allocation in
+ * non-coherent or write-combined memory).  Eliminates persistent black
+ * tears visible during USB-C boot bring-up until SLIM/Xorg takes over
+ * and replaces the FB with its own properly-rendered surface.
+ * Set to 0 to restore old behavior.
+ */
+static int rk_drm_dp_pin_boot_fb = 1;
+TUNABLE_INT("hw.rk_drm.dp_pin_boot_fb", &rk_drm_dp_pin_boot_fb);
+static int rk_drm_dp_first_modeset_done = 0;
+
 static int
 rk_drm_lookup_dp_altmode_status_cb(linker_file_t lf, void *arg)
 {
@@ -313,6 +336,14 @@ rk_drm_try_usbc_autobringup(struct rk_drm_softc *sc)
 		device_printf(sc->dev, "USB-C DP auto bring-up failed: %d\n",
 		    error);
 		return;
+	}
+
+	if (rk_drm_dp_settle_ms > 0) {
+		device_printf(sc->dev,
+		    "USB-C DP auto bring-up: settling %dms before modeset\n",
+		    rk_drm_dp_settle_ms);
+		pause_sbt("dpsettle",
+		    SBT_1MS * rk_drm_dp_settle_ms, 0, 0);
 	}
 
 	rk_drm_dp_mode_fill(&mode);
@@ -1416,6 +1447,117 @@ rk_drm_sysctl_audio_sine(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * rk_drm_sysctl_audio_i2s_match_armbian
+ *
+ * One-shot debug helper: rewrite I2S2 CKR and XFER to match the
+ * working Armbian (BSP 4.4) values observed during DP audio
+ * playback.  Verified empirically that Armbian uses:
+ *   CKR  = 0x00033f3f  (slower BCLK divider)
+ *   XFER = 0x00000003  (TXS + RXS both started)
+ * Our default path was CKR=0x00071f1f, XFER=0x00000001 — same
+ * audio sub-block state on cdn-dp side as Armbian, but Armbian
+ * plays through the panel speakers and we don't.  Toggle this to
+ * test whether the BCLK rate or the RX-also-started bit is what
+ * the cdn-dp audio packetizer actually needs.
+ */
+static int
+rk_drm_sysctl_audio_i2s_match_armbian(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val = 0;
+	uint32_t before_ckr, before_xfer, after_ckr, after_xfer;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+	sc = arg1;
+	if (sc == NULL || sc->i2s2_va == 0) {
+		device_printf(sc != NULL ? sc->dev : NULL,
+		    "audio_i2s_match_armbian: I2S2 not mapped — "
+		    "run audio_refill=1 first\n");
+		return (ENXIO);
+	}
+
+	before_ckr  = *(volatile uint32_t *)(sc->i2s2_va + 0x0008);
+	before_xfer = *(volatile uint32_t *)(sc->i2s2_va + 0x001c);
+
+	/* Stop, reprogram, restart. */
+	*(volatile uint32_t *)(sc->i2s2_va + 0x001c) = 0;
+	__asm volatile("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(sc->i2s2_va + 0x0008) = 0x00033f3f;
+	__asm volatile("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(sc->i2s2_va + 0x001c) = 0x00000003;
+	__asm volatile("dsb sy" ::: "memory");
+
+	after_ckr  = *(volatile uint32_t *)(sc->i2s2_va + 0x0008);
+	after_xfer = *(volatile uint32_t *)(sc->i2s2_va + 0x001c);
+
+	device_printf(sc->dev,
+	    "audio_i2s_match_armbian: CKR 0x%08x -> 0x%08x, "
+	    "XFER 0x%08x -> 0x%08x\n",
+	    before_ckr, after_ckr, before_xfer, after_xfer);
+	return (0);
+}
+
+/*
+ * rk_drm_sysctl_audio_i2s_dump
+ *
+ * Read back I2S2 controller register state + the live TX FIFO level
+ * plus refill counters.  Lets us confirm I2S2 is actually clocking
+ * samples out (XFER=1, FIFO drains between callouts) instead of just
+ * sitting full because the I2S clock isn't running.
+ */
+static int
+rk_drm_sysctl_audio_i2s_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_drm_softc *sc;
+	int error, val = 0;
+	uint32_t txcr, rxcr, ckr, fifolr, dmacr, intcr, intsr, xfer;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+	sc = arg1;
+	if (sc == NULL || sc->i2s2_va == 0) {
+		device_printf(sc != NULL ? sc->dev : NULL,
+		    "audio_i2s_dump: I2S2 not mapped yet "
+		    "(run audio_refill=1 first)\n");
+		return (ENXIO);
+	}
+
+	txcr   = *(volatile uint32_t *)(sc->i2s2_va + 0x0000);
+	rxcr   = *(volatile uint32_t *)(sc->i2s2_va + 0x0004);
+	ckr    = *(volatile uint32_t *)(sc->i2s2_va + 0x0008);
+	fifolr = *(volatile uint32_t *)(sc->i2s2_va + 0x000c);
+	dmacr  = *(volatile uint32_t *)(sc->i2s2_va + 0x0010);
+	intcr  = *(volatile uint32_t *)(sc->i2s2_va + 0x0014);
+	intsr  = *(volatile uint32_t *)(sc->i2s2_va + 0x0018);
+	xfer   = *(volatile uint32_t *)(sc->i2s2_va + 0x001c);
+
+	device_printf(sc->dev,
+	    "audio_i2s_dump: TXCR=0x%08x RXCR=0x%08x CKR=0x%08x XFER=0x%08x\n",
+	    txcr, rxcr, ckr, xfer);
+	device_printf(sc->dev,
+	    "audio_i2s_dump: DMACR=0x%08x INTCR=0x%08x INTSR=0x%08x\n",
+	    dmacr, intcr, intsr);
+	device_printf(sc->dev,
+	    "audio_i2s_dump: TXFIFOLR=0x%08x (TX_lvl=%u/32) "
+	    "refill_running=%d sine_running=%d phase=%u\n",
+	    fifolr, fifolr & 0x3f, (int)sc->audio_refill_running,
+	    (int)sc->audio_sine_running, sc->audio_sine_phase);
+	device_printf(sc->dev,
+	    "audio_i2s_dump: refill_calls=%ju refill_words=%ju\n",
+	    (uintmax_t)sc->audio_refill_calls,
+	    (uintmax_t)sc->audio_refill_words);
+
+	return (0);
+}
+
+/*
  * rk_drm_sysctl_audio_i2s_start
  *
  * Sysctl handler for `dev.rk_drm.<unit>.audio_i2s_start`.  Writing 1
@@ -2476,6 +2618,21 @@ rk_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 	if (rk_drm_output_route_locked(sc) == RK_DRM_OUTPUT_USBC_DP) {
 		int (*set_video_active)(bool);
 
+		/*
+		 * Let the cdn-dp framer + VOP pixel clock settle on the
+		 * fresh modeset before driving the framer to VALID.  Without
+		 * this delay the panel sees the IDLE→VALID transition while
+		 * the link is still stabilizing from training, producing
+		 * visible black tears during USB-C boot.  Tunable via
+		 * dev.rk_drm.0.dp_settle_ms (default 500ms).
+		 */
+		if (rk_drm_dp_settle_ms > 0) {
+			device_printf(sc->dev,
+			    "DP modeset: pre-video_active settle %dms\n",
+			    rk_drm_dp_settle_ms);
+			pause_sbt("dpsetl",
+			    SBT_1MS * rk_drm_dp_settle_ms, 0, 0);
+		}
 		set_video_active = rk_drm_lookup_set_video_active();
 		if (set_video_active != NULL) {
 			error = set_video_active(true);
@@ -2485,10 +2642,39 @@ rk_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 			if (error != 0)
 				return (-error);
 		}
+		/*
+		 * One final retrain after video_active.  Without this the
+		 * panel shows persistent transient black tears on USB-C boot
+		 * that only clear when Xorg-side modeset triggers its own
+		 * retrain.  Doing it ourselves at the tail of the boot
+		 * modeset closes the gap.  Empirically: pre-retrain
+		 * VIF_STATUS=0x800 PCK_STUFF_STATUS_0=0x...102; post-retrain
+		 * VIF_STATUS=0x2000 PCK_STUFF_STATUS_0=0x...802 — different
+		 * stable steady-state in the framer pipeline.
+		 */
+		if (!rk_drm_dp_first_modeset_done) {
+			int (*cdn_retrain)(void) = rk_drm_lookup_cdn_retrain();
+			if (cdn_retrain != NULL) {
+				int rerr = cdn_retrain();
+				device_printf(sc->dev,
+				    "DP modeset: post-bringup retrain err=%d\n",
+				    rerr);
+			}
+		}
 	}
 	sc->vblank_ticks = rk_drm_vblank_ticks_from_mode(active_mode);
 	if (crtc->fb == NULL)
 		return (0);
+	if (rk_drm_dp_pin_boot_fb && !rk_drm_dp_first_modeset_done &&
+	    rk_drm_output_route_locked(sc) == RK_DRM_OUTPUT_USBC_DP) {
+		device_printf(sc->dev,
+		    "DP modeset: pinning WIN0 to coherent boot FB fb_pa=0x%jx; "
+		    "skipping crtc->fb retarget until next modeset\n",
+		    (uintmax_t)sc->fb_pa);
+		rk_drm_dp_first_modeset_done = 1;
+		return (0);
+	}
+	rk_drm_dp_first_modeset_done = 1;
 	return (rk_drm_crtc_mode_set_base(crtc, x, y, old_fb));
 }
 
@@ -3313,6 +3499,18 @@ rk_drm_attach(device_t dev)
 		    CTLFLAG_RD, &rk_drm_dual_vop, 0,
 		    "Dual-VOP coexistence mode enabled (tunable hw.rk_drm.dual_vop)");
 
+		SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "dp_settle_ms",
+		    CTLFLAG_RW, &rk_drm_dp_settle_ms, 0,
+		    "USB-C DP settle delay (ms) between stage 19 and auto-bringup "
+		    "modeset (0 = skip); fixes black tears during boot bring-up");
+
+		SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "dp_pin_boot_fb",
+		    CTLFLAG_RW, &rk_drm_dp_pin_boot_fb, 0,
+		    "Keep WIN0 on coherent boot FB on first DP modeset "
+		    "(skip retarget to fbdev/vt FB) to suppress boot tears");
+
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "audio_dump",
 		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
@@ -3360,6 +3558,18 @@ rk_drm_attach(device_t dev)
 		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 		    sc, 0, rk_drm_sysctl_audio_sine, "I",
 		    "Write 1 to make audio_refill write a 480 Hz sine tone instead of silence");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "audio_i2s_dump",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_audio_i2s_dump, "I",
+		    "Write 1 to print I2S2 register state + TX FIFO level + refill counters");
+
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "audio_i2s_match_armbian",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, rk_drm_sysctl_audio_i2s_match_armbian, "I",
+		    "Write 1 to rewrite I2S2 CKR=0x33f3f, XFER=0x3 (match working Armbian)");
 	}
 
 	return (0);
