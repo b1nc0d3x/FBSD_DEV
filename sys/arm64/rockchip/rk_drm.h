@@ -147,6 +147,8 @@ struct rk_drm_softc {
 						 * wave samples instead of
 						 * silence — DP audio test */
 	uint32_t		audio_sine_phase;
+	uint64_t		audio_refill_calls;	/* callout count */
+	uint64_t		audio_refill_words;	/* int32 words written */
 
 	bus_space_handle_t	vop_bsh;
 	bus_space_handle_t	vop_lit_bsh;	/* VOP_LIT @ 0xff8f0000 (dual-VOP) */

@@ -2047,10 +2047,14 @@ rk_drm_hw_audio_i2s_refill(void *arg)
 
 	level = *(volatile uint32_t *)(sc->i2s2_va + 0x000c) & 0x3f;
 	free = 32 - (int)level;
+	sc->audio_refill_calls++;
 	if (sc->audio_sine_running) {
 		for (i = 0; i < free; i++) {
 			uint32_t phase = sc->audio_sine_phase % 100;
-			int16_t s = rk_drm_sine_table[phase];
+			int32_t boosted = (int32_t)rk_drm_sine_table[phase] * 3;
+			if (boosted > 32760) boosted = 32760;
+			else if (boosted < -32760) boosted = -32760;
+			int16_t s = (int16_t)boosted;
 			/* Pack stereo: same sample on L and R. */
 			uint32_t word = ((uint32_t)(uint16_t)s) |
 			    ((uint32_t)(uint16_t)s << 16);
@@ -2061,6 +2065,7 @@ rk_drm_hw_audio_i2s_refill(void *arg)
 		for (i = 0; i < free; i++)
 			*(volatile uint32_t *)(sc->i2s2_va + 0x0024) = 0;
 	}
+	sc->audio_refill_words += (uint64_t)free;
 
 	callout_reset_sbt(&sc->audio_refill_co, SBT_1MS / 2, 0,
 	    rk_drm_hw_audio_i2s_refill, sc, 0);
@@ -2097,11 +2102,22 @@ rk_drm_hw_audio_i2s_refill_start(struct rk_drm_softc *sc)
 		}
 	}
 
+	/*
+	 * Force I2S2 clock-divider + bidirectional XFER to match
+	 * Armbian BSP 4.4 values that the cdn-dp audio packetizer
+	 * actually accepts.  Empirically:
+	 *   CKR  = 0x00033f3f   (64-fs BCLK divider)
+	 *   XFER = 0x00000003   (start both TX and RX state machines)
+	 * Without these, DP audio packets reach the panel but never
+	 * decode.  Discovered via /dev/mem diff against working
+	 * Armbian (kernel 4.4.213-rockchip64) on the same board.
+	 */
+	*(volatile uint32_t *)(sc->i2s2_va + 0x0008) = 0x00033f3f;
 	/* Pre-seed FIFO with 32 zero samples */
 	for (i = 0; i < 32; i++)
 		*(volatile uint32_t *)(sc->i2s2_va + 0x0024) = 0;
-	/* Start TX */
-	*(volatile uint32_t *)(sc->i2s2_va + 0x001c) = 0x00000001;
+	/* Start TX + RX state machines */
+	*(volatile uint32_t *)(sc->i2s2_va + 0x001c) = 0x00000003;
 	__asm volatile("dsb sy" ::: "memory");
 
 	sc->audio_refill_running = true;
@@ -2166,7 +2182,7 @@ rk_drm_hw_audio_i2s_start(struct rk_drm_softc *sc)
 	vm_offset_t va;
 	const vm_paddr_t i2s2_pa = 0xff8a0000;
 	const size_t i2s2_size = 0x1000;
-	uint32_t txcr, ckr, xfer_before, xfer_after, intsr;
+	uint32_t txcr, xfer_before, xfer_after, intsr;
 	int i;
 
 	va = (vm_offset_t)pmap_mapdev(i2s2_pa, i2s2_size);
@@ -2176,7 +2192,6 @@ rk_drm_hw_audio_i2s_start(struct rk_drm_softc *sc)
 	}
 
 	txcr = *(volatile uint32_t *)(va + 0x0000);
-	ckr  = *(volatile uint32_t *)(va + 0x0008);
 
 	/* If TXCR is unprogrammed, set 16-bit I2S, 2-channel, normal IBM */
 	if (txcr == 0) {
@@ -2184,12 +2199,17 @@ rk_drm_hw_audio_i2s_start(struct rk_drm_softc *sc)
 		device_printf(sc->dev,
 		    "i2s2_start: TXCR was 0, programmed 0x0f (I2S 16-bit)\n");
 	}
-	/* If CKR is unprogrammed, set master mode, MDIV/RSD/TSD = 32 */
-	if (ckr == 0) {
-		*(volatile uint32_t *)(va + 0x0008) = 0x00071f1f;
-		device_printf(sc->dev,
-		    "i2s2_start: CKR was 0, programmed master/32-fs\n");
-	}
+	/*
+	 * CKR = 0x00033f3f matches what BSP 4.4 Armbian programs while
+	 * playing audio out of cdn-dp's I2S input.  We initially used
+	 * 0x00071f1f (32-fs BCLK divider) and the cdn-dp audio
+	 * packetizer accepted samples without complaint but the panel
+	 * speakers never decoded a thing.  Matching the slower (64-fs)
+	 * Armbian BCLK divider — captured via live /dev/mem diff —
+	 * unblocked audio on the XYM panel.  Always force this value
+	 * even if a prior driver left a different CKR programmed.
+	 */
+	*(volatile uint32_t *)(va + 0x0008) = 0x00033f3f;
 
 	/* Seed TX FIFO with 32 zero samples */
 	for (i = 0; i < 32; i++)
@@ -2197,8 +2217,16 @@ rk_drm_hw_audio_i2s_start(struct rk_drm_softc *sc)
 
 	xfer_before = *(volatile uint32_t *)(va + 0x001c);
 
-	/* Start TX */
-	*(volatile uint32_t *)(va + 0x001c) = 0x00000001;
+	/*
+	 * XFER = 0x3 starts BOTH TX and RX state machines.  Armbian's
+	 * I2S2 driver does this; ours used to start TX only (0x1).
+	 * The cdn-dp audio packetizer needs the RX-side state machine
+	 * to be alive (apparently for clock-distribution reasons —
+	 * undocumented, found empirically) for it to actually
+	 * propagate audio packets the sink will decode.  TX-only is
+	 * fine for HDMI audio but silent on the DP path.
+	 */
+	*(volatile uint32_t *)(va + 0x001c) = 0x00000003;
 	__asm volatile("dsb sy" ::: "memory");
 
 	/* Brief settle — XFER status reflects current state immediately */
