@@ -7,6 +7,14 @@
  * lives in rk_drm_hw.c; this overlay only exists so audio_soc has
  * both ends of the DAI link to bind.
  *
+ * NOTE: The base rk3399-rockpro64.dtsi already declares a stub
+ * hdmi-sound node (compatible = "simple-audio-card") without the
+ * required simple-audio-card,cpu / simple-audio-card,codec children
+ * and without an hdmi-audio-codec sibling node.  Re-declaring
+ * hdmi-sound at root in this overlay would conflict; instead we
+ * patch the existing node via &{/hdmi-sound} and add the missing
+ * codec sibling at root.
+ *
  * Build: included automatically by sys/dts/arm64/overlays/Makefile.
  * Install: cp .dtbo to /boot/dtb/overlays/, then in /boot/loader.conf:
  *     fdt_overlays="rk3399-rockpro64-hdmi-audio"
@@ -25,11 +33,9 @@
 };
 
 /*
- * Add a dummy codec child of the root.  audio_soc references it via
- * sound-dai = <&hdmi_audio_codec>, so it needs a phandle.  The
- * dummy_codec driver simply registers an OFW xref and provides an
- * empty audio_dai_init -- exactly what we want for a downstream sink
- * (the HDMI TX) that we configure outside the codec abstraction.
+ * Add the dummy codec at root (sibling of hdmi-sound).  audio_soc
+ * resolves &hdmi_audio_codec via this label so the codec attach
+ * succeeds and pcm_register() actually fires.
  */
 &{/} {
 	hdmi_audio_codec: hdmi-audio-codec {
@@ -37,30 +43,25 @@
 		#sound-dai-cells = <0>;
 		status = "okay";
 	};
+};
 
-	/*
-	 * simple-audio-card binding consumed by sys/dev/sound/fdt/audio_soc.c.
-	 * The CPU side is i2s2 (driven by rk_i2s.c), the codec side is the
-	 * placeholder above.  Format = i2s, BCLK = 64*LRCK, frame master
-	 * is the CPU side -- this matches what rk_drm_hdmi_configure_audio
-	 * already programmed for the HDMI TX.
-	 */
-	hdmi_sound: hdmi-sound {
-		compatible = "simple-audio-card";
-		simple-audio-card,name = "RK3399-HDMI";
-		simple-audio-card,format = "i2s";
-		simple-audio-card,mclk-fs = <256>;
-		simple-audio-card,frame-master = <&hdmi_sound_cpu>;
-		simple-audio-card,bitclock-master = <&hdmi_sound_cpu>;
-		status = "okay";
+/*
+ * Patch the existing /hdmi-sound (from base DTSI) — add the two
+ * required simple-audio-card child nodes that name the CPU + codec
+ * DAI references.  Without these audio_soc can't construct the link
+ * and the pcm device never appears.
+ */
+&{/hdmi-sound} {
+	simple-audio-card,frame-master = <&hdmi_sound_cpu>;
+	simple-audio-card,bitclock-master = <&hdmi_sound_cpu>;
+	status = "okay";
 
-		hdmi_sound_cpu: simple-audio-card,cpu {
-			sound-dai = <&{/i2s@ff8a0000}>;
-		};
+	hdmi_sound_cpu: simple-audio-card,cpu {
+		sound-dai = <&{/i2s@ff8a0000}>;
+	};
 
-		hdmi_sound_codec: simple-audio-card,codec {
-			sound-dai = <&hdmi_audio_codec>;
-		};
+	hdmi_sound_codec: simple-audio-card,codec {
+		sound-dai = <&hdmi_audio_codec>;
 	};
 };
 
