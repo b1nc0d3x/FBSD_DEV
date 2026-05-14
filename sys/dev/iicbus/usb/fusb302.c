@@ -368,8 +368,23 @@ enum fusb302_vdm_state {
 /* -----------------------------------------------------------------------
  * Software context
  * ----------------------------------------------------------------------- */
+
+/*
+ * DPRINTF — chatty trace output gated on dev.fusb302.0.debug.
+ *   debug = 0  (default): only true errors / one-shot attach milestones
+ *                         go to dmesg
+ *   debug >= 1:           verbose trace (alerts, FIFO TX/RX, VDM walk,
+ *                         PD message dumps)
+ */
+#define	FUSB302_DPRINTF(sc, ...)					\
+	do {								\
+		if ((sc)->debug > 0)					\
+			device_printf((sc)->dev, __VA_ARGS__);		\
+	} while (0)
+
 struct fusb302_softc {
 	device_t		dev;
+	int			debug;		/* sysctl-controlled, gates DPRINTF */
 	/*
 	 * Sleepable rwlock so the irq path can hold it across i2c
 	 * transactions (which sleep in rk_i2c_transfer).  The previous
@@ -718,7 +733,7 @@ fusb302_fifo_write_locked(struct fusb302_softc *sc)
 			n += snprintf(hex + n, sizeof(hex) - n,
 			    "%s%02x", i ? " " : "", senddata[i]);
 		if (bootverbose)
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "fifo TX [%d B] hdr=0x%04x ndo=%d: %s\n",
 			    pos, sc->send_head, PD_HDR_CNT(sc->send_head),
 			    hex);
@@ -973,7 +988,7 @@ fusb302_set_vdm_mesg_locked(struct fusb302_softc *sc, int cmd, int type,
 		/* pin_assignment_def set by process_vdm_msg when modes arrived */
 		sc->send_load[1] =
 		    ((uint32_t)sc->notify_pin_def << 8) | (1 << 2) | 2;
-		device_printf(sc->dev, "VDM DP config: send_load[1]=0x%08x "
+		FUSB302_DPRINTF(sc, "VDM DP config: send_load[1]=0x%08x "
 		    "pin_def=0x%x\n", sc->send_load[1], sc->notify_pin_def);
 		break;
 	default:
@@ -1046,7 +1061,7 @@ fusb302_process_vdm_msg_locked(struct fusb302_softc *sc)
 	case VDM_TYPE_INIT:
 		if (VDM_GET_CMD(hdr) == 0x06 /* ATTENTION */) {
 			sc->notify_dp_status = sc->rec_load[1] & 0xff;
-			device_printf(sc->dev, "VDM attention dp_status=0x%x\n",
+			FUSB302_DPRINTF(sc, "VDM attention dp_status=0x%x\n",
 			    sc->notify_dp_status);
 			/*
 			 * Refresh exported DP altmode state. VDM Attention
@@ -1085,7 +1100,7 @@ fusb302_process_vdm_msg_locked(struct fusb302_softc *sc)
 					sc->notify_dp_caps = tmp;
 					sc->notify_pin_def = 0;
 					sc->notify_pin_support = PD_DP_PIN_CAPS(tmp);
-					device_printf(sc->dev,
+					FUSB302_DPRINTF(sc,
 					    "VDM DP caps=0x%08x pin_support=0x%x\n",
 					    tmp, sc->notify_pin_support);
 				}
@@ -1097,14 +1112,14 @@ fusb302_process_vdm_msg_locked(struct fusb302_softc *sc)
 			break;
 		case VDM_DP_STATUS:
 			sc->notify_dp_status = sc->rec_load[1] & 0xff;
-			device_printf(sc->dev, "VDM DP status=0x%08x\n",
+			FUSB302_DPRINTF(sc, "VDM DP status=0x%08x\n",
 			    sc->rec_load[1]);
 			sc->val_tmp = 1;
 			break;
 		case VDM_DP_CONFIG:
 			sc->val_tmp = 1;
 			sc->notify_is_enter_mode = true;
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "VDM DP config OK, pin_assignment=0x%x\n",
 			    sc->notify_pin_def);
 			break;
@@ -1114,7 +1129,7 @@ fusb302_process_vdm_msg_locked(struct fusb302_softc *sc)
 		break;
 
 	case VDM_TYPE_NACK:
-		device_printf(sc->dev, "VDM NACK for cmd=0x%x\n",
+		FUSB302_DPRINTF(sc, "VDM NACK for cmd=0x%x\n",
 		    VDM_GET_CMD(hdr));
 		sc->vdm_state = VDM_ERR_ST;
 		break;
@@ -1156,7 +1171,7 @@ fusb302_vdm_send_discid_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state++;
 			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
 		} else if (tmp == FUSB_TX_FAILED) {
-			device_printf(sc->dev, "VDM DISC_ID TX failed\n");
+			FUSB302_DPRINTF(sc, "VDM DISC_ID TX failed\n");
 			return (-EIO);
 		}
 		if (sc->vdm_send_state != 2)
@@ -1167,7 +1182,7 @@ fusb302_vdm_send_discid_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state = 0;
 			return (0);
 		} else if (evt & FUSB_EVT_TIMER_STATE) {
-			device_printf(sc->dev, "VDM DISC_ID timeout\n");
+			FUSB302_DPRINTF(sc, "VDM DISC_ID timeout\n");
 			sc->work_continue |= FUSB_EVT_CONTINUE;
 			return (-ETIMEDOUT);
 		}
@@ -1196,7 +1211,7 @@ fusb302_vdm_send_discsvid_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state++;
 			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
 		} else if (tmp == FUSB_TX_FAILED) {
-			device_printf(sc->dev, "VDM DISC_SVIDS TX failed\n");
+			FUSB302_DPRINTF(sc, "VDM DISC_SVIDS TX failed\n");
 			return (-EIO);
 		}
 		if (sc->vdm_send_state != 2)
@@ -1207,7 +1222,7 @@ fusb302_vdm_send_discsvid_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state = 0;
 			return (0);
 		} else if (evt & FUSB_EVT_TIMER_STATE) {
-			device_printf(sc->dev, "VDM DISC_SVIDS timeout\n");
+			FUSB302_DPRINTF(sc, "VDM DISC_SVIDS timeout\n");
 			sc->work_continue |= FUSB_EVT_CONTINUE;
 			return (-ETIMEDOUT);
 		}
@@ -1235,7 +1250,7 @@ fusb302_vdm_send_discmodes_locked(struct fusb302_softc *sc, uint32_t evt)
 				sc->vdm_send_state++;
 				fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
 			} else if (tmp == FUSB_TX_FAILED) {
-				device_printf(sc->dev,
+				FUSB302_DPRINTF(sc,
 				    "VDM DISC_MODES TX failed\n");
 				return (-EIO);
 			}
@@ -1249,7 +1264,7 @@ fusb302_vdm_send_discmodes_locked(struct fusb302_softc *sc, uint32_t evt)
 				sc->vdm_send_state = 0;
 				sc->work_continue |= FUSB_EVT_CONTINUE;
 			} else if (evt & FUSB_EVT_TIMER_STATE) {
-				device_printf(sc->dev,
+				FUSB302_DPRINTF(sc,
 				    "VDM DISC_MODES timeout\n");
 				sc->work_continue |= FUSB_EVT_CONTINUE;
 				return (-ETIMEDOUT);
@@ -1282,7 +1297,7 @@ fusb302_vdm_send_entermode_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state++;
 			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
 		} else if (tmp == FUSB_TX_FAILED) {
-			device_printf(sc->dev, "VDM ENTER_MODE TX failed\n");
+			FUSB302_DPRINTF(sc, "VDM ENTER_MODE TX failed\n");
 			return (-EIO);
 		}
 		if (sc->vdm_send_state != 2)
@@ -1294,7 +1309,7 @@ fusb302_vdm_send_entermode_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state = 0;
 			return (0);
 		} else if (evt & FUSB_EVT_TIMER_STATE) {
-			device_printf(sc->dev, "VDM ENTER_MODE timeout\n");
+			FUSB302_DPRINTF(sc, "VDM ENTER_MODE timeout\n");
 			sc->work_continue |= FUSB_EVT_CONTINUE;
 			return (-ETIMEDOUT);
 		}
@@ -1321,7 +1336,7 @@ fusb302_vdm_send_dpstatus_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state++;
 			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
 		} else if (tmp == FUSB_TX_FAILED) {
-			device_printf(sc->dev, "VDM DP_STATUS TX failed\n");
+			FUSB302_DPRINTF(sc, "VDM DP_STATUS TX failed\n");
 			return (-EIO);
 		}
 		if (sc->vdm_send_state != 2)
@@ -1333,7 +1348,7 @@ fusb302_vdm_send_dpstatus_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state = 0;
 			return (0);
 		} else if (evt & FUSB_EVT_TIMER_STATE) {
-			device_printf(sc->dev, "VDM DP_STATUS timeout\n");
+			FUSB302_DPRINTF(sc, "VDM DP_STATUS timeout\n");
 			sc->work_continue |= FUSB_EVT_CONTINUE;
 			return (-ETIMEDOUT);
 		}
@@ -1363,7 +1378,7 @@ fusb302_vdm_send_dpconfig_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state++;
 			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
 		} else if (tmp == FUSB_TX_FAILED) {
-			device_printf(sc->dev, "VDM DP_CONFIG TX failed\n");
+			FUSB302_DPRINTF(sc, "VDM DP_CONFIG TX failed\n");
 			return (-EIO);
 		}
 		if (sc->vdm_send_state != 2)
@@ -1375,7 +1390,7 @@ fusb302_vdm_send_dpconfig_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->vdm_send_state = 0;
 			return (0);
 		} else if (evt & FUSB_EVT_TIMER_STATE) {
-			device_printf(sc->dev, "VDM DP_CONFIG timeout\n");
+			FUSB302_DPRINTF(sc, "VDM DP_CONFIG timeout\n");
 			sc->work_continue |= FUSB_EVT_CONTINUE;
 			return (-ETIMEDOUT);
 		}
@@ -1409,7 +1424,7 @@ fusb302_notify_dp_locked(struct fusb302_softc *sc)
 	sc->dp_altmode.usb_ss =
 	    ((sc->notify_pin_def & DP_PIN_MF_MASK) != 0) ? 1 : 0;
 
-	device_printf(sc->dev,
+	FUSB302_DPRINTF(sc,
 	    "DP Alt Mode: dp_ready=%d pin=0x%x usb_ss=%d dp_status=0x%x\n",
 	    sc->dp_altmode.dp_ready, sc->dp_altmode.pin_assignment,
 	    sc->dp_altmode.usb_ss, sc->dp_altmode.dp_status);
@@ -1549,7 +1564,7 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 		 * present VBUS as supplied for our purposes.
 		 */
 		if (sc->passive_src) {
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "src attach: passive_src=%d, enabling VBUS regulator "
 			    "(present Rp on CC%d only)\n",
 			    sc->passive_src, polarity + 1);
@@ -1568,7 +1583,7 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 			if (st0 == 0)
 				(void)fusb302_read_reg(sc, FUSB_REG_STATUS0, &st0);
 			if (st0 & FUSB_ST0_VBUSOK) {
-				device_printf(sc->dev,
+				FUSB302_DPRINTF(sc,
 				    "src attach: partner already sources VBUS, "
 				    "skipping our regulator_enable\n");
 				sc->vbus_enabled = true;
@@ -1635,7 +1650,7 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 				 * → SRC_SEND_CAPS → full PD negotiation). Use
 				 * this when partner can speak PD if we present
 				 * SRC + AUTO_CRC properly. */
-				device_printf(sc->dev, "attached as DFP on CC%d, "
+				FUSB302_DPRINTF(sc, "attached as DFP on CC%d, "
 				    "VCONN on CC%d, AUTO_CRC set, proceeding "
 				    "to send_caps\n",
 				    polarity + 1, (polarity == 0) ? 2 : 1);
@@ -1650,7 +1665,7 @@ fusb302_state_attached_source_locked(struct fusb302_softc *sc, uint32_t evt)
 			}
 		}
 
-		device_printf(sc->dev, "attached as DFP on CC%d, VCONN on CC%d, "
+		FUSB302_DPRINTF(sc, "attached as DFP on CC%d, VCONN on CC%d, "
 		    "waiting %dms for sink PD init\n",
 		    polarity + 1, (polarity == 0) ? 2 : 1, T_ATTACH_WAIT_MS);
 		fusb302_start_state_timer(sc, T_ATTACH_WAIT_MS);
@@ -1688,7 +1703,7 @@ fusb302_state_src_startup_locked(struct fusb302_softc *sc,
 	fusb302_set_polarity_locked(sc, sc->cc_polarity);
 	fusb302_enable_rx_locked(sc, true);
 
-	device_printf(sc->dev, "src_startup: PD init done, sending caps\n");
+	FUSB302_DPRINTF(sc, "src_startup: PD init done, sending caps\n");
 	fusb302_set_state_locked(sc, FUSB_ST_SRC_SEND_CAPS);
 }
 
@@ -1699,7 +1714,7 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 
 	switch (sc->sub_state) {
 	case 0:
-		device_printf(sc->dev, "send_caps: writing src caps to FIFO\n");
+		FUSB302_DPRINTF(sc, "send_caps: writing src caps to FIFO\n");
 		fusb302_set_mesg_srccap_locked(sc);
 		sc->tx_state = FUSB_TX_IDLE;
 		sc->sub_state++;
@@ -1713,11 +1728,11 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 		 * request-handling branch instead of spinning forever in BUSY.
 		 */
 		if ((evt & FUSB_EVT_RX) && sc->tx_state == FUSB_TX_BUSY) {
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "send_caps: RX arrived before TXSENT, assuming caps delivered\n");
 			sc->tx_state = FUSB_TX_SUCCESS;
 			sc->sub_state = 2;
-			device_printf(sc->dev, "send_caps: TXSENT, waiting for REQUEST\n");
+			FUSB302_DPRINTF(sc, "send_caps: TXSENT, waiting for REQUEST\n");
 			sc->hardrst_count = 0;
 			sc->caps_counter = 0;
 			sc->is_pd_support = true;
@@ -1726,7 +1741,7 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 		}
 		tmp = fusb302_policy_send_data_locked(sc);
 		if (tmp == FUSB_TX_SUCCESS) {
-			device_printf(sc->dev, "send_caps: TXSENT, waiting for REQUEST\n");
+			FUSB302_DPRINTF(sc, "send_caps: TXSENT, waiting for REQUEST\n");
 			sc->hardrst_count = 0;
 			sc->caps_counter = 0;
 			sc->is_pd_support = true;
@@ -1744,7 +1759,7 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 			(void)fusb302_read_reg(sc, FUSB_REG_CONTROL3, &ctl3);
 			(void)fusb302_read_reg(sc, FUSB_REG_SWITCHES0, &sw0);
 			(void)fusb302_read_reg(sc, FUSB_REG_SWITCHES1, &sw1);
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "send_caps: RETRYFAIL caps_counter=%d "
 			    "intr=%02x intra=%02x intrb=%02x "
 			    "st0=%02x st1=%02x ctl3=%02x sw0=%02x sw1=%02x\n",
@@ -1762,7 +1777,7 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 				 * we re-enter SRC_STARTUP and try caps again.
 				 */
 				if (sc->hardrst_count <= 0) {
-					device_printf(sc->dev,
+					FUSB302_DPRINTF(sc,
 					    "send_caps: %d RETRYFAILs on CC%d, "
 					    "issuing Hard_Reset to wake "
 					    "non-responsive sink\n",
@@ -1857,7 +1872,7 @@ fusb302_state_src_transition_supply_locked(struct fusb302_softc *sc,
 	default:
 		tmp = fusb302_policy_send_data_locked(sc);
 		if (tmp == FUSB_TX_SUCCESS) {
-			device_printf(sc->dev, "PD connected as DFP (5V)\n");
+			FUSB302_DPRINTF(sc, "PD connected as DFP (5V)\n");
 			fusb302_set_state_locked(sc, FUSB_ST_SRC_READY);
 		} else if (tmp == FUSB_TX_FAILED) {
 			fusb302_set_state_locked(sc, FUSB_ST_SRC_SEND_SOFTRST);
@@ -1876,7 +1891,7 @@ fusb302_state_src_ready_locked(struct fusb302_softc *sc, uint32_t evt)
 
 	if (evt & FUSB_EVT_CONTINUE)
 		if (bootverbose)
-		device_printf(sc->dev, "src_ready: vdm_active=%d vdm_state=%d\n",
+		FUSB302_DPRINTF(sc, "src_ready: vdm_active=%d vdm_state=%d\n",
 		    vdm_active, sc->vdm_state);
 
 	if (evt & FUSB_EVT_RX) {
@@ -2073,7 +2088,7 @@ fusb302_state_attached_sink_locked(struct fusb302_softc *sc, uint32_t evt)
 		sc->attached_as_sink = true;
 
 		fusb302_set_polarity_locked(sc, polarity);
-		device_printf(sc->dev, "attached as UFP on CC%d, "
+		FUSB302_DPRINTF(sc, "attached as UFP on CC%d, "
 		    "waiting %dms for VBUS\n",
 		    polarity + 1, T_ATTACH_WAIT_MS);
 		fusb302_start_state_timer(sc, T_ATTACH_WAIT_MS);
@@ -2116,7 +2131,7 @@ fusb302_state_snk_startup_locked(struct fusb302_softc *sc,
 		/* DP_Status VDO bit 7 = HPD; cdn_dp's altmode_signature_ok
 		 * requires it set before it will run mailbox bring-up. */
 		sc->dp_altmode.dp_status = (1u << 7);
-		device_printf(sc->dev,
+		FUSB302_DPRINTF(sc,
 		    "snk_startup: skip_pd=1, DP-only attach on CC%d, "
 		    "synthesizing Pin C 4-lane DP\n", sc->cc_polarity + 1);
 		if (sc->policy != NULL)
@@ -2126,7 +2141,7 @@ fusb302_state_snk_startup_locked(struct fusb302_softc *sc,
 		return;
 	}
 
-	device_printf(sc->dev,
+	FUSB302_DPRINTF(sc,
 	    "snk_startup: PD init done, listening for src caps\n");
 	fusb302_set_state_locked(sc, FUSB_ST_SNK_DISCOVERY);
 }
@@ -2150,7 +2165,7 @@ fusb302_state_snk_discovery_locked(struct fusb302_softc *sc, uint32_t evt)
 			for (; i < 7; i++)
 				sc->partner_cap[i] = 0;
 			sc->is_pd_support = true;
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "snk: src_caps n=%d PDO[0]=0x%08x\n",
 			    n, sc->partner_cap[0]);
 			fusb302_set_state_locked(sc,
@@ -2174,14 +2189,14 @@ fusb302_state_snk_discovery_locked(struct fusb302_softc *sc, uint32_t evt)
 			 * SNK_WAIT_CAPABILITIES_TIMEOUT.
 			 */
 			sc->softrst_tried = true;
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "snk: no src caps within %dms; trying soft "
 			    "reset before hard reset\n",
 			    T_TYPEC_SINK_WAIT_CAP);
 			fusb302_set_state_locked(sc,
 			    FUSB_ST_SNK_SEND_SOFTRST);
 		} else if (sc->hardrst_count <= N_SNK_HARDRESET_RETRY) {
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "snk: no src caps within %dms; sending hard "
 			    "reset (try %d/%d) to wake partner\n",
 			    T_TYPEC_SINK_WAIT_CAP, sc->hardrst_count + 1,
@@ -2309,7 +2324,7 @@ fusb302_state_role_discovery_src_locked(struct fusb302_softc *sc,
 		(void)fusb302_update_reg(sc, FUSB_REG_CONTROL2,
 		    FUSB_CTL2_TOGGLE, 0);
 		sc->role_discovery_tries++;
-		device_printf(sc->dev,
+		FUSB302_DPRINTF(sc,
 		    "role-discovery: detach + re-toggle (attempt %d/%d)\n",
 		    sc->role_discovery_tries, ROLE_DISCOVERY_MAX_TOGGLES);
 		sc->sub_state = 1;
@@ -2330,7 +2345,7 @@ fusb302_state_role_discovery_src_locked(struct fusb302_softc *sc,
 		    FUSB_CTL2_TOGGLE,
 		    FUSB_CTL2_MODE_DRP | FUSB_CTL2_TOG_RD_ONLY |
 		    FUSB_CTL2_TOGGLE);
-		device_printf(sc->dev,
+		FUSB302_DPRINTF(sc,
 		    "role-discovery: TOGGLE re-enabled in DRP mode, awaiting "
 		    "TOGDONE\n");
 		sc->conn_state = FUSB_ST_UNATTACHED;
@@ -2378,7 +2393,7 @@ fusb302_state_snk_evaluate_caps_locked(struct fusb302_softc *sc,
 	if (pos == 0)
 		pos = 1;
 	sc->pos_power = pos;
-	device_printf(sc->dev, "snk: selecting PDO position %d (PDO=0x%08x)\n",
+	FUSB302_DPRINTF(sc, "snk: selecting PDO position %d (PDO=0x%08x)\n",
 	    pos, sc->partner_cap[pos - 1]);
 	fusb302_set_state_locked(sc, FUSB_ST_SNK_SELECT_CAP);
 }
@@ -2391,7 +2406,7 @@ fusb302_state_snk_select_cap_locked(struct fusb302_softc *sc, uint32_t evt)
 	switch (sc->sub_state) {
 	case 0:
 		fusb302_set_mesg_request_locked(sc);
-		device_printf(sc->dev, "snk: send REQUEST RDO=0x%08x\n",
+		FUSB302_DPRINTF(sc, "snk: send REQUEST RDO=0x%08x\n",
 		    sc->send_load[0]);
 		sc->tx_state = FUSB_TX_IDLE;
 		sc->sub_state++;
@@ -2409,13 +2424,13 @@ fusb302_state_snk_select_cap_locked(struct fusb302_softc *sc, uint32_t evt)
 	default:
 		if (evt & FUSB_EVT_RX) {
 			if (PD_IS_CTRL(sc->rec_head, PD_CMT_ACCEPT)) {
-				device_printf(sc->dev, "snk: REQUEST accepted\n");
+				FUSB302_DPRINTF(sc, "snk: REQUEST accepted\n");
 				fusb302_start_state_timer(sc, T_PS_TRANSITION);
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_SNK_TRANSITION_SINK);
 			} else if (PD_IS_CTRL(sc->rec_head, PD_CMT_REJECT) ||
 			    PD_IS_CTRL(sc->rec_head, PD_CMT_WAIT)) {
-				device_printf(sc->dev,
+				FUSB302_DPRINTF(sc,
 				    "snk: REQUEST rejected/wait, staying in 5V default\n");
 				fusb302_set_state_locked(sc, FUSB_ST_SNK_READY);
 			}
@@ -2438,7 +2453,7 @@ fusb302_state_snk_transition_sink_locked(struct fusb302_softc *sc,
 	if (evt & FUSB_EVT_RX) {
 		if (PD_IS_CTRL(sc->rec_head, PD_CMT_PS_RDY)) {
 			sc->notify_is_pd = true;
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "PD connected as UFP (5V contract)\n");
 			fusb302_set_state_locked(sc, FUSB_ST_SNK_READY);
 			return;
@@ -2450,7 +2465,7 @@ fusb302_state_snk_transition_sink_locked(struct fusb302_softc *sc,
 		}
 	}
 	if (evt & FUSB_EVT_TIMER_STATE) {
-		device_printf(sc->dev, "snk: PS_RDY timeout\n");
+		FUSB302_DPRINTF(sc, "snk: PS_RDY timeout\n");
 		fusb302_set_state_locked(sc, FUSB_ST_SNK_TRANSITION_DEFAULT);
 	}
 }
@@ -2468,7 +2483,7 @@ fusb302_state_snk_ready_locked(struct fusb302_softc *sc, uint32_t evt)
 			    FUSB_ST_SNK_EVALUATE_CAPS);
 			return;
 		}
-		device_printf(sc->dev,
+		FUSB302_DPRINTF(sc,
 		    "snk_ready: RX head=0x%04x type=%d cnt=%d\n",
 		    sc->rec_head, PD_HDR_TYPE(sc->rec_head),
 		    PD_HDR_CNT(sc->rec_head));
@@ -2615,7 +2630,7 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp,
 
 	/* Verbose alert trace — useful for VDM bring-up debug only. */
 	if (bootverbose && (intr | intra | intrb))
-		device_printf(sc->dev,
+		FUSB302_DPRINTF(sc,
 		    "alert: intr=%02x intra=%02x intrb=%02x\n",
 		    intr, intra, intrb);
 
@@ -2632,7 +2647,7 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp,
 		/* Stop toggle; PD code takes manual control of CC */
 		(void)fusb302_update_reg(sc, FUSB_REG_CONTROL2,
 		    FUSB_CTL2_TOGGLE, 0);
-		device_printf(sc->dev, "TOGDONE status1a=0x%02x\n", status1a);
+		FUSB302_DPRINTF(sc, "TOGDONE status1a=0x%02x\n", status1a);
 	}
 
 	if (intr & 0x80 /* VBUSOK */) {
@@ -2659,7 +2674,7 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp,
 	}
 
 	if (intra & FUSB_INTRA_HARDRST) {
-		device_printf(sc->dev, "hard reset received\n");
+		FUSB302_DPRINTF(sc, "hard reset received\n");
 		fusb302_pd_reset_locked(sc);
 		sc->msg_id = 0;
 		sc->vdm_state = VDM_DISC_ID_ST;
@@ -3128,7 +3143,7 @@ fusb302_init(struct fusb302_softc *sc)
 	fusb302_read_reg(sc, FUSB_REG_STATUS1A, &sc->status1a);
 	sc->state_valid = true;
 
-	device_printf(sc->dev,
+	FUSB302_DPRINTF(sc,
 	    "initialized: irq=0x%02x irqa=0x%02x irqb=0x%02x "
 	    "st0=0x%02x st1=0x%02x st0a=0x%02x st1a=0x%02x\n",
 	    intr, intra, intrb,
@@ -3187,7 +3202,7 @@ fusb302_init(struct fusb302_softc *sc)
 			}
 		}
 
-		device_printf(sc->dev,
+		FUSB302_DPRINTF(sc,
 		    "manual probe: cc1_max_bc=%d cc2_max_bc=%d\n",
 		    cc1_max, cc2_max);
 
@@ -3197,7 +3212,7 @@ fusb302_init(struct fusb302_softc *sc)
 			polarity = 1;
 
 		if (polarity >= 0) {
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "manual probe: VBUSOK + Rp on CC%d, "
 			    "attaching as SNK\n", polarity + 1);
 			sc->cc_polarity = polarity;
@@ -3227,7 +3242,7 @@ fusb302_init(struct fusb302_softc *sc)
 		cc1_rd = fusb302_probe_cc_pull_up_locked(sc, 0);
 		cc2_rd = fusb302_probe_cc_pull_up_locked(sc, 1);
 
-		device_printf(sc->dev,
+		FUSB302_DPRINTF(sc,
 		    "manual source probe: cc1_rd=%d cc2_rd=%d\n",
 		    cc1_rd, cc2_rd);
 
@@ -3244,14 +3259,14 @@ fusb302_init(struct fusb302_softc *sc)
 			 * existing PD/VDM machine can start; if that proves
 			 * wrong, later retries can still revisit orientation.
 			 */
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "manual source probe: ambiguous dual-Rd, "
 			    "bootstrapping CC1 on RockPro64\n");
 			polarity = 0;
 		}
 
 		if (polarity >= 0) {
-			device_printf(sc->dev,
+			FUSB302_DPRINTF(sc,
 			    "manual source probe: Rd on CC%d, "
 			    "attaching as SRC/DFP\n", polarity + 1);
 			sc->cc_polarity = polarity;
@@ -3385,7 +3400,7 @@ fusb302_sysctl_slice_sdac(SYSCTL_HANDLER_ARGS)
 	sc->slice_sdac = val;
 	(void)fusb302_write_reg(sc, FUSB_REG_SLICE,
 	    0x40u | (uint8_t)(val & 0x3fu));
-	device_printf(sc->dev, "BMC slice SDAC -> 0x%02x (~%d mV)\n",
+	FUSB302_DPRINTF(sc, "BMC slice SDAC -> 0x%02x (~%d mV)\n",
 	    val, val * 42);
 	return (0);
 }
@@ -3410,23 +3425,23 @@ fusb302_sysctl_vbus_cycle(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 
 	if (sc->vbus_supply == NULL) {
-		device_printf(sc->dev,
+		FUSB302_DPRINTF(sc,
 		    "vbus_cycle: no regulator handle, nothing to do\n");
 		return (ENXIO);
 	}
 
-	device_printf(sc->dev, "vbus_cycle: dropping VBUS\n");
+	FUSB302_DPRINTF(sc, "vbus_cycle: dropping VBUS\n");
 	if (sc->vbus_enabled) {
 		(void)regulator_disable(sc->vbus_supply);
 		sc->vbus_enabled = false;
 	}
 	pause("vbusoff", hz * 3 / 2);	/* 1.5s */
-	device_printf(sc->dev, "vbus_cycle: restoring VBUS\n");
+	FUSB302_DPRINTF(sc, "vbus_cycle: restoring VBUS\n");
 	error = regulator_enable(sc->vbus_supply);
 	if (error == 0)
 		sc->vbus_enabled = true;
 	else
-		device_printf(sc->dev,
+		FUSB302_DPRINTF(sc,
 		    "vbus_cycle: regulator_enable failed (%d)\n", error);
 	return (error);
 }
@@ -3456,7 +3471,7 @@ fusb302_sysctl_reattach(SYSCTL_HANDLER_ARGS)
 		sx_xunlock(&sc->sx);
 		return (ENXIO);
 	}
-	device_printf(sc->dev,
+	FUSB302_DPRINTF(sc,
 	    "reattach_now: forcing detach/re-toggle (role_pref=%d skip_pd=%d)\n",
 	    sc->role_pref, sc->skip_pd);
 	fusb302_set_state_unattached_locked(sc);
@@ -3475,6 +3490,10 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	ctx = device_get_sysctl_ctx(sc->dev);
 	tree = device_get_sysctl_tree(sc->dev);
 
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "debug", CTLFLAG_RW, &sc->debug, 0,
+	    "Enable verbose trace prints (alerts, FIFO TX/RX, VDM walk, "
+	    "PD message dumps). 0=off (default), 1=on");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "device_id",
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
 	    FUSB_REG_DEVICE_ID, fusb302_sysctl_reg, "I", "device ID");
@@ -3585,7 +3604,7 @@ fusb302_try_ofw_irq(struct fusb302_softc *sc)
 	if (error != 0)
 		return (error);
 
-	device_printf(sc->dev, "recovered irq %d from OFW\n", irq);
+	FUSB302_DPRINTF(sc, "recovered irq %d from OFW\n", irq);
 	return (0);
 }
 
@@ -3651,7 +3670,7 @@ fusb302_attach(device_t dev)
 		device_printf(dev, "cannot read device ID: %d\n", error);
 		goto fail;
 	}
-	device_printf(dev, "device id 0x%02x at addr 0x%02x\n",
+	FUSB302_DPRINTF(sc, "device id 0x%02x at addr 0x%02x\n",
 	    sc->device_id, sc->addr);
 
 	sc->role_pref = fusb302_is_rockpro64(dev) ? FUSB_ROLE_SRC :
@@ -3659,7 +3678,7 @@ fusb302_attach(device_t dev)
 	TUNABLE_INT_FETCH("hw.fusb302.role_pref", &sc->role_pref);
 	if (sc->role_pref < 0 || sc->role_pref > FUSB_ROLE_SNK)
 		sc->role_pref = FUSB_ROLE_DRP;
-	device_printf(dev, "toggle role preference: %s\n",
+	FUSB302_DPRINTF(sc, "toggle role preference: %s\n",
 	    sc->role_pref == FUSB_ROLE_SRC ? "source-only" :
 	    sc->role_pref == FUSB_ROLE_SNK ? "sink-only" : "DRP");
 
@@ -3672,15 +3691,15 @@ fusb302_attach(device_t dev)
 	TUNABLE_INT_FETCH("hw.fusb302.slice_sdac", &sc->slice_sdac);
 	if (sc->slice_sdac < 0 || sc->slice_sdac > 0x3f)
 		sc->slice_sdac = 0x20;
-	device_printf(dev, "BMC slice SDAC: 0x%02x (~%d mV)\n",
+	FUSB302_DPRINTF(sc, "BMC slice SDAC: 0x%02x (~%d mV)\n",
 	    sc->slice_sdac, sc->slice_sdac * 42);
-	device_printf(dev, "PD spec rev advertise: PD %s\n",
+	FUSB302_DPRINTF(sc, "PD spec rev advertise: PD %s\n",
 	    sc->pd_spec_rev == 1 ? "2.0" : "3.0");
 
 	sc->skip_pd = 0;
 	TUNABLE_INT_FETCH("hw.fusb302.skip_pd", &sc->skip_pd);
 	if (sc->skip_pd)
-		device_printf(dev, "skip_pd=1: passive DP defaults on SNK attach\n");
+		FUSB302_DPRINTF(sc, "skip_pd=1: passive DP defaults on SNK attach\n");
 
 	/*
 	 * Default passive_src=2: explicit AUTO_CRC + role-bit programming in
@@ -3760,7 +3779,7 @@ fusb302_attach(device_t dev)
 	/* IRQ allocation — same multi-fallback as original */
 	if (bus_get_resource(dev, SYS_RES_IRQ, sc->irq_rid, &irq_start,
 	    &irq_count) == 0) {
-		device_printf(dev, "irq metadata start=%ju count=%ju\n",
+		FUSB302_DPRINTF(sc, "irq metadata start=%ju count=%ju\n",
 		    (uintmax_t)irq_start, (uintmax_t)irq_count);
 	}
 	sc->irq_res = bus_alloc_resource_any(dev, SYS_RES_IRQ, &sc->irq_rid,

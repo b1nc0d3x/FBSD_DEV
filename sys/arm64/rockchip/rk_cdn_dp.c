@@ -521,11 +521,24 @@ static struct resource_spec rk_cdn_dp_spec[] = {
 #define	RK_CDN_DP_PMU_BUS_IDLE_ACK	0x0068
 #define	RK_CDN_DP_HDCP_BUS_BIT		11U
 
+/*
+ * DPRINTF — chatty trace output gated on dev.rk_cdn_dp.0.debug.
+ *   debug = 0  (default): only true errors / one-shot bring-up
+ *                         milestones go to dmesg
+ *   debug >= 1:           verbose trace, mailbox / AUX / stage walk
+ */
+#define	RK_CDN_DP_DPRINTF(sc, ...)					\
+	do {								\
+		if ((sc)->debug > 0)					\
+			device_printf((sc)->dev, __VA_ARGS__);		\
+	} while (0)
+
 struct rk_cdn_dp_softc {
 	device_t		dev;
 	device_t		aux_iicbus;
 	device_t		aux_iic_adapter;
 	phandle_t		node;
+	int			debug;		/* sysctl-controlled, gates DPRINTF */
 	struct resource		*res[RK_CDN_DP_RES_COUNT];
 	clk_t			clks[RK_CDN_DP_NCLKS];
 	hwreset_t		rsts[RK_CDN_DP_NRSTS];
@@ -1429,7 +1442,7 @@ rk_cdn_dp_load_firmware(struct rk_cdn_dp_softc *sc)
 		if (reg != 0)
 			break;
 		if (i % 50 == 49)
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "fw-load: waiting for KEEP_ALIVE (%u ms elapsed)\n",
 			    (i + 1) * 2);
 		DELAY(2000);
@@ -1557,7 +1570,7 @@ rk_cdn_dp_set_host_cap(struct rk_cdn_dp_softc *sc, uint8_t lanes, bool flip)
 		 * splits were fighting the lane mapping.
 		 */
 		aux_swap = sc->aux_swap_value;
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "host_cap: AUX_SWAP=0x%x (flip=%u, ctl_override=0x%x)\n",
 		    aux_swap, flip ? 1 : 0, sc->aux_swap_value);
 		error = rk_cdn_dp_mailbox_reg_write(sc,
@@ -1864,7 +1877,7 @@ rk_cdn_dp_mailbox_get_hpd_state(struct rk_cdn_dp_softc *sc)
 		return (error);
 
 	sc->hpd_status = status;
-	device_printf(sc->dev, "mailbox HPD status=%d\n", status);
+	RK_CDN_DP_DPRINTF(sc, "mailbox HPD status=%d\n", status);
 	if (status <= 0)
 		return (ENODEV);
 	return (0);
@@ -1905,7 +1918,7 @@ rk_cdn_dp_mailbox_get_last_aux_status(struct rk_cdn_dp_softc *sc,
 		return (error);
 	if (status_out != NULL)
 		*status_out = status;
-	device_printf(sc->dev, "last AUX status=0x%02x (%s)\n", status,
+	RK_CDN_DP_DPRINTF(sc, "last AUX status=0x%02x (%s)\n", status,
 	    status == 0x00 ? "ACK" :
 	    status == 0x01 ? "NACK" :
 	    status == 0x02 ? "DEFER" :
@@ -1954,12 +1967,12 @@ rk_cdn_dp_hpd_pulse(struct rk_cdn_dp_softc *sc)
 
 	error = rk_cdn_dp_mailbox_reg_write(sc, RK_CDN_DP_SYS_CTL_3, base);
 	if (error != 0) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "hpd_pulse: mailbox write SYS_CTL_3 (HPD low) failed (%d)\n",
 		    error);
 		return (error);
 	}
-	device_printf(sc->dev, "hpd_pulse: HPD low (SYS_CTL_3=0x%08x)\n",
+	RK_CDN_DP_DPRINTF(sc, "hpd_pulse: HPD low (SYS_CTL_3=0x%08x)\n",
 	    base);
 
 	DELAY(500000);	/* 500ms */
@@ -1967,12 +1980,12 @@ rk_cdn_dp_hpd_pulse(struct rk_cdn_dp_softc *sc)
 	error = rk_cdn_dp_mailbox_reg_write(sc, RK_CDN_DP_SYS_CTL_3,
 	    base | RK_CDN_DP_SYS_CTL_3_F_HPD);
 	if (error != 0) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "hpd_pulse: mailbox write SYS_CTL_3 (HPD high) failed (%d)\n",
 		    error);
 		return (error);
 	}
-	device_printf(sc->dev, "hpd_pulse: HPD high (SYS_CTL_3=0x%08x)\n",
+	RK_CDN_DP_DPRINTF(sc, "hpd_pulse: HPD high (SYS_CTL_3=0x%08x)\n",
 	    base | RK_CDN_DP_SYS_CTL_3_F_HPD);
 
 	DELAY(100000);	/* 100ms settle before any AUX */
@@ -2015,11 +2028,11 @@ rk_cdn_dp_aux_wake(struct rk_cdn_dp_softc *sc)
 	int error;
 
 	error = rk_cdn_dp_mailbox_dpcd_write(sc, 0x600, &d3, 1);
-	device_printf(sc->dev, "aux_wake: DPCD 0x600 <- D3 result=%d\n",
+	RK_CDN_DP_DPRINTF(sc, "aux_wake: DPCD 0x600 <- D3 result=%d\n",
 	    error);
 	DELAY(50000);	/* 50ms */
 	error = rk_cdn_dp_mailbox_dpcd_write(sc, 0x600, &d0, 1);
-	device_printf(sc->dev, "aux_wake: DPCD 0x600 <- D0 result=%d\n",
+	RK_CDN_DP_DPRINTF(sc, "aux_wake: DPCD 0x600 <- D0 result=%d\n",
 	    error);
 	DELAY(50000);
 	return (error);
@@ -2260,7 +2273,7 @@ rk_cdn_dp_sysctl_edid_audio_dump(SYSCTL_HANDLER_ARGS)
 	if (sc == NULL)
 		return (ENXIO);
 	if (!sc->edid_valid || sc->edid_len < 256) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "edid_audio_dump: EDID not cached or no extension "
 		    "block (valid=%d len=%u)\n",
 		    (int)sc->edid_valid, (unsigned int)sc->edid_len);
@@ -2269,13 +2282,13 @@ rk_cdn_dp_sysctl_edid_audio_dump(SYSCTL_HANDLER_ARGS)
 
 	cta = &sc->edid[128];
 	if (cta[0] != 0x02) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "edid_audio_dump: ext block tag=0x%02x is not CTA-861 "
 		    "(0x02) — no audio info\n", cta[0]);
 		return (0);
 	}
 	dtd_offset = cta[2];
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "edid_audio_dump: CTA-861 rev=%u dtd_offset=0x%02x flags=0x%02x "
 	    "(YCbCr444=%d YCbCr422=%d basic_audio=%d underscan=%d, ndtd=%d)\n",
 	    cta[1], dtd_offset, cta[3],
@@ -2283,7 +2296,7 @@ rk_cdn_dp_sysctl_edid_audio_dump(SYSCTL_HANDLER_ARGS)
 	    (cta[3] >> 6) & 1, (cta[3] >> 7) & 1,
 	    cta[3] & 0x0f);
 	if (dtd_offset < 4 || dtd_offset > 128) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "edid_audio_dump: invalid dtd_offset, bailing\n");
 		return (0);
 	}
@@ -2300,7 +2313,7 @@ rk_cdn_dp_sysctl_edid_audio_dump(SYSCTL_HANDLER_ARGS)
 				    &cta[dbc_off + 1 + idx];
 				uint8_t fmt = (s[0] >> 3) & 0x0f;
 				uint8_t ch  = (s[0] & 0x07) + 1;
-				device_printf(sc->dev,
+				RK_CDN_DP_DPRINTF(sc,
 				    "edid_audio_dump:  SAD%d fmt=%u(%s) "
 				    "ch=%u rates=0x%02x byte2=0x%02x\n",
 				    sad_count, fmt, fmt_name[fmt], ch,
@@ -2313,11 +2326,11 @@ rk_cdn_dp_sysctl_edid_audio_dump(SYSCTL_HANDLER_ARGS)
 			break;
 	}
 	if (sad_count == 0) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "edid_audio_dump: NO Short Audio Descriptors found — "
 		    "sink does NOT advertise DP audio support\n");
 	} else {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "edid_audio_dump: %d SAD(s) found — sink claims audio "
 		    "support (basic_audio=%d for stereo LPCM 32/44.1/48kHz)\n",
 		    sad_count, (cta[3] >> 6) & 1);
@@ -2377,35 +2390,35 @@ rk_cdn_dp_sysctl_audio_dump(SYSCTL_HANDLER_ARGS)
 	pif_wr_addr = rk_cdn_dp_read_4(sc, RK_CDN_DP_SOURCE_PIF_WR_ADDR);
 	pif_wr_req  = rk_cdn_dp_read_4(sc, RK_CDN_DP_SOURCE_PIF_WR_REQ);
 
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: mb AUDIO_PACK_CONTROL=0x%08x (e=%d, want bit8=1)\n",
 	    pack_ctrl, e_pack);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: mb DP_VB_ID=0x%08x (e=%d, want bit4=0 unmuted)\n",
 	    vb_id, e_vb);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: AUDIO_SRC_CNTL=0x%08x (want bit1=I2S_DEC_START)\n",
 	    src_cntl);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: AUDIO_SRC_CNFG=0x%08x\n", src_cnfg);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: SMPL2PKT_CNTL=0x%08x (want bit1=SMPL2PKT_EN)\n",
 	    smpl_cntl);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: SMPL2PKT_CNFG=0x%08x\n", smpl_cnfg);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: FIFO_CNTL=0x%08x  COM_CH_STTS=0x%08x  SPDIF_CTRL=0x%08x\n",
 	    fifo_cntl, com_ch, spdif_ctrl);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: PIF_PKT_ALLOC=0x%08x (want TYPE_VALID+PACKET_TYPE=0x84)\n",
 	    pif_alloc);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: PIF_WR_EN=0x%08x  WR_ADDR=0x%08x  WR_REQ=0x%08x\n",
 	    pif_wr_en, pif_wr_addr, pif_wr_req);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: mb AUDIO_PACK_STATUS=0x%08x (e=%d) VIF_STATUS=0x%08x (e=%d)\n",
 	    pack_status, e_pkst, vif_status, e_vif);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "audio_dump: mb PCK_STUFF_STATUS_0=0x%08x (e=%d) STATUS_1=0x%08x (e=%d)\n",
 	    stuff_0, e_s0, stuff_1, e_s1);
 
@@ -2632,7 +2645,7 @@ rk_cdn_dp_sysctl_probe_warm(SYSCTL_HANDLER_ARGS)
 			goto out;
 		}
 	}
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "probe_warm: clocks ready (skip resets/fw); APB MMIO at 0xfec02000+ now readable\n");
 out:
 	sx_sunlock(&sc->detach_sx);
@@ -2677,7 +2690,7 @@ rk_cdn_dp_sysctl_framer_dump(SYSCTL_HANDLER_ARGS)
 		sx_sunlock(&sc->detach_sx);
 		return (ENXIO);
 	}
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "framer_dump: trained=%d video_configured=%d rate_code=0x%x lanes=%u pixel_clock=%u\n",
 	    sc->link_trained ? 1 : 0, sc->video_configured ? 1 : 0,
 	    sc->link_plan_rate_code, sc->link_plan_lanes, sc->pixel_clock_khz);
@@ -2772,7 +2785,7 @@ rk_cdn_dp_sysctl_reg_read(SYSCTL_HANDLER_ARGS)
 	error = rk_cdn_dp_mailbox_reg_read(sc, (uint16_t)sc->debug_reg_addr, &regv);
 	if (error == 0) {
 		sc->debug_reg_value = regv;
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "debug_reg: read [0x%04x] = 0x%08x\n",
 		    (uint16_t)sc->debug_reg_addr, regv);
 	}
@@ -2802,7 +2815,7 @@ rk_cdn_dp_sysctl_reg_write(SYSCTL_HANDLER_ARGS)
 	error = rk_cdn_dp_mailbox_reg_write(sc, (uint16_t)sc->debug_reg_addr,
 	    sc->debug_reg_value);
 	if (error == 0)
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "debug_reg: write [0x%04x] = 0x%08x\n",
 		    (uint16_t)sc->debug_reg_addr, sc->debug_reg_value);
 	sx_sunlock(&sc->detach_sx);
@@ -2891,7 +2904,7 @@ rk_cdn_dp_mailbox_set_host_cap(struct rk_cdn_dp_softc *sc)
 
 	rk_cdn_dp_get_hostcap_config(sc, &lanes, &flip, &usb_ss);
 
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "host-cap using lanes=%u flip=%u usb_ss=%d%s%s\n",
 	    lanes, flip ? 1 : 0, usb_ss,
 	    sc->hostcap_flip_override >= 0 ? " flip-override" : "",
@@ -3001,7 +3014,7 @@ rk_cdn_dp_wait_sink_ready(struct rk_cdn_dp_softc *sc)
 				fw_dead_streak = (error == ETIMEDOUT) ? 1 : 0;
 			fw_dead_ka = ka;
 			if (i == 0 || i % 50 == 49) {
-				device_printf(sc->dev,
+				RK_CDN_DP_DPRINTF(sc,
 				    "sink_count poll: error=%d (try %d) "
 				    "ka=0x%08x streak=%d\n",
 				    error, i, ka, fw_dead_streak);
@@ -3012,7 +3025,7 @@ rk_cdn_dp_wait_sink_ready(struct rk_cdn_dp_softc *sc)
 				    "sink_count poll state");
 			}
 			if (fw_dead_streak >= 3) {
-				device_printf(sc->dev,
+				RK_CDN_DP_DPRINTF(sc,
 				    "sink_count poll: firmware wedged "
 				    "(ka frozen at 0x%08x for %d straight "
 				    "timeouts) — bailing\n",
@@ -3459,7 +3472,7 @@ rk_cdn_dp_complete_dpcd_caps(struct rk_cdn_dp_softc *sc)
 	device_printf(sc->dev,
 	    "DPCD rev=%#x max_link_rate=%#x max_lane_count=%#x\n",
 	    sc->aux_dpcd[0], sc->aux_dpcd[1], sc->aux_dpcd[2]);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "DPCD caps raw: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 	    sc->aux_dpcd[0], sc->aux_dpcd[1], sc->aux_dpcd[2],
 	    sc->aux_dpcd[3], sc->aux_dpcd[4], sc->aux_dpcd[5],
@@ -3505,7 +3518,7 @@ rk_cdn_dp_record_sink_caps(struct rk_cdn_dp_softc *sc)
 	    sc->aux_dpcd[2],
 	    (sc->aux_dpcd[2] & 0x80) != 0 ? 1 : 0,
 	    (sc->aux_dpcd[3] & 0x01) != 0 ? 1 : 0);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "DPCD caps raw: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 	    sc->aux_dpcd[0], sc->aux_dpcd[1], sc->aux_dpcd[2],
 	    sc->aux_dpcd[3], sc->aux_dpcd[4], sc->aux_dpcd[5],
@@ -3533,7 +3546,7 @@ rk_cdn_dp_plan_link(struct rk_cdn_dp_softc *sc)
 	sc->link_plan_lanes = MIN(host_lanes, sink_lanes);
 	sc->link_plan_rate_code = sc->sink_max_link_rate_code;
 
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "link-plan: sink_rate=%#x (%u kHz) sink_lanes=%u host_lanes=%u usb_ss=%d flip=%u -> train_rate=%#x train_lanes=%u\n",
 	    sc->sink_max_link_rate_code,
 	    sc->sink_max_link_rate_khz,
@@ -3818,7 +3831,7 @@ rk_cdn_dp_link_train_clock_recovery(struct rk_cdn_dp_softc *sc)
 		if (error != 0)
 			return (error);
 
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "CR iter v_tries=%u max_vs=%u status=%02x %02x %02x %02x %02x %02x train[0]=%02x\n",
 		    voltage_tries, max_vswing_tries,
 		    sc->link_status[0], sc->link_status[1], sc->link_status[2],
@@ -3827,7 +3840,7 @@ rk_cdn_dp_link_train_clock_recovery(struct rk_cdn_dp_softc *sc)
 
 		if (rk_cdn_dp_clock_recovery_ok(sc->link_status,
 		    sc->link_plan_lanes)) {
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "CR done after %u vswing tries (max_vs=%u)\n",
 			    voltage_tries, max_vswing_tries);
 			return (0);
@@ -3894,7 +3907,7 @@ rk_cdn_dp_link_train_channel_eq(struct rk_cdn_dp_softc *sc)
 		if (error != 0)
 			return (error);
 
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "EQ iter try=%d status=%02x %02x %02x %02x %02x %02x train[0]=%02x\n",
 		    tries, sc->link_status[0], sc->link_status[1],
 		    sc->link_status[2], sc->link_status[3], sc->link_status[4],
@@ -3908,7 +3921,7 @@ rk_cdn_dp_link_train_channel_eq(struct rk_cdn_dp_softc *sc)
 		}
 		if (rk_cdn_dp_channel_eq_ok(sc->link_status,
 		    sc->link_plan_lanes)) {
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "EQ done after %d tries\n", tries);
 			return (0);
 		}
@@ -3982,7 +3995,7 @@ rk_cdn_dp_fw_train_link(struct rk_cdn_dp_softc *sc)
 	error = rk_cdn_dp_mailbox_send(sc, RK_CDN_DP_MB_MODULE_ID_DP_TX,
 	    RK_CDN_DP_DPTX_TRAINING_CONTROL, sizeof(msg), &msg);
 	if (error != 0) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "fw-train: TRAINING_CONTROL send failed (%d)\n", error);
 		return (error);
 	}
@@ -4013,7 +4026,7 @@ rk_cdn_dp_fw_train_link(struct rk_cdn_dp_softc *sc)
 			return (error);
 
 		if (event[1] & RK_CDN_DP_EQ_PHASE_FINISHED) {
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "fw-train: EQ_PHASE_FINISHED after %d ms "
 			    "(event=%02x %02x)\n",
 			    elapsed_ms, event[0], event[1]);
@@ -4050,7 +4063,7 @@ rk_cdn_dp_fw_train_link(struct rk_cdn_dp_softc *sc)
 	if (error != 0)
 		return (error);
 
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "fw-train: firmware negotiated rate_code=0x%02x lanes=%u\n",
 	    status[0], status[1]);
 	sc->link_plan_rate_code = status[0];
@@ -4139,7 +4152,7 @@ rk_cdn_dp_link_train(struct rk_cdn_dp_softc *sc)
 	if (error != 0) {
 		int fw_error;
 
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "software link training failed (%d); trying firmware-driven\n",
 		    error);
 		fw_error = rk_cdn_dp_fw_train_link(sc);
@@ -4268,14 +4281,14 @@ rk_cdn_dp_read_edid(struct rk_cdn_dp_softc *sc)
 
 	sc->edid_len = 128 * (1 + cached_blocks);
 	sc->edid_valid = true;
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "EDID OK: vendor=%c%c%c product=0x%02x%02x%02x%02x version=%u.%u ext=%u cached_len=%u\n",
 	    ((e[8] >> 2) & 0x1f) + 'A' - 1,
 	    (((e[8] & 0x3) << 3) | (e[9] >> 5)) + 'A' - 1,
 	    (e[9] & 0x1f) + 'A' - 1,
 	    e[10], e[11], e[12], e[13], e[18], e[19], ext_blocks,
 	    sc->edid_len);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "EDID first 32B: %02x %02x %02x %02x %02x %02x %02x %02x "
 	    "%02x %02x %02x %02x %02x %02x %02x %02x "
 	    "%02x %02x %02x %02x %02x %02x %02x %02x "
@@ -4399,7 +4412,7 @@ rk_cdn_dp_fill_forced_mode(struct rk_cdn_dp_softc *sc)
 	sc->vsync_end = RK_DP_FORCED_VSYNC_END;
 	sc->h_sync_polarity = RK_DP_FORCED_H_POLARITY;
 	sc->v_sync_polarity = RK_DP_FORCED_V_POLARITY;
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "forced video mode: %ux%u @ %u kHz htotal=%u hsync=%u..%u (pol=%u) vtotal=%u vsync=%u..%u (pol=%u)\n",
 	    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz, sc->htotal,
 	    sc->hsync_start, sc->hsync_end, sc->h_sync_polarity, sc->vtotal,
@@ -4427,7 +4440,7 @@ rk_cdn_dp_fill_mode(struct rk_cdn_dp_softc *sc, uint32_t clock,
 	    ((flags & RK_CDN_DP_MODE_FLAG_PHSYNC) != 0) ? 1 : 0;
 	sc->v_sync_polarity =
 	    ((flags & RK_CDN_DP_MODE_FLAG_PVSYNC) != 0) ? 1 : 0;
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "selected video mode: %ux%u @ %u kHz htotal=%u hsync=%u..%u (pol=%u) vtotal=%u vsync=%u..%u (pol=%u)\n",
 	    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz, sc->htotal,
 	    sc->hsync_start, sc->hsync_end, sc->h_sync_polarity, sc->vtotal,
@@ -4570,7 +4583,7 @@ rk_cdn_dp_config_video(struct rk_cdn_dp_softc *sc)
 	error = rk_cdn_dp_mailbox_reg_write(sc, RK_CDN_DP_STREAM_CONFIG, 1);
 	if (error != 0)
 		return (error);
-	device_printf(sc->dev, "config_video: STREAM_CONFIG <- 0x00000001\n");
+	RK_CDN_DP_DPRINTF(sc, "config_video: STREAM_CONFIG <- 0x00000001\n");
 
 	val = (uint32_t)(sc->hsync_end - sc->hsync_start) |
 	    ((uint32_t)sc->hdisplay << 16);
@@ -4597,14 +4610,14 @@ rk_cdn_dp_config_video(struct rk_cdn_dp_softc *sc)
 	 */
 	error = rk_cdn_dp_mailbox_reg_write_bit(sc, RK_CDN_DP_DP_VB_ID, 2, 1, 0);
 	if (error != 0) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "config_video: DP_VB_ID NO_VIDEO clear failed (%d)\n",
 		    error);
 		return (error);
 	}
 
 	sc->video_configured = true;
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "config_video: TU=%u VS=%llu (rem=%u) %ux%u @ %u kHz, %u-lane HBR\n",
 	    tu, (unsigned long long)symbol, rem, sc->hdisplay, sc->vdisplay,
 	    sc->pixel_clock_khz, sc->link_plan_lanes);
@@ -4688,12 +4701,12 @@ rk_cdn_dp_auto_bringup_default(void)
 
 	error = rk_cdn_dp_set_stage(sc, RK_CDN_DP_STAGE_VIDEO_ON);
 	if (error != 0) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "auto_bringup_default: stage19 failed: %d\n", error);
 		return (error);
 	}
 
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "auto_bringup_default: stage19 complete (skip_aux_swap=%d lanes=%d)\n",
 	    sc->skip_aux_swap, sc->hostcap_lanes_override);
 	return (0);
@@ -5057,12 +5070,12 @@ rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 		    sc->vdisplay == vdisplay &&
 		    sc->vsync_start == vsync_start &&
 		    sc->vsync_end == vsync_end && sc->vtotal == vtotal) {
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "enable_mode: %ux%u already active, no-op\n",
 			    hdisplay, vdisplay);
 			return (0);
 		}
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "enable_mode: fast-path %ux%u@%u (skipping fw-reload, "
 		    "re-running config_video only)\n",
 		    hdisplay, vdisplay, clock);
@@ -5073,12 +5086,12 @@ rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 		sc->stage = RK_CDN_DP_STAGE_EDID;
 		error = rk_cdn_dp_set_stage(sc, RK_CDN_DP_STAGE_VIDEO_ON);
 		if (error != 0) {
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "enable_mode: fast-path config-video failed: %d\n",
 			    error);
 			return (error);
 		}
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "enable_mode: ready for %ux%u@%u kHz (fast-path)\n",
 		    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz);
 		return (0);
@@ -5114,7 +5127,7 @@ rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 		}
 	}
 
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "enable_mode: ready for %ux%u@%u kHz (fw_training=%d stage=%d)\n",
 	    sc->hdisplay, sc->vdisplay, sc->pixel_clock_khz,
 	    sc->fw_link_training_used ? 1 : 0, sc->stage);
@@ -5159,7 +5172,7 @@ rk_cdn_dp_start_link_training(struct rk_cdn_dp_softc *sc)
 	if (error != 0)
 		return (error);
 
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "link-train-start: status raw: %02x %02x %02x %02x %02x %02x\n",
 	    sc->link_status[0], sc->link_status[1], sc->link_status[2],
 	    sc->link_status[3], sc->link_status[4], sc->link_status[5]);
@@ -5311,7 +5324,7 @@ rk_cdn_dp_get_power_domain(struct rk_cdn_dp_softc *sc)
 	OF_prop_free(cells);
 
 	if (sc->power_dev == NULL) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "power-domain provider is not attached yet\n");
 		return (ENXIO);
 	}
@@ -5391,7 +5404,7 @@ fallback:
 	if (dc != NULL)
 		sc->extcon_dev = devclass_get_device(dc, 0);
 	if (sc->extcon_dev != NULL) {
-		device_printf(sc->dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "using fusb302 fallback extcon provider %s%d\n",
 		    device_get_name(sc->extcon_dev),
 		    device_get_unit(sc->extcon_dev));
@@ -6061,13 +6074,13 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 		case RK_CDN_DP_STAGE_POWER:
 			if (sc->has_power_domain) {
 				if (sc->power_dev == NULL) {
-					device_printf(sc->dev,
+					RK_CDN_DP_DPRINTF(sc,
 					    "power-domain provider not ready; load/enable rk3399_power first\n");
 					sc->last_error = ENXIO;
 					return (ENXIO);
 				}
 				if (rk_cdn_dp_power_domain_ready(sc)) {
-					device_printf(sc->dev,
+					RK_CDN_DP_DPRINTF(sc,
 					    "power-domain %u already on and bus-open; skipping provider enable\n",
 					    sc->power_domain_id);
 				} else {
@@ -6125,7 +6138,7 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			 * → enable_phy ordering.
 			 */
 			rk_cdn_dp_clock_reset(sc);
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "stage5: SOURCE_PHY_CAR=0x%08x SOURCE_DPTX_CAR=0x%08x\n",
 			    rk_cdn_dp_read_4(sc, RK_CDN_DP_SOURCE_PHY_CAR),
 			    rk_cdn_dp_read_4(sc, RK_CDN_DP_SOURCE_DPTX_CAR));
@@ -6198,7 +6211,7 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			error = rk_cdn_dp_select_hpd(sc);
 			if (error != 0) {
 				sc->last_error = error;
-				device_printf(sc->dev, "HPD select failed (%d)\n",
+				RK_CDN_DP_DPRINTF(sc, "HPD select failed (%d)\n",
 				    error);
 				return (error);
 			}
@@ -6207,7 +6220,7 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			error = rk_cdn_dp_mailbox_get_hpd_state(sc);
 			if (error != 0) {
 				sc->last_error = error;
-				device_printf(sc->dev, "HPD state failed (%d)\n",
+				RK_CDN_DP_DPRINTF(sc, "HPD state failed (%d)\n",
 				    error);
 				return (error);
 			}
@@ -6257,7 +6270,7 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				sc->aux_dpcd[1] = 0x06;	/* MAX_LINK_RATE 1.62 Gbps */
 				sc->aux_dpcd[2] = 0x02;	/* MAX_LANE_COUNT=2 */
 				rk_cdn_dp_record_sink_caps(sc);
-				device_printf(sc->dev,
+				RK_CDN_DP_DPRINTF(sc,
 				    "stage13: skip_dpcd=1, synthesized "
 				    "DPCD 1.1 / 1.62Gbps / 2-lane\n");
 				break;
@@ -6272,7 +6285,7 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				sc->aux_dpcd[1] = 0x06;	/* MAX_LINK_RATE 1.62 Gbps */
 				sc->aux_dpcd[2] = 0x02;	/* MAX_LANE_COUNT=2 */
 				rk_cdn_dp_record_sink_caps(sc);
-				device_printf(sc->dev,
+				RK_CDN_DP_DPRINTF(sc,
 				    "stage13: synthesized fallback "
 				    "DPCD 1.1 / 1.62Gbps / 2-lane\n");
 				break;
@@ -6288,29 +6301,29 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			}
 			break;
 		case RK_CDN_DP_STAGE_LINK_TRAIN_START:
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "stage15: entering link-train-start\n");
 			error = rk_cdn_dp_start_link_training(sc);
 			if (error != 0) {
 				sc->last_error = error;
-				device_printf(sc->dev,
+				RK_CDN_DP_DPRINTF(sc,
 				    "link-train-start failed (%d)\n", error);
 				return (error);
 			}
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "stage15: link-train-start done\n");
 			break;
 		case RK_CDN_DP_STAGE_LINK_TRAIN_FULL:
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "stage16: entering link-train-full\n");
 			error = rk_cdn_dp_link_train(sc);
 			if (error != 0) {
 				sc->last_error = error;
-				device_printf(sc->dev,
+				RK_CDN_DP_DPRINTF(sc,
 				    "link-train-full failed (%d)\n", error);
 				return (error);
 			}
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "stage16: link-train-full done\n");
 			break;
 		case RK_CDN_DP_STAGE_EDID:
@@ -6323,7 +6336,7 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 			}
 			break;
 		case RK_CDN_DP_STAGE_CONFIG_VIDEO:
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "stage18: entering config-video\n");
 			error = rk_cdn_dp_config_video(sc);
 			if (error != 0) {
@@ -6332,25 +6345,25 @@ rk_cdn_dp_set_stage(struct rk_cdn_dp_softc *sc, int target)
 				    "config-video failed (%d)\n", error);
 				return (error);
 			}
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "stage18: config-video done\n");
 			break;
 		case RK_CDN_DP_STAGE_VIDEO_ON:
 			if (!sc->fw_link_training_used) {
-				device_printf(sc->dev,
+				RK_CDN_DP_DPRINTF(sc,
 				    "stage19: software-trained link; no firmware video arm needed\n");
 				break;
 			}
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "stage19: entering video-idle arm\n");
 			error = rk_cdn_dp_set_video_status(sc, false);
 			if (error != 0) {
 				sc->last_error = error;
-				device_printf(sc->dev,
+				RK_CDN_DP_DPRINTF(sc,
 				    "video-idle arm failed (%d)\n", error);
 				return (error);
 			}
-			device_printf(sc->dev,
+			RK_CDN_DP_DPRINTF(sc,
 			    "stage19: video-idle armed; awaiting VOP live pixels\n");
 			break;
 		default:
@@ -6426,7 +6439,7 @@ rk_cdn_dp_sysctl_reset_state(SYSCTL_HANDLER_ARGS)
 		return (ENXIO);
 	}
 	rk_cdn_dp_reset_runtime_state(sc);
-	device_printf(sc->dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "reset_state: stage rewound to ATTACHED, tunables cleared\n");
 	sx_sunlock(&sc->detach_sx);
 	return (0);
@@ -6562,22 +6575,22 @@ rk_cdn_dp_attach(device_t dev)
 		device_printf(dev, "cannot allocate resources\n");
 		return (ENXIO);
 	}
-	device_printf(dev, "attach: resources allocated\n");
+	RK_CDN_DP_DPRINTF(sc, "attach: resources allocated\n");
 
 	error = rk_cdn_dp_get_power_domain(sc);
 	if (error != 0 && error != ENXIO) {
-		device_printf(dev, "attach: power-domain lookup failed (%d)\n",
+		RK_CDN_DP_DPRINTF(sc, "attach: power-domain lookup failed (%d)\n",
 		    error);
 		goto fail;
 	}
 	if (error == ENXIO) {
 		/* Provider may attach later; staging keeps this safe. */
-		device_printf(dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "attach: power-domain provider not ready yet; deferring provider use\n");
 		sc->power_dev = NULL;
 		error = 0;
 	}
-	device_printf(dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "attach: power-domain state has_prop=%s provider=%s id=%u\n",
 	    sc->has_power_domain ? "yes" : "no",
 	    sc->power_dev != NULL ? "yes" : "no", sc->power_domain_id);
@@ -6587,7 +6600,7 @@ rk_cdn_dp_attach(device_t dev)
 		    error);
 		error = 0;
 	}
-	device_printf(dev, "attach: extcon dt=%s provider=%s\n",
+	RK_CDN_DP_DPRINTF(sc, "attach: extcon dt=%s provider=%s\n",
 	    sc->has_extcon ? "yes" : "no",
 	    sc->extcon_dev != NULL ? device_get_nameunit(sc->extcon_dev) : "none");
 	if (OF_hasprop(sc->node, "rockchip,grf") &&
@@ -6597,10 +6610,14 @@ rk_cdn_dp_attach(device_t dev)
 		error = ENXIO;
 		goto fail;
 	}
-	device_printf(dev, "attach: grf=%s\n", sc->grf != NULL ? "yes" : "no");
+	RK_CDN_DP_DPRINTF(sc, "attach: grf=%s\n", sc->grf != NULL ? "yes" : "no");
 
 	ctx = device_get_sysctl_ctx(dev);
 	tree = device_get_sysctl_tree(dev);
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "debug", CTLFLAG_RW, &sc->debug, 0,
+	    "Enable verbose trace prints (mailbox / AUX / stage walk / "
+	    "audio path). 0=off (default), 1=on");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "stage", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_stage, "I",
@@ -6846,7 +6863,7 @@ rk_cdn_dp_attach(device_t dev)
 	    sc->has_extcon ? "yes" : "no",
 	    sc->res[RK_CDN_DP_RES_IRQ] != NULL ? "present" : "absent");
 	if (sc->rockpro64_typec0_only)
-		device_printf(dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "board recipe: RockPro64 USB-C DP is fixed to TYPEC0/PHY0\n");
 	if (sc->extcon_dev != NULL)
 		device_printf(dev, "Type-C extcon provider: %s\n",
@@ -6854,7 +6871,7 @@ rk_cdn_dp_attach(device_t dev)
 	rk_cdn_dp_snapshot_typec_state(sc, "attach typec snapshot");
 
 	defer = rk_cdn_dp_defer_enable();
-	device_printf(dev,
+	RK_CDN_DP_DPRINTF(sc,
 	    "bring-up deferred=%s allow_phys=%s allow_aux=%s\n",
 	    defer ? "yes" : "no",
 	    sc->allow_phys ? "yes" : "no",
@@ -6867,13 +6884,13 @@ rk_cdn_dp_attach(device_t dev)
 	error = iic_dp_aux_add_bus(dev, "rk_cdn_dp_aux",
 	    rk_cdn_dp_aux_i2c_xfer, sc, &sc->aux_iicbus, &sc->aux_iic_adapter);
 	if (error != 0) {
-		device_printf(dev,
+		RK_CDN_DP_DPRINTF(sc,
 		    "AUX-backed iicbus unavailable (%d); continuing without it\n",
 		    -error);
 		sc->aux_iicbus = NULL;
 		sc->aux_iic_adapter = NULL;
 	} else {
-		device_printf(dev, "AUX-backed iicbus registered: %s\n",
+		RK_CDN_DP_DPRINTF(sc, "AUX-backed iicbus registered: %s\n",
 		    sc->aux_iic_adapter != NULL ?
 		    device_get_nameunit(sc->aux_iic_adapter) : "unknown");
 	}
