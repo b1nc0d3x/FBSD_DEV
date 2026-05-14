@@ -326,6 +326,9 @@ int iic_dp_aux_add_bus(device_t dev, const char *name,
  * range mapped via RK_CDN_DP_RES_MEM).  Offsets from RK3399 Linux 4.4
  * BSP cdn-dp-reg.h.
  */
+#define	RK_CDN_DP_CM_CTRL		0x0a00	/* mailbox-accessed */
+#define	RK_CDN_DP_CM_LANE_CTRL		0x0a10	/* mailbox-accessed */
+#define	RK_CDN_DP_LANE_REF_CYC		0xf000
 #define	RK_CDN_DP_AUDIO_SRC_CNTL	0x30000
 #define	RK_CDN_DP_AUDIO_SRC_CNFG	0x30004
 #define	RK_CDN_DP_COM_CH_STTS_BITS	0x30008
@@ -335,7 +338,24 @@ int iic_dp_aux_add_bus(device_t dev, const char *name,
 #define	RK_CDN_DP_SMPL2PKT_CNFG		0x30084
 #define	RK_CDN_DP_FIFO_CNTL		0x30088
 #define	RK_CDN_DP_AUDIO_PACK_CONTROL	0x2214	/* mailbox write target */
-#define	RK_CDN_DP_DP_VB_ID		0x2258	/* mailbox bit access */
+#define	RK_CDN_DP_AUDIO_PACK_STATUS	0x2298
+#define	RK_CDN_DP_PCK_STUFF_STATUS_0	0x22a0
+#define	RK_CDN_DP_PCK_STUFF_STATUS_1	0x22a4
+#define	RK_CDN_DP_VIF_STATUS		0x229c
+
+/* SDP (Secondary-Data Packet) infoframe write path, direct MMIO. */
+#define	RK_CDN_DP_SOURCE_PIF_WR_ADDR		0x30800
+#define	RK_CDN_DP_SOURCE_PIF_WR_REQ		0x30804
+#define	RK_CDN_DP_SOURCE_PIF_DATA_WR		0x30810
+#define	RK_CDN_DP_SOURCE_PIF_PKT_ALLOC_REG	0x3082c
+#define	RK_CDN_DP_SOURCE_PIF_PKT_ALLOC_WR_EN	0x30830
+#define	RK_CDN_DP_HOST_WR			(1U << 0)
+#define	RK_CDN_DP_PKT_ALLOC_WR_EN		(1U << 0)
+#define	RK_CDN_DP_TYPE_VALID			(1U << 16)
+#define	RK_CDN_DP_ACTIVE_IDLE_TYPE(x)		(((x) & 0x1) << 17)
+#define	RK_CDN_DP_PACKET_TYPE(x)		(((x) & 0xff) << 8)
+#define	RK_CDN_DP_PKT_ALLOC_ADDRESS(x)		((x) & 0xf)
+#define	RK_CDN_DP_HDMI_INFOFRAME_TYPE_AUDIO	0x84
 
 /* Audio config bit fields. */
 #define	RK_CDN_DP_AUDIO_PACK_EN		(1U << 8)
@@ -2207,6 +2227,189 @@ rk_cdn_dp_sysctl_audio_stop_now(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 	(void)arg1;
 	return (rk_cdn_dp_audio_stop());
+}
+
+/*
+ * Walk the cached EDID looking for a CTA-861 extension block and,
+ * within it, any Short Audio Descriptors.  This is the source of
+ * truth for whether the sink advertises DP audio support — a sink
+ * with no SADs in its EDID will silently discard our audio packets
+ * regardless of how perfectly we packetize them.
+ */
+static int
+rk_cdn_dp_sysctl_edid_audio_dump(SYSCTL_HANDLER_ARGS)
+{
+	static const char *fmt_name[16] = {
+		"reserved", "LPCM", "AC-3", "MPEG1", "MP3", "MPEG2",
+		"AAC LC", "DTS", "ATRAC", "DSD", "E-AC-3", "DTS-HD",
+		"MLP/TrueHD", "DST", "WMA Pro", "extended"
+	};
+	struct rk_cdn_dp_softc *sc;
+	int error, val = 0;
+	const uint8_t *cta;
+	uint8_t dtd_offset, dbc_end;
+	unsigned int idx, dbc_off;
+	int sad_count = 0;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+	sc = arg1;
+	if (sc == NULL)
+		return (ENXIO);
+	if (!sc->edid_valid || sc->edid_len < 256) {
+		device_printf(sc->dev,
+		    "edid_audio_dump: EDID not cached or no extension "
+		    "block (valid=%d len=%u)\n",
+		    (int)sc->edid_valid, (unsigned int)sc->edid_len);
+		return (ENXIO);
+	}
+
+	cta = &sc->edid[128];
+	if (cta[0] != 0x02) {
+		device_printf(sc->dev,
+		    "edid_audio_dump: ext block tag=0x%02x is not CTA-861 "
+		    "(0x02) — no audio info\n", cta[0]);
+		return (0);
+	}
+	dtd_offset = cta[2];
+	device_printf(sc->dev,
+	    "edid_audio_dump: CTA-861 rev=%u dtd_offset=0x%02x flags=0x%02x "
+	    "(YCbCr444=%d YCbCr422=%d basic_audio=%d underscan=%d, ndtd=%d)\n",
+	    cta[1], dtd_offset, cta[3],
+	    (cta[3] >> 5) & 1, (cta[3] >> 4) & 1,
+	    (cta[3] >> 6) & 1, (cta[3] >> 7) & 1,
+	    cta[3] & 0x0f);
+	if (dtd_offset < 4 || dtd_offset > 128) {
+		device_printf(sc->dev,
+		    "edid_audio_dump: invalid dtd_offset, bailing\n");
+		return (0);
+	}
+	dbc_end = dtd_offset;
+	dbc_off = 4;
+	while (dbc_off < dbc_end) {
+		uint8_t hdr = cta[dbc_off];
+		uint8_t tag = (hdr >> 5) & 0x07;
+		uint8_t blen = hdr & 0x1f;
+
+		if (tag == 1) { /* Audio Data Block */
+			for (idx = 0; idx + 3 <= blen; idx += 3) {
+				const uint8_t *s =
+				    &cta[dbc_off + 1 + idx];
+				uint8_t fmt = (s[0] >> 3) & 0x0f;
+				uint8_t ch  = (s[0] & 0x07) + 1;
+				device_printf(sc->dev,
+				    "edid_audio_dump:  SAD%d fmt=%u(%s) "
+				    "ch=%u rates=0x%02x byte2=0x%02x\n",
+				    sad_count, fmt, fmt_name[fmt], ch,
+				    s[1], s[2]);
+				sad_count++;
+			}
+		}
+		dbc_off += 1 + blen;
+		if (blen == 0)
+			break;
+	}
+	if (sad_count == 0) {
+		device_printf(sc->dev,
+		    "edid_audio_dump: NO Short Audio Descriptors found — "
+		    "sink does NOT advertise DP audio support\n");
+	} else {
+		device_printf(sc->dev,
+		    "edid_audio_dump: %d SAD(s) found — sink claims audio "
+		    "support (basic_audio=%d for stereo LPCM 32/44.1/48kHz)\n",
+		    sad_count, (cta[3] >> 6) & 1);
+	}
+	return (0);
+}
+
+/*
+ * Read back the audio packetizer + mute state via the mailbox plus
+ * the direct-MMIO audio sub-block + SDP PIF slot 0 status.  Lets us
+ * confirm that audio_start_now actually armed the cadence side
+ * (without trusting the no-status-feedback mailbox write path).
+ */
+static int
+rk_cdn_dp_sysctl_audio_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val = 0;
+	uint32_t pack_ctrl = 0, vb_id = 0;
+	uint32_t pack_status = 0, vif_status = 0;
+	uint32_t stuff_0 = 0, stuff_1 = 0;
+	uint32_t src_cntl, src_cnfg, smpl_cntl, smpl_cnfg;
+	uint32_t fifo_cntl, com_ch, spdif_ctrl;
+	uint32_t pif_alloc, pif_wr_en, pif_wr_addr, pif_wr_req;
+	int e_pack, e_vb, e_pkst, e_vif, e_s0, e_s1;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+	sc = arg1;
+	if (sc == NULL)
+		return (ENXIO);
+
+	e_pack = rk_cdn_dp_mailbox_reg_read(sc, RK_CDN_DP_AUDIO_PACK_CONTROL,
+	    &pack_ctrl);
+	e_vb   = rk_cdn_dp_mailbox_reg_read(sc, RK_CDN_DP_DP_VB_ID, &vb_id);
+	e_pkst = rk_cdn_dp_mailbox_reg_read(sc, RK_CDN_DP_AUDIO_PACK_STATUS,
+	    &pack_status);
+	e_vif  = rk_cdn_dp_mailbox_reg_read(sc, RK_CDN_DP_VIF_STATUS,
+	    &vif_status);
+	e_s0   = rk_cdn_dp_mailbox_reg_read(sc, RK_CDN_DP_PCK_STUFF_STATUS_0,
+	    &stuff_0);
+	e_s1   = rk_cdn_dp_mailbox_reg_read(sc, RK_CDN_DP_PCK_STUFF_STATUS_1,
+	    &stuff_1);
+
+	src_cntl    = rk_cdn_dp_read_4(sc, RK_CDN_DP_AUDIO_SRC_CNTL);
+	src_cnfg    = rk_cdn_dp_read_4(sc, RK_CDN_DP_AUDIO_SRC_CNFG);
+	smpl_cntl   = rk_cdn_dp_read_4(sc, RK_CDN_DP_SMPL2PKT_CNTL);
+	smpl_cnfg   = rk_cdn_dp_read_4(sc, RK_CDN_DP_SMPL2PKT_CNFG);
+	fifo_cntl   = rk_cdn_dp_read_4(sc, RK_CDN_DP_FIFO_CNTL);
+	com_ch      = rk_cdn_dp_read_4(sc, RK_CDN_DP_COM_CH_STTS_BITS);
+	spdif_ctrl  = rk_cdn_dp_read_4(sc, RK_CDN_DP_SPDIF_CTRL_ADDR);
+	pif_alloc   = rk_cdn_dp_read_4(sc, RK_CDN_DP_SOURCE_PIF_PKT_ALLOC_REG);
+	pif_wr_en   = rk_cdn_dp_read_4(sc, RK_CDN_DP_SOURCE_PIF_PKT_ALLOC_WR_EN);
+	pif_wr_addr = rk_cdn_dp_read_4(sc, RK_CDN_DP_SOURCE_PIF_WR_ADDR);
+	pif_wr_req  = rk_cdn_dp_read_4(sc, RK_CDN_DP_SOURCE_PIF_WR_REQ);
+
+	device_printf(sc->dev,
+	    "audio_dump: mb AUDIO_PACK_CONTROL=0x%08x (e=%d, want bit8=1)\n",
+	    pack_ctrl, e_pack);
+	device_printf(sc->dev,
+	    "audio_dump: mb DP_VB_ID=0x%08x (e=%d, want bit4=0 unmuted)\n",
+	    vb_id, e_vb);
+	device_printf(sc->dev,
+	    "audio_dump: AUDIO_SRC_CNTL=0x%08x (want bit1=I2S_DEC_START)\n",
+	    src_cntl);
+	device_printf(sc->dev,
+	    "audio_dump: AUDIO_SRC_CNFG=0x%08x\n", src_cnfg);
+	device_printf(sc->dev,
+	    "audio_dump: SMPL2PKT_CNTL=0x%08x (want bit1=SMPL2PKT_EN)\n",
+	    smpl_cntl);
+	device_printf(sc->dev,
+	    "audio_dump: SMPL2PKT_CNFG=0x%08x\n", smpl_cnfg);
+	device_printf(sc->dev,
+	    "audio_dump: FIFO_CNTL=0x%08x  COM_CH_STTS=0x%08x  SPDIF_CTRL=0x%08x\n",
+	    fifo_cntl, com_ch, spdif_ctrl);
+	device_printf(sc->dev,
+	    "audio_dump: PIF_PKT_ALLOC=0x%08x (want TYPE_VALID+PACKET_TYPE=0x84)\n",
+	    pif_alloc);
+	device_printf(sc->dev,
+	    "audio_dump: PIF_WR_EN=0x%08x  WR_ADDR=0x%08x  WR_REQ=0x%08x\n",
+	    pif_wr_en, pif_wr_addr, pif_wr_req);
+	device_printf(sc->dev,
+	    "audio_dump: mb AUDIO_PACK_STATUS=0x%08x (e=%d) VIF_STATUS=0x%08x (e=%d)\n",
+	    pack_status, e_pkst, vif_status, e_vif);
+	device_printf(sc->dev,
+	    "audio_dump: mb PCK_STUFF_STATUS_0=0x%08x (e=%d) STATUS_1=0x%08x (e=%d)\n",
+	    stuff_0, e_s0, stuff_1, e_s1);
+
+	return (0);
 }
 
 /*
@@ -4563,7 +4766,29 @@ rk_cdn_dp_audio_config_i2s_locked(struct rk_cdn_dp_softc *sc,
 	uint32_t val;
 	int sub_pckt_num = 1;
 	int i2s_port_en_val = 0xf;
-	int i;
+	int i, error;
+
+	/*
+	 * Bring the cdn-dp clock manager into the state the audio
+	 * sub-block needs.  Without these two mailbox writes, MMIO
+	 * accesses to AUDIO_SRC_CNTL / FIFO_CNTL / SMPL2PKT_CNTL
+	 * (offsets 0x30000+) hit an unpowered region and fault the
+	 * kernel.  Mirrors cdn_dp_audio_config in the Rockchip 4.4
+	 * BSP.
+	 */
+	error = rk_cdn_dp_mailbox_reg_write(sc, RK_CDN_DP_CM_LANE_CTRL,
+	    RK_CDN_DP_LANE_REF_CYC);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "audio_config: CM_LANE_CTRL write failed %d\n", error);
+		return (error);
+	}
+	error = rk_cdn_dp_mailbox_reg_write(sc, RK_CDN_DP_CM_CTRL, 0);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "audio_config: CM_CTRL write failed %d\n", error);
+		return (error);
+	}
 
 	if (channels == 2) {
 		sub_pckt_num = (lanes == 1) ? 2 : 4;
@@ -4629,6 +4854,64 @@ rk_cdn_dp_audio_config_i2s_locked(struct rk_cdn_dp_softc *sc,
 	    RK_CDN_DP_AUDIO_PACK_CONTROL, RK_CDN_DP_AUDIO_PACK_EN));
 }
 
+/*
+ * Write a 32-byte DP Secondary Data Packet (SDP) into one of the
+ * cdn-dp packet allocation slots.  Direct MMIO path: stream the data
+ * words through SOURCE_PIF_DATA_WR, then poke the packet-type/slot
+ * registers to arm it.  Matches Rockchip 4.4 BSP cdn_dp_infoframe_set.
+ */
+static void
+rk_cdn_dp_infoframe_set_locked(struct rk_cdn_dp_softc *sc, int entry_id,
+    const uint8_t *buf, uint32_t len, int type)
+{
+	uint32_t words;
+	uint32_t v;
+	unsigned int i;
+
+	words = len / 4;
+	for (i = 0; i < words; i++) {
+		v = (uint32_t)buf[i * 4] |
+		    ((uint32_t)buf[i * 4 + 1] << 8) |
+		    ((uint32_t)buf[i * 4 + 2] << 16) |
+		    ((uint32_t)buf[i * 4 + 3] << 24);
+		rk_cdn_dp_write_4(sc, RK_CDN_DP_SOURCE_PIF_DATA_WR, v);
+	}
+
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SOURCE_PIF_WR_ADDR,
+	    (uint32_t)entry_id);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SOURCE_PIF_WR_REQ,
+	    RK_CDN_DP_HOST_WR);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SOURCE_PIF_PKT_ALLOC_REG,
+	    RK_CDN_DP_ACTIVE_IDLE_TYPE(1) | RK_CDN_DP_TYPE_VALID |
+	    RK_CDN_DP_PACKET_TYPE(type) |
+	    RK_CDN_DP_PKT_ALLOC_ADDRESS(entry_id));
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SOURCE_PIF_PKT_ALLOC_WR_EN,
+	    RK_CDN_DP_PKT_ALLOC_WR_EN);
+}
+
+/*
+ * Build a minimal HDMI audio infoframe SDP and push it to slot 0,
+ * type 0x84.  For stream-encoded fields (coding_type=STREAM,
+ * sample_frequency=STREAM, sample_size=STREAM, channels=0) every
+ * body byte is zero, so the packed buffer collapses to a 32-byte
+ * payload of (HB0=0, HB1=0x84, HB2=0x1b, HB3=0x48) followed by 28
+ * zero bytes.  Ported from BSP cdn_dp_setup_audio_infoframe.
+ */
+static void
+rk_cdn_dp_setup_audio_infoframe_locked(struct rk_cdn_dp_softc *sc)
+{
+	uint8_t sdp[32];
+
+	memset(sdp, 0, sizeof(sdp));
+	sdp[0] = 0;
+	sdp[1] = RK_CDN_DP_HDMI_INFOFRAME_TYPE_AUDIO;
+	sdp[2] = 0x1b;
+	sdp[3] = 0x48;
+
+	rk_cdn_dp_infoframe_set_locked(sc, 0, sdp, sizeof(sdp),
+	    RK_CDN_DP_HDMI_INFOFRAME_TYPE_AUDIO);
+}
+
 int
 rk_cdn_dp_audio_mute(bool mute)
 {
@@ -4660,6 +4943,35 @@ rk_cdn_dp_audio_start(int channels, int sample_rate, int sample_width)
 		return (ENXIO);
 
 	(void)rk_cdn_dp_audio_mute(true);
+
+	/*
+	 * Idempotent: tear down any prior audio config before
+	 * re-arming.  Without this, a second audio_start_now after a
+	 * working first run hits half-configured state and faults.
+	 */
+	(void)rk_cdn_dp_mailbox_reg_write(sc,
+	    RK_CDN_DP_AUDIO_PACK_CONTROL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SPDIF_CTRL_ADDR, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNTL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNFG, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNTL,
+	    RK_CDN_DP_AUDIO_SW_RST);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_AUDIO_SRC_CNTL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SMPL2PKT_CNTL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SMPL2PKT_CNTL,
+	    RK_CDN_DP_AUDIO_SW_RST);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_SMPL2PKT_CNTL, 0);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_FIFO_CNTL,
+	    RK_CDN_DP_AUDIO_SW_RST);
+	rk_cdn_dp_write_4(sc, RK_CDN_DP_FIFO_CNTL, 0);
+
+	/*
+	 * Order matches BSP cdn_dp_audio_hw_params: infoframe SDP must
+	 * be armed before the audio packetizer starts emitting samples,
+	 * otherwise the sink discards every packet.
+	 */
+	rk_cdn_dp_setup_audio_infoframe_locked(sc);
+
 	error = rk_cdn_dp_audio_config_i2s_locked(sc, channels,
 	    sample_rate, sample_width, sc->link_plan_lanes);
 	if (error != 0) {
@@ -4669,7 +4981,7 @@ rk_cdn_dp_audio_start(int channels, int sample_rate, int sample_width)
 	}
 	(void)rk_cdn_dp_audio_mute(false);
 	device_printf(sc->dev,
-	    "audio_start: I2S %dch %dHz %dbit unmuted\n",
+	    "audio_start: I2S %dch %dHz %dbit infoframe+unmuted\n",
 	    channels, sample_rate, sample_width);
 	return (0);
 }
@@ -6386,6 +6698,14 @@ rk_cdn_dp_attach(device_t dev)
 	    "audio_stop_now", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_audio_stop_now, "I",
 	    "Write 1 to mute + reset DP audio packetizer");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "audio_dump", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_audio_dump, "I",
+	    "Write 1 to print AUDIO_PACK_CONTROL / DP_VB_ID / audio sub-block / SDP PIF state");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "edid_audio_dump", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_edid_audio_dump, "I",
+	    "Write 1 to dump CTA-861 audio capabilities from cached EDID");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "display_power", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_display_power, "I",
