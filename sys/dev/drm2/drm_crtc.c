@@ -2478,7 +2478,21 @@ int drm_mode_dirtyfb_ioctl(struct drm_device *dev,
 	sx_xlock(&dev->mode_config.mutex);
 	obj = drm_mode_object_find(dev, r->fb_id, DRM_MODE_OBJECT_FB);
 	if (!obj) {
-		ret = -EINVAL;
+		/*
+		 * X.org modesetting probes dirty support with
+		 * drmModeDirtyFB(fd, fb_id, NULL, 0) BEFORE the first
+		 * framebuffer is created.  If we return EINVAL or
+		 * ENOSYS here, modesetting permanently disables damage
+		 * tracking and never delivers pixels via DIRTYFB.
+		 * For the no-clip probe case, accept it as "supported"
+		 * so dirty tracking gets enabled.  Real dirty calls
+		 * will provide a valid fb_id and reach the driver.
+		 */
+		if (r->num_clips == 0 && r->clips_ptr == 0) {
+			ret = 0;
+		} else {
+			ret = -EINVAL;
+		}
 		goto out_err1;
 	}
 	fb = obj_to_fb(obj);
