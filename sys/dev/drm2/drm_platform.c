@@ -143,6 +143,12 @@ int drm_get_platform_dev(device_t kdev, struct drm_device *dev,
 	if (ret)
 		goto err_g2;
 
+	if (drm_core_check_feature(dev, DRIVER_RENDER)) {
+		ret = drm_get_minor(dev, &dev->render, DRM_MINOR_RENDER);
+		if (ret)
+			goto err_g_render;
+	}
+
 	if (dev->driver->load) {
 		ret = dev->driver->load(dev, 0);
 		if (ret)
@@ -170,6 +176,9 @@ int drm_get_platform_dev(device_t kdev, struct drm_device *dev,
 	return 0;
 
 err_g3:
+	if (drm_core_check_feature(dev, DRIVER_RENDER))
+		drm_put_minor(&dev->render);
+err_g_render:
 	drm_put_minor(&dev->primary);
 err_g2:
 	if (drm_core_check_feature(dev, DRIVER_MODESET))

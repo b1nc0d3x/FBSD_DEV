@@ -280,8 +280,18 @@ int drm_getcap(struct drm_device *dev, void *data, struct drm_file *file_priv)
 		req->value = dev->mode_config.prefer_shadow;
 		break;
 	case DRM_CAP_PRIME:
-		req->value |= false /* XXXKIB dev->driver->prime_fd_to_handle */ ? DRM_PRIME_CAP_IMPORT : 0;
-		req->value |= false /* XXXKIB dev->driver->prime_handle_to_fd */ ? DRM_PRIME_CAP_EXPORT : 0;
+		/*
+		 * Advertise PRIME export/import capability now that the
+		 * FREEBSD_NOTYET guard around DRM_IOCTL_PRIME_* is gone
+		 * and drm_prime.c provides default ioctl bodies that
+		 * wrap any gem_obj as a struct file fd.  A driver may
+		 * still override via prime_handle_to_fd / prime_fd_to_handle
+		 * callbacks; we advertise the cap unconditionally because
+		 * the default helper works for any driver with a gem
+		 * pager.
+		 */
+		req->value |= DRM_PRIME_CAP_IMPORT;
+		req->value |= DRM_PRIME_CAP_EXPORT;
 		break;
 	case DRM_CAP_TIMESTAMP_MONOTONIC:
 		req->value = drm_timestamp_monotonic;
