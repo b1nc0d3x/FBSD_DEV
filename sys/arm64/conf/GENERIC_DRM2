@@ -1,0 +1,10 @@
+include		GENERIC
+ident		GENERIC_DRM2
+
+# Add the in-base drm2 stack so loadable DRM-KMS drivers
+# (e.g. virtio_drm) can link to drm_*() symbols at kldload.
+device		drm2
+
+# Exclude the in-tree virtio_gpu driver so our virtio_drm.ko, loaded
+# from rc.conf kld_list, binds to virtio-gpu-pci instead.
+nodevice	virtio_gpu
