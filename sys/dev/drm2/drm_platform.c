@@ -143,6 +143,8 @@ int drm_get_platform_dev(device_t kdev, struct drm_device *dev,
 	if (ret)
 		goto err_g2;
 
+	/* Opt-in: drivers that advertise DRIVER_RENDER get a render node
+	 * (/dev/dri/renderD<n>) for unprivileged DRI3 clients. */
 	if (drm_core_check_feature(dev, DRIVER_RENDER)) {
 		ret = drm_get_minor(dev, &dev->render, DRM_MINOR_RENDER);
 		if (ret)

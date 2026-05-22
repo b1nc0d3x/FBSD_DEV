@@ -154,6 +154,7 @@ struct drm_device;
 #define DRIVER_GEM         0x1000
 #define DRIVER_MODESET     0x2000
 #define DRIVER_PRIME       0x4000
+/* DRIVER_RENDER: driver wants /dev/dri/renderD<n> (DRI3 render node). */
 #define DRIVER_RENDER      0x8000
 
 #define DRIVER_BUS_PCI 0x1
