@@ -117,6 +117,31 @@ struct rk_drm_softc {
 	uint32_t		dp_last_altmode_status;	/* for HPD_IRQ rising-edge */
 	uint32_t		fusb302_attach_seq_prev;/* cable-reattach edge */
 	bool			fusb302_attach_seq_init;
+	/*
+	 * Snapshot of the framebuffer the userspace SETCRTC ioctl
+	 * last bound via rk_drm_crtc_mode_set_base().  Stashed
+	 * whenever the programmed paddr differs from sc->fb_pa (the
+	 * coherent boot fb), so the USB-C DP attach-edge auto-recovery
+	 * can re-point WIN0 at the live X-session fb instead of
+	 * falling back to boot fb (which would only show backlight +
+	 * initial bg colour after a replug).
+	 *
+	 * `valid == false` means no SETCRTC has bound a non-boot fb
+	 * yet, so the legacy crtc->fb fallback applies.
+	 * `session_id` bumps on every fresh bind; consumers compare
+	 * to detect re-bindings (e.g. SLiM restarts) and decide
+	 * whether to discard cached state.
+	 */
+	struct {
+		vm_paddr_t	paddr;		/* physical addr of fb */
+		uint32_t	width;		/* horizontal pixels    */
+		uint32_t	height;		/* vertical pixels      */
+		uint32_t	depth;		/* bits per pixel       */
+		uint32_t	stride;		/* bytes per row        */
+		uint32_t	format;		/* DRM_FORMAT_*         */
+		uint32_t	session_id;	/* bumps on each bind   */
+		bool		valid;
+	} user_fb;
 	bool			pending_flip_put;
 	int			vblank_ticks;
 	struct drm_framebuffer	*pending_fb;

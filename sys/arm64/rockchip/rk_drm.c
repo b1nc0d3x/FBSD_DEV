@@ -2719,6 +2719,51 @@ rk_drm_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
 	error = rk_drm_hw_set_scanout_locked(sc, paddr, stride);
 	if (error != 0)
 		return (-error);
+	/*
+	 * Stash anything that isn't the coherent boot fb -- that's an
+	 * X-bound buffer the user-space SETCRTC ioctl just programmed.
+	 * The USB-C DP attach-edge auto-recovery in hpd_task uses this
+	 * snapshot to put WIN0 back on the live session fb after a
+	 * cable replug, instead of falling back to the boot fb.
+	 */
+	if (crtc->fb != NULL && paddr != sc->fb_pa) {
+		sc->user_fb.paddr = paddr;
+		sc->user_fb.stride = stride;
+		sc->user_fb.width = crtc->fb->width;
+		sc->user_fb.height = crtc->fb->height;
+		sc->user_fb.depth = crtc->fb->bits_per_pixel;
+		sc->user_fb.format = crtc->fb->pixel_format;
+		sc->user_fb.session_id++;
+		sc->user_fb.valid = true;
+	}
+	return (0);
+}
+
+/*
+ * rk_drm_get_user_fb_paddr
+ *
+ * Read the last X-session framebuffer that user-space SETCRTC bound
+ * via rk_drm_crtc_mode_set_base().  Used by the USB-C DP attach-edge
+ * auto-recovery to re-bind WIN0 to the live X fb after a cable
+ * replug, regardless of whatever crtc->fb currently points at (which
+ * may have been swapped to the boot or black buffer by DPMS-off).
+ *
+ * Returns 0 and fills the out-pointers when a valid X-bound fb has
+ * been seen, ENOENT otherwise (caller should fall back to the
+ * crtc->fb path).  The full snapshot (H/W/depth/format/session_id) is
+ * available as `sc->user_fb` for callers that need more than just
+ * the scanout-set parameters.
+ */
+static int
+rk_drm_get_user_fb_paddr(struct rk_drm_softc *sc, vm_paddr_t *paddr,
+    uint32_t *stride)
+{
+	if (!sc->user_fb.valid || sc->user_fb.paddr == 0)
+		return (ENOENT);
+	if (paddr != NULL)
+		*paddr = sc->user_fb.paddr;
+	if (stride != NULL)
+		*stride = sc->user_fb.stride;
 	return (0);
 }
 
@@ -3167,26 +3212,113 @@ rk_drm_hpd_task(void *arg, int pending)
 					 */
 					sc->output_select =
 					    RK_DRM_OUTPUT_USBC_DP;
-					rerr = cdn_retrain != NULL ?
-					    cdn_retrain() : ENOENT;
+					/*
+					 * Retry retrain on EIO -- typec_phy
+					 * may not be at A0_READY the instant
+					 * attach_seq bumps, and rk_cdn_dp's
+					 * post-train link_status check
+					 * returns EIO when the sink isn't
+					 * yet ACK'ing AUX.  3 attempts with
+					 * a 250ms settle apiece (cap ~750ms)
+					 * covers both Cadence-firmware
+					 * settle and most PHY warm-up paths;
+					 * stays well within the hpd_task
+					 * tick budget (hz=1s) so we don't
+					 * stretch into the next iteration.
+					 */
+					if (cdn_retrain != NULL) {
+						int attempt;
+						for (attempt = 0;
+						    attempt < 3; attempt++) {
+							if (attempt > 0)
+								pause_sbt(
+								    "dpretry",
+								    SBT_1MS *
+								    250, 0, 0);
+							rerr = cdn_retrain();
+							if (rerr == 0)
+								break;
+							device_printf(sc->dev,
+							    "DP attach-edge "
+							    "recovery: "
+							    "retrain attempt %d "
+							    "failed (%d), "
+							    "retrying\n",
+							    attempt + 1, rerr);
+						}
+					} else {
+						rerr = ENOENT;
+					}
 					rk_drm_dp_mode_fill(&mode);
 					merr = rk_drm_hw_modeset_dp_locked(sc,
 					    &mode);
 					verr = set_video_active != NULL ?
 					    set_video_active(true) : ENOENT;
 					serr = 0;
-					fb = sc->crtc.fb;
-					if (merr == 0 && fb != NULL)
-						serr =
-						    rk_drm_crtc_mode_set_base(
-							&sc->crtc, sc->crtc.x,
-							sc->crtc.y, NULL);
+					/*
+					 * Prefer the last X-session fb we
+					 * stashed in rk_drm_crtc_mode_set_base
+					 * over crtc->fb (the latter may have
+					 * been pinned to boot fb by a DPMS-off
+					 * swap that ran before the unplug, in
+					 * which case the recovery would
+					 * succeed at every layer except the
+					 * one that matters -- the panel just
+					 * shows backlight + initial bg).
+					 */
+					if (merr == 0) {
+						vm_paddr_t ufb_pa;
+						uint32_t ufb_stride;
+
+						if (rk_drm_get_user_fb_paddr(sc,
+						    &ufb_pa, &ufb_stride) == 0) {
+							serr =
+							    rk_drm_hw_set_scanout_locked(
+								sc, ufb_pa,
+								ufb_stride);
+							device_printf(sc->dev,
+							    "DP attach-edge "
+							    "recovery: pinned "
+							    "WIN0 to user fb "
+							    "pa=0x%jx %ux%u "
+							    "stride=%u "
+							    "session=%u\n",
+							    (uintmax_t)ufb_pa,
+							    sc->user_fb.width,
+							    sc->user_fb.height,
+							    ufb_stride,
+							    sc->user_fb.session_id);
+						} else {
+							fb = sc->crtc.fb;
+							if (fb != NULL)
+								serr =
+								    rk_drm_crtc_mode_set_base(
+									&sc->crtc,
+									sc->crtc.x,
+									sc->crtc.y,
+									NULL);
+						}
+					}
 					device_printf(sc->dev,
 					    "DP attach-edge recovery: "
 					    "retrain=%d modeset=%d arm=%d "
 					    "scanout=%d\n",
 					    rerr, merr, verr, serr);
 					sc->dp_last_altmode_status = 0;
+					/*
+					 * Wake userspace.  Our in-kernel
+					 * retrain + modeset + scanout-rebind
+					 * pins WIN0 to whatever sc->crtc.fb
+					 * currently points at -- which after
+					 * a DPMS-off cycle is the boot fb,
+					 * not the X-session fb.  Fire a
+					 * connector hotplug event so X /
+					 * SLiM re-runs its own ioctl-driven
+					 * modeset against its own fb and
+					 * the live session reappears, not
+					 * just the boot framebuffer.
+					 */
+					drm_helper_hpd_irq_event(&sc->drm_dev);
 				}
 			}
 		}
