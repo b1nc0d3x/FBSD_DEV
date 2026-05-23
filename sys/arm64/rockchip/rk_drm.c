@@ -3198,20 +3198,40 @@ rk_drm_hpd_task(void *arg, int pending)
 					    "forcing DP recovery\n",
 					    prev_seq, cur_seq);
 					/*
-					 * Mirror dp_modeset_now: set
-					 * output_select so the modeset
-					 * takes the USBC_DP path, run
-					 * modeset + framer arm, then
-					 * rebind the live X/SLiM fb via
-					 * crtc_mode_set_base so WIN0 scans
-					 * out the user content rather than
-					 * the boot fb.  Without the
-					 * scanout rebind the link trains
-					 * but the panel shows backlight-
-					 * only.
+					 * DO NOT force output_select to
+					 * USBC_DP here.  Spurious
+					 * attach_seq bumps (fusb302 CC
+					 * toggle hitting open-circuit /
+					 * stray Rd at boot on boards
+					 * with no USB-C device attached --
+					 * e.g. armbsd) would otherwise
+					 * snatch HDMI's output route, kill
+					 * HDMI scanout, and leave the board
+					 * dark.  Only continue recovery on
+					 * boards that are already using or
+					 * permit DP (i.e. output_select is
+					 * USBC_DP or AUTO).  HDMI-only
+					 * (output_select=HDMI) is already
+					 * filtered above; here we further
+					 * require either an explicit DP
+					 * route or evidence that DP has
+					 * ever successfully come up
+					 * (user_fb pa within the DP scanout
+					 * range -- if we never had a real
+					 * DP session, retrain has nothing
+					 * to recover and we'd just burn
+					 * 750ms of taskqueue time on a
+					 * non-DP board on every spurious
+					 * CC toggle).
 					 */
-					sc->output_select =
-					    RK_DRM_OUTPUT_USBC_DP;
+					if (sc->output_select !=
+					    RK_DRM_OUTPUT_USBC_DP) {
+						rerr = ENOTCONN;
+						merr = ENOTCONN;
+						verr = ENOTCONN;
+						serr = ENOTCONN;
+						goto skip_recovery_body;
+					}
 					/*
 					 * Retry retrain on EIO -- typec_phy
 					 * may not be at A0_READY the instant
@@ -3248,6 +3268,22 @@ rk_drm_hpd_task(void *arg, int pending)
 						}
 					} else {
 						rerr = ENOENT;
+					}
+					/*
+					 * If retrain ultimately failed,
+					 * skip the modeset/arm/scanout -- no
+					 * point reprogramming VOP for a sink
+					 * that isn't actually trained.
+					 * Especially important for the
+					 * spurious-attach case where there
+					 * is no real DP partner; we'd just
+					 * thrash the framer.
+					 */
+					if (rerr != 0) {
+						merr = ENOTCONN;
+						verr = ENOTCONN;
+						serr = ENOTCONN;
+						goto skip_recovery_body;
 					}
 					rk_drm_dp_mode_fill(&mode);
 					merr = rk_drm_hw_modeset_dp_locked(sc,
@@ -3299,6 +3335,7 @@ rk_drm_hpd_task(void *arg, int pending)
 									NULL);
 						}
 					}
+				skip_recovery_body:
 					device_printf(sc->dev,
 					    "DP attach-edge recovery: "
 					    "retrain=%d modeset=%d arm=%d "
