@@ -761,6 +761,7 @@ static int	rk_cdn_dp_sysctl_display_power(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_backlight_power(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_dpcd_write_now(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_sysctl_dpcd_read_now(SYSCTL_HANDLER_ARGS);
+static int	rk_cdn_dp_sysctl_link_status(SYSCTL_HANDLER_ARGS);
 static int	rk_cdn_dp_get_clocks(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_enable_clocks(struct rk_cdn_dp_softc *sc);
 static int	rk_cdn_dp_sysctl_reg_addr(SYSCTL_HANDLER_ARGS);
@@ -2585,9 +2586,9 @@ rk_cdn_dp_sysctl_dpcd_read_now(SYSCTL_HANDLER_ARGS)
 	addr = sc->debug_reg_addr;
 	byte = 0;
 	got = rk_cdn_dp_mailbox_dpcd_read(sc, addr, &byte, 1);
-	if (got != 1) {
+	if (got != 0) {
 		device_printf(sc->dev,
-		    "dpcd_read: DPCD 0x%05x failed (got=%zd)\n", addr, got);
+		    "dpcd_read: DPCD 0x%05x failed (err=%zd)\n", addr, got);
 		sx_sunlock(&sc->detach_sx);
 		return (EIO);
 	}
@@ -2596,6 +2597,129 @@ rk_cdn_dp_sysctl_dpcd_read_now(SYSCTL_HANDLER_ARGS)
 	    "dpcd_read: DPCD 0x%05x = 0x%02x\n", addr, byte);
 	sx_sunlock(&sc->detach_sx);
 	return (0);
+}
+
+/*
+ * Read DPCD 0x200..0x205 and decide whether the link is actually
+ * trained at the lane count the most recent link_plan called for.
+ *
+ *   0x200 SINK_COUNT       — bit 6..0 = #downstream receivers; 0 normally
+ *                             means "sink dead / cable yanked".
+ *   0x202 LANE0_1_STATUS   — per-lane CR_DONE / EQ_DONE / SYMBOL_LOCKED.
+ *   0x203 LANE2_3_STATUS   — same for lanes 2 & 3.
+ *   0x204 LANE_ALIGN       — bit 0 INTERLANE_ALIGN_DONE,
+ *                             bit 6 DOWNSTREAM_PORT_STATUS_CHANGED,
+ *                             bit 7 LINK_STATUS_UPDATED.
+ *   0x205 SINK_STATUS      — bit 0 RECEIVE_PORT_0_STATUS.
+ *
+ * Always emits a one-line dmesg summary including the raw bytes
+ * (prefixed with `tag` so callers like retrain_default can label
+ * the check).  Returns 0 only when every active lane has CR_DONE,
+ * EQ_DONE, and SYMBOL_LOCKED, plus INTERLANE_ALIGN_DONE for
+ * multi-lane configurations.  Returns EIO if the AUX burst itself
+ * failed (the strongest "link is not up" signal — even a freshly-
+ * trained link replies to a 6-byte AUX burst).  Returns EAGAIN when
+ * AUX worked but the per-lane bits are not all set.
+ *
+ * Caller must hold sc->detach_sx (slock or xlock).
+ */
+static int
+rk_cdn_dp_check_link_locked(struct rk_cdn_dp_softc *sc, const char *tag)
+{
+	uint8_t buf[8];
+	uint8_t lanes_expected;
+	bool ok;
+	ssize_t got;
+	uint8_t sinkc, l01, l23, la, ss;
+
+	lanes_expected = sc->link_plan_lanes;
+	if (lanes_expected == 0)
+		lanes_expected = 1;	/* defensive: never assert with 0 */
+	if (lanes_expected > 4)
+		lanes_expected = 4;
+
+	got = rk_cdn_dp_mailbox_dpcd_read(sc, 0x200, buf, 6);
+	if (got != 0) {
+		device_printf(sc->dev,
+		    "%s link_status: AUX read 0x200..0x205 failed (err=%zd) — "
+		    "link is NOT trained\n", tag, got);
+		return (EIO);
+	}
+
+	sinkc = buf[0];
+	l01   = buf[2];
+	l23   = buf[3];
+	la    = buf[4];
+	ss    = buf[5];
+
+	/*
+	 * Per-lane status nibbles: bit 0 CR_DONE, bit 1 EQ_DONE,
+	 * bit 2 SYMBOL_LOCKED.  Lane N's nibble is at bits (N%2)*4 of the
+	 * matching status byte.  Trained === all three set on each lane
+	 * we asked for.
+	 */
+	ok = true;
+	{
+		const uint8_t lane_ok = 0x07;	/* CR | EQ | SL */
+		uint8_t lane_bits[4];
+
+		lane_bits[0] = (l01 >> 0) & 0xf;
+		lane_bits[1] = (l01 >> 4) & 0xf;
+		lane_bits[2] = (l23 >> 0) & 0xf;
+		lane_bits[3] = (l23 >> 4) & 0xf;
+
+		for (uint8_t i = 0; i < lanes_expected; i++) {
+			if ((lane_bits[i] & lane_ok) != lane_ok)
+				ok = false;
+		}
+	}
+	if (lanes_expected > 1 && (la & 0x01) == 0)
+		ok = false;	/* INTERLANE_ALIGN_DONE required for >1 lane */
+
+	device_printf(sc->dev,
+	    "%s link_status: %s sink_count=%u lanes_expected=%u "
+	    "L0=0x%x L1=0x%x L2=0x%x L3=0x%x "
+	    "INTERLANE_ALIGN=%d LINK_STATUS_UPDATED=%d RX0=%d  "
+	    "raw=200:%02x 202:%02x 203:%02x 204:%02x 205:%02x\n",
+	    tag, ok ? "UP" : "NOT_UP",
+	    sinkc & 0x3f, lanes_expected,
+	    (l01 >> 0) & 0xf, (l01 >> 4) & 0xf,
+	    (l23 >> 0) & 0xf, (l23 >> 4) & 0xf,
+	    (la & 0x01) != 0, (la & 0x80) != 0, (ss & 0x01) != 0,
+	    buf[0], buf[2], buf[3], buf[4], buf[5]);
+
+	return (ok ? 0 : EAGAIN);
+}
+
+/*
+ * Sysctl wrapper: triggers a one-shot link-status read.  Returns 0 if
+ * the link is fully trained at the planned lane count, EIO if the AUX
+ * burst itself fails (cable likely gone or PHY dead), EAGAIN if AUX
+ * works but the per-lane bits aren't all set yet.  Userspace can poll
+ * this sysctl as a programmatic "is the link up" check; the dmesg
+ * one-liner provides the human-readable breakdown.
+ */
+static int
+rk_cdn_dp_sysctl_link_status(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_cdn_dp_softc *sc;
+	int error, val = 0;
+
+	sc = arg1;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_slock(&sc->detach_sx);
+	if (sc->detached) {
+		sx_sunlock(&sc->detach_sx);
+		return (ENXIO);
+	}
+	error = rk_cdn_dp_check_link_locked(sc, "link_status:");
+	sx_sunlock(&sc->detach_sx);
+	return (error);
 }
 
 /*
@@ -4753,6 +4877,17 @@ rk_cdn_dp_retrain_default(void)
 		return (ENXIO);
 	}
 	error = rk_cdn_dp_link_train(sc);
+	if (error == 0) {
+		/*
+		 * link_train() returning 0 only means the training
+		 * sequence ran without an internal error; it does NOT
+		 * mean the sink agreed.  Verify via DPCD 0x202..0x205
+		 * before claiming success -- a "trained" link that the
+		 * sink hasn't actually locked produces a dark panel and
+		 * silently broken downstream modesets.
+		 */
+		error = rk_cdn_dp_check_link_locked(sc, "retrain_default:");
+	}
 	sx_sunlock(&sc->detach_sx);
 
 	if (error == 0)
@@ -6744,6 +6879,13 @@ rk_cdn_dp_attach(device_t dev)
 	    sc, 0, rk_cdn_dp_sysctl_dpcd_read_now, "I",
 	    "Read DPCD addr debug_reg_addr via AUX, store result in "
 	    "debug_reg_value (low byte).");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "link_status", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rk_cdn_dp_sysctl_link_status, "I",
+	    "Write 1 to read DPCD 0x200..0x205 and print decoded per-lane "
+	    "CR/EQ/SYMBOL_LOCKED + INTERLANE_ALIGN + LINK_STATUS_UPDATED "
+	    "to dmesg.  Returns EIO if the AUX burst itself fails -- the "
+	    "decisive 'link not actually trained' signal.");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "debug_reg_addr", CTLTYPE_U32 | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, rk_cdn_dp_sysctl_reg_addr, "IU",

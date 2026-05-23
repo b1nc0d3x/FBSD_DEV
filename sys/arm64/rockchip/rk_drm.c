@@ -210,6 +210,28 @@ static int
 }
 
 static int
+rk_drm_lookup_fusb302_attach_seq_cb(linker_file_t lf, void *arg)
+{
+	caddr_t sym;
+
+	sym = linker_file_lookup_symbol(lf, "fusb302_get_attach_seq", 0);
+	if (sym == 0)
+		return (0);
+	*(caddr_t *)arg = sym;
+	return (1);
+}
+
+static uint32_t
+(*rk_drm_lookup_fusb302_attach_seq(void))(device_t)
+{
+	caddr_t sym;
+
+	sym = 0;
+	(void)linker_file_foreach(rk_drm_lookup_fusb302_attach_seq_cb, &sym);
+	return ((uint32_t (*)(device_t))sym);
+}
+
+static int
 rk_drm_lookup_cdn_edid_cb(linker_file_t lf, void *arg)
 {
 	caddr_t sym;
@@ -3028,6 +3050,147 @@ rk_drm_hpd_task(void *arg, int pending)
 	rk_drm_hpd_update_locked(sc, true, hpd, squelch);
 	if (changed)
 		drm_helper_hpd_irq_event(&sc->drm_dev);
+	/*
+	 * Full hotplug recovery on the false->true edge.
+	 *
+	 * When the USB-C cable is unplugged and replugged, fusb302 sees the
+	 * detach + reattach, rk_typec_phy returns to A0_READY, and our hpd
+	 * sample flips false -> true.  drm_helper_hpd_irq_event above tells
+	 * userspace the connector came back, but the DP link itself was lost
+	 * when the partner PHY dropped -- the Cadence DPTX firmware needs
+	 * fresh CR+EQ against the (presumed-same) sink, and the framer needs
+	 * video_active re-armed so it resumes pushing pixels.  Without that,
+	 * the connector reads "connected" but the screen stays black:
+	 *   - Xorg modesets fail because the dptx refuses to flip a stream
+	 *     onto an untrained link.
+	 *   - Headless/SLiM consoles never re-bind a framebuffer at all.
+	 *
+	 * Gated identically to the in-session HPD_IRQ retrain below: only
+	 * USB-C DP output, only after initial bring-up has cached sink_caps
+	 * and a valid link plan (so retrain_default has something to redo).
+	 */
+	if (changed && hpd && sc->output_select == RK_DRM_OUTPUT_USBC_DP &&
+	    sc->dp_autobring_done) {
+		int (*cdn_retrain)(void);
+		int (*set_video_active)(bool);
+		int rerr, verr;
+
+		cdn_retrain = rk_drm_lookup_cdn_retrain();
+		set_video_active = rk_drm_lookup_set_video_active();
+		rerr = cdn_retrain != NULL ? cdn_retrain() : ENOENT;
+		verr = set_video_active != NULL ? set_video_active(true) :
+		    ENOENT;
+		device_printf(sc->dev,
+		    "HPD replug: auto-resume retrain=%d arm=%d\n", rerr, verr);
+		/*
+		 * Reset the in-session HPD_IRQ baseline so the level-not-edge
+		 * detector below treats the next ATTENTION as a fresh event
+		 * rather than comparing against the pre-unplug dp_status.
+		 */
+		sc->dp_last_altmode_status = 0;
+	}
+
+	/*
+	 * Cable-reattach edge recovery (PD-independent).
+	 *
+	 * The auto-resume branch above only fires when fusb302's altmode
+	 * state machine completes -- i.e. when PD SourceCaps → REQUEST →
+	 * Discover_Identity → Discover_Modes → DP altmode entry all
+	 * succeed.  Real-world USB-C displays sometimes latch a stale PD
+	 * state across a brief unplug and refuse to ACK SourceCaps on
+	 * reattach, so we never reach altmode-ready and the HPD edge
+	 * above never fires.  But the typec_phy is still configured for
+	 * DP from the prior session, the DPTX firmware is still alive,
+	 * and the sink still trains over AUX -- so retrain + framer-arm
+	 * brings video back regardless of the PD layer's mood.
+	 *
+	 * Hook the fusb302 attach_seq counter (bumped on each fresh
+	 * TOGSS->ATTACHED_SRC/SNK transition) so we trigger recovery
+	 * once per physical reattach, even when PD never completes.
+	 * Skips on first sample (no prior baseline) and on initial
+	 * boot (dp_autobring_done not yet set), so the normal cold-
+	 * bring-up path still runs unimpeded.
+	 */
+	{
+		uint32_t (*get_seq)(device_t);
+		devclass_t fdc = devclass_find("fusb302");
+		device_t fdev = fdc != NULL ?
+		    devclass_get_device(fdc, 0) : NULL;
+
+		get_seq = rk_drm_lookup_fusb302_attach_seq();
+		if (fdev != NULL && get_seq != NULL) {
+			uint32_t cur_seq = get_seq(fdev);
+
+			if (cur_seq != sc->fusb302_attach_seq_prev) {
+				uint32_t prev_seq = sc->fusb302_attach_seq_prev;
+				sc->fusb302_attach_seq_prev = cur_seq;
+				/*
+				 * Fire on every change in attach_seq.
+				 * The retrain + modeset_dp + framer-arm
+				 * sequence is idempotent: on an already-
+				 * trained link it just re-runs CR+EQ
+				 * (~50-200ms at HBR) and re-asserts
+				 * video_active.  A spurious cold-boot
+				 * edge thus produces one log line and no
+				 * visible glitch.  Every real cable
+				 * reattach edge does the useful recovery
+				 * work.
+				 */
+				if (sc->output_select !=
+				    RK_DRM_OUTPUT_HDMI) {
+					int (*cdn_retrain)(void);
+					int (*set_video_active)(bool);
+					struct drm_display_mode mode;
+					struct drm_framebuffer *fb;
+					int rerr, merr, verr, serr;
+
+					cdn_retrain =
+					    rk_drm_lookup_cdn_retrain();
+					set_video_active =
+					    rk_drm_lookup_set_video_active();
+					device_printf(sc->dev,
+					    "fusb302 attach edge (seq %u→%u): "
+					    "forcing DP recovery\n",
+					    prev_seq, cur_seq);
+					/*
+					 * Mirror dp_modeset_now: set
+					 * output_select so the modeset
+					 * takes the USBC_DP path, run
+					 * modeset + framer arm, then
+					 * rebind the live X/SLiM fb via
+					 * crtc_mode_set_base so WIN0 scans
+					 * out the user content rather than
+					 * the boot fb.  Without the
+					 * scanout rebind the link trains
+					 * but the panel shows backlight-
+					 * only.
+					 */
+					sc->output_select =
+					    RK_DRM_OUTPUT_USBC_DP;
+					rerr = cdn_retrain != NULL ?
+					    cdn_retrain() : ENOENT;
+					rk_drm_dp_mode_fill(&mode);
+					merr = rk_drm_hw_modeset_dp_locked(sc,
+					    &mode);
+					verr = set_video_active != NULL ?
+					    set_video_active(true) : ENOENT;
+					serr = 0;
+					fb = sc->crtc.fb;
+					if (merr == 0 && fb != NULL)
+						serr =
+						    rk_drm_crtc_mode_set_base(
+							&sc->crtc, sc->crtc.x,
+							sc->crtc.y, NULL);
+					device_printf(sc->dev,
+					    "DP attach-edge recovery: "
+					    "retrain=%d modeset=%d arm=%d "
+					    "scanout=%d\n",
+					    rerr, merr, verr, serr);
+					sc->dp_last_altmode_status = 0;
+				}
+			}
+		}
+	}
 	if (!hpd || sc->output_select != RK_DRM_OUTPUT_USBC_DP) {
 		sc->dp_hotplug_reprobe_done = false;
 	} else if (sc->fbdev != NULL &&

@@ -115,6 +115,8 @@ struct rk_drm_softc {
 	bool			dp_autobring_done;
 	bool			dp_hotplug_reprobe_done;
 	uint32_t		dp_last_altmode_status;	/* for HPD_IRQ rising-edge */
+	uint32_t		fusb302_attach_seq_prev;/* cable-reattach edge */
+	bool			fusb302_attach_seq_init;
 	bool			pending_flip_put;
 	int			vblank_ticks;
 	struct drm_framebuffer	*pending_fb;

@@ -37,5 +37,6 @@ struct fusb302_typec_status {
 int	fusb302_get_typec_status(device_t dev, struct fusb302_typec_status *status);
 int	fusb302_get_dp_altmode_state(device_t dev,
 	    struct rk3399_typec_dp_altmode_status *status);
+uint32_t fusb302_get_attach_seq(device_t dev);
 
 #endif

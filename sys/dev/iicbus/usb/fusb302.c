@@ -505,6 +505,15 @@ struct fusb302_softc {
 	bool			softrst_tried;	/* SNK: soft reset attempted */
 	int			pos_power;
 
+	/*
+	 * Increments each time the CC toggle detects a fresh partner Rd
+	 * (TOGSS transitions out of NOTHING and we enter ATTACHED_SRC or
+	 * ATTACHED_SNK).  Consumers (rk_drm) sample this to detect cable
+	 * reattach edges independently of the PD/altmode state machine,
+	 * which can wedge mid-handshake on uncooperative partners.
+	 */
+	uint32_t		attach_seq;
+
 	/* Timers */
 	struct callout		timer_state;
 
@@ -1733,7 +1742,17 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 			sc->tx_state = FUSB_TX_SUCCESS;
 			sc->sub_state = 2;
 			FUSB302_DPRINTF(sc, "send_caps: TXSENT, waiting for REQUEST\n");
-			sc->hardrst_count = 0;
+			/*
+			 * Intentionally NOT resetting sc->hardrst_count here:
+			 * successful TX is just our side getting bytes onto the
+			 * wire.  The count tracks "Hard_Reset attempts that have
+			 * failed to elicit a response", and only an actual
+			 * REQUEST received from the partner proves recovery
+			 * succeeded.  Resetting on TXSENT (as we used to) made
+			 * the give-up check at the bottom unreachable, so a
+			 * non-responsive sink trapped us in an infinite
+			 * send_caps → timeout → Hard_Reset → send_caps loop.
+			 */
 			sc->caps_counter = 0;
 			sc->is_pd_support = true;
 			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
@@ -1742,7 +1761,7 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 		tmp = fusb302_policy_send_data_locked(sc);
 		if (tmp == FUSB_TX_SUCCESS) {
 			FUSB302_DPRINTF(sc, "send_caps: TXSENT, waiting for REQUEST\n");
-			sc->hardrst_count = 0;
+			/* See comment above re: not resetting hardrst_count here. */
 			sc->caps_counter = 0;
 			sc->is_pd_support = true;
 			fusb302_start_state_timer(sc, T_SENDER_RESPONSE);
@@ -1811,6 +1830,13 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 	default:
 		if (evt & FUSB_EVT_RX) {
 			if (PD_IS_DATA(sc->rec_head, PD_DMT_REQUEST)) {
+				/*
+				 * Genuine PD handshake completed -- partner
+				 * is alive and acknowledged our caps.  Clear
+				 * the hard-reset attempt counter now so a
+				 * later mid-session timeout starts fresh.
+				 */
+				sc->hardrst_count = 0;
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_SRC_NEGOTIATE_CAP);
 			} else {
@@ -1819,13 +1845,28 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 			}
 		} else if (evt & FUSB_EVT_TIMER_STATE) {
 			device_printf(sc->dev,
-			    "send_caps: timeout, no REQUEST (hardrst_count=%d)\n",
-			    sc->hardrst_count);
-			if (sc->hardrst_count <= 0)
+			    "send_caps: timeout, no REQUEST "
+			    "(hardrst_count=%d passive_src=%d)\n",
+			    sc->hardrst_count, sc->passive_src);
+			/*
+			 * When passive_src != 0 the partner is bus-powered
+			 * from our VBUS rail (no DC adapter on the sink end).
+			 * Hard_Reset drops VBUS for ~25-35 ms which brown-outs
+			 * the partner's PD MCU and prevents it from ever
+			 * completing the next SourceCaps→REQUEST exchange,
+			 * trapping us in a self-perpetuating send_caps→
+			 * Hard_Reset loop and leaving the panel stuck in
+			 * "backlight on, no valid stream".  Skip Hard_Reset
+			 * in that configuration and go directly to DISABLED,
+			 * which silences interrupts but leaves CC pulls and
+			 * VBUS intact -- typec_phy + cdn_dp can still drive
+			 * DP altmode over the AUX channel without PD.
+			 */
+			if (sc->passive_src != 0 || sc->hardrst_count > 0)
+				fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
+			else
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_SRC_SEND_HARDRST);
-			else
-				fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
 		}
 		break;
 	}
@@ -1966,6 +2007,16 @@ fusb302_state_src_send_hardrst_locked(struct fusb302_softc *sc,
 
 	switch (sc->sub_state) {
 	case 0:
+		/*
+		 * Increment counter before TX so the HARDSENT interrupt
+		 * routing (which jumps straight to SRC_TRANSITION_DEFAULT)
+		 * doesn't skip our retry accounting.  Mirror of the SNK
+		 * variant in fusb302_state_snk_send_hardrst_locked.
+		 */
+		sc->hardrst_count++;
+		device_printf(sc->dev,
+		    "src hard reset send (hardrst_count=%d)\n",
+		    sc->hardrst_count);
 		error = fusb302_update_reg(sc, FUSB_REG_CONTROL3,
 		    FUSB_CTL3_SEND_HARDRST, FUSB_CTL3_SEND_HARDRST);
 		if (error != 0)
@@ -1975,7 +2026,6 @@ fusb302_state_src_send_hardrst_locked(struct fusb302_softc *sc,
 		break;
 	default:
 		if (evt & FUSB_EVT_TIMER_STATE) {
-			sc->hardrst_count++;
 			fusb302_set_state_locked(sc,
 			    FUSB_ST_SRC_TRANSITION_DEFAULT);
 		}
@@ -2674,16 +2724,22 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp,
 	}
 
 	if (intra & FUSB_INTRA_HARDRST) {
-		FUSB302_DPRINTF(sc, "hard reset received\n");
+		device_printf(sc->dev, "hard reset received (hardrst_count=%d)\n",
+		    sc->hardrst_count);
 		fusb302_pd_reset_locked(sc);
 		sc->msg_id = 0;
 		sc->vdm_state = VDM_DISC_ID_ST;
 		/*
-		 * Partner-initiated reset means partner just woke up its PD
-		 * stack — give the discovery loop a fresh budget of retries
-		 * even if we previously gave up.
+		 * Do NOT reset sc->hardrst_count here.  Receiving a Hard_Reset
+		 * from the partner is not by itself a sign of PD recovery —
+		 * if our own send_caps→Hard_Reset cycle prompted the partner
+		 * to bounce one back, resetting the counter restarts the same
+		 * unproductive loop (observed with a USB-C portable monitor
+		 * whose PD MCU latched a stale state and never answered our
+		 * SourceCaps).  Reset only on REQUEST received (in
+		 * fusb302_state_src_send_caps_locked), since that proves the
+		 * partner is genuinely responsive again.
 		 */
-		sc->hardrst_count = 0;
 		fusb302_set_state_locked(sc, sc->attached_as_sink ?
 		    FUSB_ST_SNK_TRANSITION_DEFAULT :
 		    FUSB_ST_SRC_TRANSITION_DEFAULT);
@@ -2692,7 +2748,12 @@ fusb302_tcpc_alert_locked(struct fusb302_softc *sc, uint32_t *evtp,
 	}
 
 	if (intra & FUSB_INTRA_HARDSENT) {
-		/* Hard reset transmitted; transition to default state */
+		/*
+		 * Hard reset transmitted on the wire.  hardrst_count was
+		 * already incremented at TX initiation in
+		 * fusb302_state_{src,snk}_send_hardrst_locked, so this
+		 * path only handles state transition.
+		 */
 		fusb302_pd_reset_locked(sc);
 		fusb302_set_state_locked(sc, sc->attached_as_sink ?
 		    FUSB_ST_SNK_TRANSITION_DEFAULT :
@@ -2717,13 +2778,18 @@ fusb302_run_state_locked(struct fusb302_softc *sc, uint32_t evt)
 		 * us as electrically attached — required for the no-PD
 		 * DP-Alt-Mode bypass path where cdn_dp tries AUX via SBU.
 		 *
-		 * Detach detection in DISABLED is currently a known gap:
-		 * VBUSOK on this RockPro64 stays asserted regardless of
-		 * cable state (board-level signal — VBUS sense appears
-		 * to be tied to a 5V rail downstream of the connector),
-		 * so we can't trust it as an unplug edge. A polling
-		 * callout would be the right fix; deferred until the
-		 * real DFP+SRC PD path lands.
+		 * Stay here until either (a) the partner physically
+		 * unplugs (hardware TOGDONE then fires from UNATTACHED
+		 * since we kept Rp asserted) or (b) the user writes 1 to
+		 * dev.fusb302.0.reattach_now.  A previous version of this
+		 * handler retried every 5s, but that created a self-
+		 * sustaining loop on partners that fail PD but accept DP
+		 * (e.g. some USB-C portable monitors): each retry re-
+		 * detected the same partner, re-sent caps, re-timed out,
+		 * and re-entered DISABLED, while the rk_drm attach-edge
+		 * code redundantly retrained DP every cycle, producing
+		 * visible backlight flicker.  Honest detach detection
+		 * comes from the toggle hardware on real unplug.
 		 */
 		(void)fusb302_write_reg(sc, FUSB_REG_MASK1, 0xff);
 		(void)fusb302_write_reg(sc, FUSB_REG_MASKA, 0xff);
@@ -2747,12 +2813,14 @@ fusb302_run_state_locked(struct fusb302_softc *sc, uint32_t evt)
 			case FUSB_TOGSS_SRC_CC1:
 			case FUSB_TOGSS_SRC_CC2:
 				sc->attached_as_sink = false;
+				sc->attach_seq++;
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_ATTACHED_SRC);
 				break;
 			case FUSB_TOGSS_SNK_CC1:
 			case FUSB_TOGSS_SNK_CC2:
 				sc->attached_as_sink = true;
+				sc->attach_seq++;
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_ATTACHED_SNK);
 				break;
@@ -3349,6 +3417,26 @@ fusb302_get_dp_altmode_state(device_t dev,
 	return (status->valid ? 0 : ENXIO);
 }
 
+/*
+ * Exported for rk_drm: returns a monotonically increasing counter that
+ * bumps each time the CC toggle detects a fresh partner Rd (i.e. each
+ * cable reattach in either source or sink role).  Consumers use it to
+ * detect reattach edges without relying on the PD/altmode state machine
+ * reaching READY -- which it may never do on partners that don't ACK
+ * SourceCaps.  Lock-free single-word read; torn-read is benign because
+ * the caller is only watching for change-from-prior-sample.
+ */
+uint32_t
+fusb302_get_attach_seq(device_t dev)
+{
+	struct fusb302_softc *sc;
+
+	if (dev == NULL)
+		return (0);
+	sc = device_get_softc(dev);
+	return (sc->attach_seq);
+}
+
 /* -----------------------------------------------------------------------
  * Sysctl
  * ----------------------------------------------------------------------- */
@@ -3539,6 +3627,9 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "attached_as_sink",
 	    CTLFLAG_RD, (int *)&sc->attached_as_sink, 0,
 	    "1 if currently attached as UFP/sink, 0 otherwise");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "attach_seq",
+	    CTLFLAG_RD, (int *)&sc->attach_seq, 0,
+	    "Counter bumped on each cable reattach (TOGSS leaves NOTHING)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "dp_altmode_valid",
 	    CTLFLAG_RD, (int *)&sc->dp_altmode.valid, 0,
 	    "1 when a DisplayPort Alt Mode snapshot is available");
