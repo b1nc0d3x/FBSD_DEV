@@ -1905,9 +1905,30 @@ rk_drm_vblank_task(void *arg, int pending)
 		}
 		if (error == 0)
 			error = rk_drm_hw_set_scanout_locked(sc, paddr, stride);
-		if (error == 0)
+		if (error == 0) {
 			sc->crtc.fb = new_fb;
-		else {
+			/*
+			 * Mirror rk_drm_crtc_mode_set_base's user_fb stash on
+			 * every successful page flip so the USB-C DP attach-
+			 * edge recovery re-pins WIN0 to whatever X is
+			 * currently rendering -- not the SETCRTC buffer X has
+			 * since page-flipped away from.  Skip the coherent
+			 * boot fb (paddr matches sc->fb_pa) and the fbdev
+			 * framebuffer (boot console).
+			 */
+			if (new_fb != NULL && paddr != sc->fb_pa &&
+			    !(sc->fbdev != NULL &&
+			    new_fb == &sc->fbdev->drm_fb)) {
+				sc->user_fb.paddr = paddr;
+				sc->user_fb.stride = stride;
+				sc->user_fb.width = new_fb->width;
+				sc->user_fb.height = new_fb->height;
+				sc->user_fb.depth = new_fb->bits_per_pixel;
+				sc->user_fb.format = new_fb->pixel_format;
+				sc->user_fb.session_id++;
+				sc->user_fb.valid = true;
+			}
+		} else {
 			device_printf(sc->dev,
 			    "Cannot flip scanout on vblank: %d\n", error);
 			mtx_lock(&sc->drm_dev.event_lock);
@@ -3224,8 +3245,8 @@ rk_drm_hpd_task(void *arg, int pending)
 					 * non-DP board on every spurious
 					 * CC toggle).
 					 */
-					if (sc->output_select !=
-					    RK_DRM_OUTPUT_USBC_DP) {
+					if (sc->output_select ==
+					    RK_DRM_OUTPUT_HDMI) {
 						rerr = ENOTCONN;
 						merr = ENOTCONN;
 						verr = ENOTCONN;
