@@ -514,6 +514,16 @@ struct fusb302_softc {
 	 */
 	int			send_caps_timeout_count;
 	int			send_caps_max_timeouts;
+	/*
+	 * Sticky once-per-session flag: set the first time we successfully
+	 * synthesize a DP altmode via the SRC skip_pd fallback path.  Used
+	 * to suppress firing USBC_PD_E_PORT_ENABLE on subsequent re-attach
+	 * fallbacks -- after cdn_dp has come up once, re-firing the policy
+	 * event triggers a full re-evaluation that downgrades the link
+	 * (HBR -> RBR) and re-pins WIN0 to the boot fb, undoing any
+	 * recovery rk_drm's hpd_task already completed for the re-attach.
+	 */
+	bool			src_skip_pd_fired;
 
 	/*
 	 * Increments each time the CC toggle detects a fresh partner Rd
@@ -1912,15 +1922,53 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 					sc->dp_altmode.pin_assignment = DP_PIN_C;
 					sc->dp_altmode.usb_ss = 0;
 					sc->dp_altmode.dp_status = (1u << 7);
-					device_printf(sc->dev,
-					    "send_caps: skip_pd=1 fallback "
-					    "after %d timeouts -- "
-					    "synthesizing Pin C 4-lane DP "
-					    "altmode\n",
-					    sc->send_caps_timeout_count);
-					if (sc->policy != NULL)
-						usbc_pd_policy_event(sc->policy,
-						    USBC_PD_E_PORT_ENABLE);
+					if (!sc->src_skip_pd_fired) {
+						/*
+						 * First-time synthesis: notify
+						 * cdn_dp so it actually brings
+						 * up DP altmode.
+						 */
+						sc->src_skip_pd_fired = true;
+						device_printf(sc->dev,
+						    "send_caps: skip_pd=1 "
+						    "fallback after %d "
+						    "timeouts -- synthesizing "
+						    "Pin C 4-lane DP "
+						    "altmode\n",
+						    sc->send_caps_timeout_count);
+						if (sc->policy != NULL)
+							usbc_pd_policy_event(
+							    sc->policy,
+							    USBC_PD_E_PORT_ENABLE);
+					} else {
+						/*
+						 * Already brought up once
+						 * this session.  rk_drm's
+						 * hpd_task attach-edge recovery
+						 * is the right path for
+						 * re-attach -- it preserves
+						 * the cached HBR rate and the
+						 * user_fb pin.  Firing
+						 * USBC_PD_E_PORT_ENABLE again
+						 * would re-evaluate altmode
+						 * from the synthesized stub
+						 * (no rate hint), downgrade
+						 * the link to RBR, and re-pin
+						 * WIN0 to the boot fb.  Just
+						 * keep dp_altmode populated
+						 * and go DISABLED.
+						 */
+						device_printf(sc->dev,
+						    "send_caps: skip_pd=1 "
+						    "fallback after %d "
+						    "timeouts -- altmode "
+						    "stub refreshed, "
+						    "suppressing policy "
+						    "event (re-attach; "
+						    "rk_drm recovery owns "
+						    "bring-up)\n",
+						    sc->send_caps_timeout_count);
+					}
 				}
 				fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
 			} else {
