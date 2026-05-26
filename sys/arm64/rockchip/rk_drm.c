@@ -164,6 +164,19 @@ static int rk_drm_dual_vop = 0;
 TUNABLE_INT("hw.rk_drm.dual_vop", &rk_drm_dual_vop);
 
 /*
+ * Set VOP_BIG SYS_CTRL bit 13 (HDMI_EN, also gates the parallel-RGB
+ * output formatter Cadence DP consumes) in the DP modeset path.
+ * Needed on armbsd's panel for pixels to reach the framer when the
+ * board boots straight to USB-C DP (output_select=2) without HDMI
+ * init running first.  On rp64dbg's panel, setting this bit triggers
+ * HBR EQ training failures and forces a downgrade to RBR which is
+ * insufficient for 1080p60.  Default 0 preserves rp64dbg's working
+ * state; opt in via hw.rk_drm.dp_set_hdmi_en="1" in loader.conf.
+ */
+int rk_drm_dp_set_hdmi_en = 0;
+TUNABLE_INT("hw.rk_drm.dp_set_hdmi_en", &rk_drm_dp_set_hdmi_en);
+
+/*
  * Settling delay between cdn-dp stage 19 returning and the auto-bringup
  * modeset + video_active edge.  Without this, the framer goes IDLE→VALID
  * while the DP link is still settling from training, and the panel

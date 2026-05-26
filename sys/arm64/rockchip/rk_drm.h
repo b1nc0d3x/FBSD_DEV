@@ -47,6 +47,11 @@
 #define RK_DRM_MAX_WIDTH             1920
 #define RK_DRM_MAX_HEIGHT            1080
 
+/* Tunable: set VOP_BIG SYS_CTRL bit 13 (HDMI_EN) in DP modeset path.
+ * Needed on some panels, breaks HBR EQ on others.  See rk_drm.c
+ * for full rationale.  Defined in rk_drm.c. */
+extern int rk_drm_dp_set_hdmi_en;
+
 #define RK_DRM_BPP                32
 #define RK_DRM_FB_BOOT_COLOR      0xff202040u
 #define RK_DRM_FB_DMA_LOWADDR_TEST 0x0fffffffu

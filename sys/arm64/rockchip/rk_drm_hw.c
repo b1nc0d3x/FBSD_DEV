@@ -1198,8 +1198,9 @@ rk_drm_vop_init_mode_dp(struct rk_drm_softc *sc,
 	    RK_DRM_VOP_SYS_CTRL_MIPI_EN |
 	    RK_DRM_VOP_SYS_CTRL_MIPI_DUAL);
 	sys_ctrl |= RK_DRM_VOP_SYS_CTRL_ENABLE |
-	    RK_DRM_VOP_SYS_CTRL_RGB_EN |
-	    RK_DRM_VOP_SYS_CTRL_HDMI_EN;
+	    RK_DRM_VOP_SYS_CTRL_RGB_EN;
+	if (rk_drm_dp_set_hdmi_en)
+		sys_ctrl |= RK_DRM_VOP_SYS_CTRL_HDMI_EN;
 	rk_drm_vop_write4(sc, 0x0008, sys_ctrl);
 
 	/*
