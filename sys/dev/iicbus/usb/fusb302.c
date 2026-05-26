@@ -1444,6 +1444,16 @@ fusb302_notify_dp_locked(struct fusb302_softc *sc)
 	sc->dp_altmode.pin_assignment = sc->notify_pin_def;
 	sc->dp_altmode.dp_status = sc->notify_dp_status;
 	/*
+	 * Mark the SRC fallback as already-fired-equivalent: cdn_dp is
+	 * about to be brought up by the policy event our caller fires
+	 * after this notify.  A later SRC_SEND_CAPS exhaustion on
+	 * replug must NOT re-fire USBC_PD_E_PORT_ENABLE -- that would
+	 * downgrade the link and reset the WIN0 pin, undoing rk_drm's
+	 * hpd_task recovery.  Sticky across detach.
+	 */
+	if (sc->dp_altmode.dp_ready)
+		sc->src_skip_pd_fired = true;
+	/*
 	 * usb_ss: 0 = DP-only (4-lane), 1 = USB3+DP (2-lane).
 	 *
 	 * Per the RK3399 TC-PHY lane map, pin assignments C/E use the DP-only
@@ -2286,6 +2296,10 @@ fusb302_state_snk_startup_locked(struct fusb302_softc *sc,
 		sc->dp_altmode.dp_ready = true;
 		sc->dp_altmode.pin_assignment = DP_PIN_C;
 		sc->dp_altmode.usb_ss = 0;	/* Pin C is 4-lane DP-only */
+		/* See fusb302_notify_dp_locked: tag bring-up as initiated so
+		 * a later SRC fallback (on a different attach role) doesn't
+		 * clobber the established link by re-firing PORT_ENABLE. */
+		sc->src_skip_pd_fired = true;
 		/* DP_Status VDO bit 7 = HPD; cdn_dp's altmode_signature_ok
 		 * requires it set before it will run mailbox bring-up. */
 		sc->dp_altmode.dp_status = (1u << 7);
@@ -2928,8 +2942,39 @@ fusb302_run_state_locked(struct fusb302_softc *sc, uint32_t evt)
 				    "ATTACHED_SRC: attach_seq=%u "
 				    "(TOGSS=0x%x)\n",
 				    sc->attach_seq, ts);
-				fusb302_set_state_locked(sc,
-				    FUSB_ST_ATTACHED_SRC);
+				if (sc->skip_pd && sc->src_skip_pd_fired) {
+					/*
+					 * Known-non-PD partner re-attaching:
+					 * skip the SEND_CAPS attempt entirely
+					 * and synthesize+notify altmode now,
+					 * before rk_drm's hpd_task (1Hz poll)
+					 * has a chance to see attach_seq bump
+					 * and run attach-edge recovery against
+					 * empty/stale altmode (which would
+					 * make retrain_default pick RBR
+					 * instead of HBR).  Mirrors the SNK
+					 * skip_pd path's immediate synthesis.
+					 */
+					sc->dp_altmode.valid = true;
+					sc->dp_altmode.dp_ready = true;
+					sc->dp_altmode.pin_assignment =
+					    DP_PIN_C;
+					sc->dp_altmode.usb_ss = 0;
+					sc->dp_altmode.dp_status = (1u << 7);
+					device_printf(sc->dev,
+					    "src_attach: skip_pd=1 known "
+					    "non-PD partner, immediate Pin C "
+					    "synthesis (no SEND_CAPS attempt)\n");
+					if (sc->policy != NULL)
+						usbc_pd_policy_event(
+						    sc->policy,
+						    USBC_PD_E_PORT_ENABLE);
+					fusb302_set_state_locked(sc,
+					    FUSB_ST_DISABLED);
+				} else {
+					fusb302_set_state_locked(sc,
+					    FUSB_ST_ATTACHED_SRC);
+				}
 				break;
 			case FUSB_TOGSS_SNK_CC1:
 			case FUSB_TOGSS_SNK_CC2:
