@@ -504,6 +504,16 @@ struct fusb302_softc {
 	int			hardrst_count;
 	bool			softrst_tried;	/* SNK: soft reset attempted */
 	int			pos_power;
+	/*
+	 * Number of SRC_SEND_CAPS state-timer timeouts (no REQUEST from
+	 * partner) tolerated before declaring the partner non-responsive
+	 * and falling to DISABLED.  Some panels need a few extra cycles to
+	 * wake their PD MCU after a cold attach; with passive_src we can't
+	 * Hard_Reset to wake them (would brown out VBUS), so we just
+	 * re-send caps and wait again.
+	 */
+	int			send_caps_timeout_count;
+	int			send_caps_max_timeouts;
 
 	/*
 	 * Increments each time the CC toggle detects a fresh partner Rd
@@ -869,6 +879,7 @@ static void
 fusb302_reset_pd_params_locked(struct fusb302_softc *sc)
 {
 	sc->caps_counter = 0;
+	sc->send_caps_timeout_count = 0;
 	sc->msg_id = 0;
 	sc->vdm_state = VDM_DISC_ID_ST;
 	sc->vdm_send_state = 0;
@@ -1837,6 +1848,7 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 				 * later mid-session timeout starts fresh.
 				 */
 				sc->hardrst_count = 0;
+				sc->send_caps_timeout_count = 0;
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_SRC_NEGOTIATE_CAP);
 			} else {
@@ -1844,10 +1856,14 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 				    FUSB_ST_SRC_SEND_SOFTRST);
 			}
 		} else if (evt & FUSB_EVT_TIMER_STATE) {
+			sc->send_caps_timeout_count++;
 			device_printf(sc->dev,
 			    "send_caps: timeout, no REQUEST "
-			    "(hardrst_count=%d passive_src=%d)\n",
-			    sc->hardrst_count, sc->passive_src);
+			    "(hardrst_count=%d passive_src=%d "
+			    "timeout_count=%d/%d)\n",
+			    sc->hardrst_count, sc->passive_src,
+			    sc->send_caps_timeout_count,
+			    sc->send_caps_max_timeouts);
 			/*
 			 * When passive_src != 0 the partner is bus-powered
 			 * from our VBUS rail (no DC adapter on the sink end).
@@ -1857,16 +1873,60 @@ fusb302_state_src_send_caps_locked(struct fusb302_softc *sc, uint32_t evt)
 			 * trapping us in a self-perpetuating send_caps→
 			 * Hard_Reset loop and leaving the panel stuck in
 			 * "backlight on, no valid stream".  Skip Hard_Reset
-			 * in that configuration and go directly to DISABLED,
-			 * which silences interrupts but leaves CC pulls and
-			 * VBUS intact -- typec_phy + cdn_dp can still drive
-			 * DP altmode over the AUX channel without PD.
+			 * in that configuration and instead re-send caps a
+			 * few times -- some panels take several
+			 * T_TYPEC_SEND_SRCCAP windows to wake their PD MCU
+			 * after a cold attach.  Only fall to DISABLED after
+			 * send_caps_max_timeouts (default 5 = ~1.25s grace)
+			 * to leave CC pulls and VBUS intact so typec_phy +
+			 * cdn_dp can still drive DP altmode over AUX without
+			 * PD.
 			 */
-			if (sc->passive_src != 0 || sc->hardrst_count > 0)
+			if (sc->passive_src != 0 &&
+			    sc->send_caps_timeout_count <
+			    sc->send_caps_max_timeouts) {
+				fusb302_start_state_timer(sc,
+				    T_TYPEC_SEND_SRCCAP);
+				fusb302_set_state_locked(sc,
+				    FUSB_ST_SRC_SEND_CAPS);
+			} else if (sc->passive_src != 0 ||
+			    sc->hardrst_count > 0) {
+				/*
+				 * SRC-side skip_pd fallback: when retries are
+				 * exhausted and the partner never sent a
+				 * REQUEST, treat it as a DP-only sink that
+				 * has no PD message engine.  Synthesize the
+				 * Pin C 4-lane DP altmode the same way the
+				 * SNK skip_pd path does (see
+				 * fusb302_state_snk_startup_locked) and fire
+				 * USBC_PD_E_PORT_ENABLE so cdn_dp can bring
+				 * up DP over AUX without ever needing PD.
+				 * Without this, a panel that doesn't speak PD
+				 * leaves us stuck in DISABLED with no altmode
+				 * info, even though typec_phy and cdn_dp
+				 * could otherwise drive the link.
+				 */
+				if (sc->skip_pd) {
+					sc->dp_altmode.valid = true;
+					sc->dp_altmode.dp_ready = true;
+					sc->dp_altmode.pin_assignment = DP_PIN_C;
+					sc->dp_altmode.usb_ss = 0;
+					sc->dp_altmode.dp_status = (1u << 7);
+					device_printf(sc->dev,
+					    "send_caps: skip_pd=1 fallback "
+					    "after %d timeouts -- "
+					    "synthesizing Pin C 4-lane DP "
+					    "altmode\n",
+					    sc->send_caps_timeout_count);
+					if (sc->policy != NULL)
+						usbc_pd_policy_event(sc->policy,
+						    USBC_PD_E_PORT_ENABLE);
+				}
 				fusb302_set_state_locked(sc, FUSB_ST_DISABLED);
-			else
+			} else {
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_SRC_SEND_HARDRST);
+			}
 		}
 		break;
 	}
@@ -3658,6 +3718,13 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	    CTLFLAG_RWTUN, &sc->passive_src, 0,
 	    "1=passive SRC: present Rp on CC, never call regulator_enable "
 	    "(use when partner sources VBUS but we want to advertise as Source)");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "send_caps_max_timeouts",
+	    CTLFLAG_RWTUN, &sc->send_caps_max_timeouts, 0,
+	    "Max SRC_SEND_CAPS state-timer timeouts (each ~250ms) to "
+	    "tolerate before falling to DISABLED.  Higher = more grace for "
+	    "slow-waking PD partners.  0 disables retry.  Only effective "
+	    "in passive_src mode (Hard_Reset path is taken otherwise).");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "slice_sdac",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    fusb302_sysctl_slice_sdac, "I",
@@ -3854,6 +3921,11 @@ fusb302_attach(device_t dev)
 	TUNABLE_INT_FETCH("hw.fusb302.passive_src", &sc->passive_src);
 	if (sc->passive_src < 0 || sc->passive_src > 2)
 		sc->passive_src = 2;
+	sc->send_caps_max_timeouts = 5;
+	TUNABLE_INT_FETCH("hw.fusb302.send_caps_max_timeouts",
+	    &sc->send_caps_max_timeouts);
+	if (sc->send_caps_max_timeouts < 0)
+		sc->send_caps_max_timeouts = 0;
 
 	/*
 	 * Run init_locked WITHOUT taking sc->mtx. init_locked does ~100 I2C
