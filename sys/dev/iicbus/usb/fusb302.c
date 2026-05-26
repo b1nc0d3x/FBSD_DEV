@@ -2611,7 +2611,9 @@ fusb302_toggle_ctl2_locked(struct fusb302_softc *sc)
 static void
 fusb302_set_state_unattached_locked(struct fusb302_softc *sc)
 {
-	device_printf(sc->dev, "detached, restarting CC detection\n");
+	device_printf(sc->dev,
+	    "detached, restarting CC detection (attach_seq=%u)\n",
+	    sc->attach_seq);
 
 	callout_stop(&sc->timer_state);
 
@@ -2814,6 +2816,10 @@ fusb302_run_state_locked(struct fusb302_softc *sc, uint32_t evt)
 			case FUSB_TOGSS_SRC_CC2:
 				sc->attached_as_sink = false;
 				sc->attach_seq++;
+				device_printf(sc->dev,
+				    "ATTACHED_SRC: attach_seq=%u "
+				    "(TOGSS=0x%x)\n",
+				    sc->attach_seq, ts);
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_ATTACHED_SRC);
 				break;
@@ -2821,6 +2827,10 @@ fusb302_run_state_locked(struct fusb302_softc *sc, uint32_t evt)
 			case FUSB_TOGSS_SNK_CC2:
 				sc->attached_as_sink = true;
 				sc->attach_seq++;
+				device_printf(sc->dev,
+				    "ATTACHED_SNK: attach_seq=%u "
+				    "(TOGSS=0x%x)\n",
+				    sc->attach_seq, ts);
 				fusb302_set_state_locked(sc,
 				    FUSB_ST_ATTACHED_SNK);
 				break;
@@ -3569,6 +3579,40 @@ fusb302_sysctl_reattach(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/*
+ * force_attach_bump: artificially increment attach_seq without going
+ * through a physical detach/reattach cycle.  Lets rk_drm's hpd_task
+ * see a fresh attach edge on its next 1Hz poll and run the DP recovery
+ * path (retrain + modeset + framer-arm + WIN0 user_fb pin).  Use to
+ * confirm the recovery path works when the cable is physically present
+ * but DP has gone dark (no reboot, no replug needed).
+ */
+static int
+fusb302_sysctl_force_attach_bump(SYSCTL_HANDLER_ARGS)
+{
+	struct fusb302_softc *sc;
+	uint32_t new_seq;
+	int error, val;
+
+	sc = arg1;
+	val = 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != 1)
+		return (EINVAL);
+
+	sx_xlock(&sc->sx);
+	sc->attach_seq++;
+	new_seq = sc->attach_seq;
+	sx_xunlock(&sc->sx);
+
+	device_printf(sc->dev,
+	    "force_attach_bump: attach_seq=%u (synthetic edge for "
+	    "rk_drm recovery)\n", new_seq);
+	return (0);
+}
+
 static void
 fusb302_add_sysctls(struct fusb302_softc *sc)
 {
@@ -3659,6 +3703,12 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    fusb302_sysctl_reattach, "I",
 	    "Write 1 to force detach and restart Type-C attach detection");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "force_attach_bump",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    fusb302_sysctl_force_attach_bump, "I",
+	    "Write 1 to increment attach_seq without a physical reattach "
+	    "(triggers rk_drm DP recovery path)");
 }
 
 /* -----------------------------------------------------------------------
