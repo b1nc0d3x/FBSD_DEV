@@ -1435,10 +1435,11 @@ fusb302_vdm_send_dpconfig_locked(struct fusb302_softc *sc, uint32_t evt)
 static void
 fusb302_notify_dp_locked(struct fusb302_softc *sc)
 {
-	bool hpd;
+	bool hpd, fire_once;
 
 	hpd = DP_STATUS_HPD(sc->notify_dp_status) != 0;
 	(void)hpd;
+	fire_once = !sc->src_skip_pd_fired;
 
 	sc->dp_altmode.valid = true;
 	/*
@@ -1484,6 +1485,17 @@ fusb302_notify_dp_locked(struct fusb302_softc *sc)
 	    "DP Alt Mode: dp_ready=%d pin=0x%x usb_ss=%d dp_status=0x%x\n",
 	    sc->dp_altmode.dp_ready, sc->dp_altmode.pin_assignment,
 	    sc->dp_altmode.usb_ss, sc->dp_altmode.dp_status);
+
+	/*
+	 * Synth paths fire PORT_ENABLE on first attach so cdn_dp begins
+	 * its stage walk; the real-VDM path needs the same kick, otherwise
+	 * cdn_dp stays at stage=0 / hpd_status=-1 even though dp_altmode
+	 * is populated.  Gate via fire_once captured before src_skip_pd_fired
+	 * was set above, so VDM Attention re-entries don't downgrade the
+	 * link by re-firing (see SRC skip_pd fallback rationale).
+	 */
+	if (fire_once && sc->policy != NULL)
+		usbc_pd_policy_event(sc->policy, USBC_PD_E_PORT_ENABLE);
 }
 
 /* -----------------------------------------------------------------------
