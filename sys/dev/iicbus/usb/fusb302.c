@@ -2762,6 +2762,15 @@ fusb302_set_state_unattached_locked(struct fusb302_softc *sc)
 	/* Keep INT_N masked until interrupt masks are written (SW_RES resets them). */
 	(void)fusb302_write_reg(sc, FUSB_REG_CONTROL0,
 	    FUSB_CTL0_HOST_CUR_DEF | FUSB_CTL0_INT_MASK);
+	/*
+	 * SW_RES clobbers CONTROL3 to chip default 0x06 (N_RETRIES=3 but
+	 * AUTO_RETRY=0).  Without AUTO_RETRY a single BMC COLLISION on
+	 * Source_Caps TX wedges the chip: no TX_SENT, no RETRYFAIL, FSM
+	 * stalls indefinitely.
+	 */
+	(void)fusb302_update_reg(sc, FUSB_REG_CONTROL3,
+	    FUSB_CTL3_AUTO_RETRY | FUSB_CTL3_N_RETRIES,
+	    FUSB_CTL3_AUTO_RETRY | FUSB_CTL3_N_RETRIES);
 	(void)fusb302_write_reg(sc, FUSB_REG_MASK1, FUSB_MASK1_PD);
 	(void)fusb302_write_reg(sc, FUSB_REG_MASKA, FUSB_MASKA_PD);
 	(void)fusb302_write_reg(sc, FUSB_REG_MASKB, FUSB_MASKB_PD);
