@@ -456,6 +456,15 @@ struct fusb302_softc {
 	int			skip_pd;
 
 	/*
+	 * hw.fusb302.synth_pin: preferred DP altmode pin assignment when
+	 * partner advertises more than one supported pin.  DP_PIN_C (0x4,
+	 * 4-lane DP, default) or DP_PIN_D (0x8, 2-lane DP + 2-lane USB3).
+	 * Lets the operator bias real-VDM picker output without baking a
+	 * partner-specific default into the picker.
+	 */
+	int			synth_pin;
+
+	/*
 	 * PD specification revision to advertise in the message header.
 	 * 1 = PD 2.0, 2 = PD 3.0+ (the chip's SPECREV field is 2 bits).
 	 * Some older sinks reject PD 3.0 headers and only respond to PD
@@ -1028,7 +1037,8 @@ fusb302_set_vdm_mesg_locked(struct fusb302_softc *sc, int cmd, int type,
 
 /* Select pin assignment from DP caps + status. */
 static int
-fusb302_dp_pin_assignment(uint32_t caps, uint32_t status)
+fusb302_dp_pin_assignment(struct fusb302_softc *sc, uint32_t caps,
+    uint32_t status)
 {
 	uint32_t pin_caps;
 
@@ -1043,6 +1053,13 @@ fusb302_dp_pin_assignment(uint32_t caps, uint32_t status)
 		pin_caps &= ~(DP_PIN_E | DP_PIN_F);
 	if (pin_caps == 0)
 		return (0);
+	/*
+	 * Honor hw.fusb302.synth_pin when partner advertises it: lets the
+	 * operator bias Pin C vs Pin D for partners that support both,
+	 * without baking a board-specific default into the picker itself.
+	 */
+	if (sc->synth_pin != 0 && (pin_caps & sc->synth_pin) != 0)
+		return ((int)sc->synth_pin);
 	return (1 << (31 - __builtin_clz(pin_caps)));
 }
 
@@ -1395,7 +1412,7 @@ fusb302_vdm_send_dpconfig_locked(struct fusb302_softc *sc, uint32_t evt)
 	switch (sc->vdm_send_state) {
 	case 0:
 		/* Compute pin assignment from discovered DP caps */
-		sc->notify_pin_def = fusb302_dp_pin_assignment(
+		sc->notify_pin_def = fusb302_dp_pin_assignment(sc,
 		    sc->notify_dp_caps, sc->notify_dp_status);
 		fusb302_set_vdm_mesg_locked(sc, VDM_DP_CONFIG, VDM_TYPE_INIT,
 		    0);
@@ -3844,6 +3861,11 @@ fusb302_add_sysctls(struct fusb302_softc *sc)
 	    CTLFLAG_RW, &sc->skip_pd, 0,
 	    "1=DP-only partner: skip PD negotiation, synthesize Pin C 4-lane "
 	    "DP altmode, notify cdn_dp directly");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "synth_pin",
+	    CTLFLAG_RWTUN, &sc->synth_pin, 0,
+	    "Preferred DP altmode pin assignment when partner advertises "
+	    "multiple: 0x4=Pin C (4-lane DP), 0x8=Pin D (2-lane DP + USB3). "
+	    "Loader tunable hw.fusb302.synth_pin");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "passive_src",
 	    CTLFLAG_RWTUN, &sc->passive_src, 0,
 	    "1=passive SRC: present Rp on CC, never call regulator_enable "
@@ -4038,6 +4060,11 @@ fusb302_attach(device_t dev)
 	TUNABLE_INT_FETCH("hw.fusb302.skip_pd", &sc->skip_pd);
 	if (sc->skip_pd)
 		FUSB302_DPRINTF(sc, "skip_pd=1: passive DP defaults on SNK attach\n");
+
+	sc->synth_pin = DP_PIN_C;
+	TUNABLE_INT_FETCH("hw.fusb302.synth_pin", &sc->synth_pin);
+	if (sc->synth_pin != DP_PIN_C && sc->synth_pin != DP_PIN_D)
+		sc->synth_pin = DP_PIN_C;
 
 	/*
 	 * Default passive_src=2: explicit AUTO_CRC + role-bit programming in
