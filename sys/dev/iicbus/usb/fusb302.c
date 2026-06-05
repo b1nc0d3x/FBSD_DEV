@@ -1438,11 +1438,27 @@ fusb302_notify_dp_locked(struct fusb302_softc *sc)
 	bool hpd;
 
 	hpd = DP_STATUS_HPD(sc->notify_dp_status) != 0;
+	(void)hpd;
 
 	sc->dp_altmode.valid = true;
-	sc->dp_altmode.dp_ready = sc->notify_is_enter_mode && hpd;
+	/*
+	 * Don't gate dp_ready on dongle-reported HPD: USB-C-to-HDMI
+	 * bridges (CCG-class) hold HPD low until they see DP signal on the
+	 * high-speed lanes, but cdn_dp won't drive DP until dp_ready is
+	 * true.  Chicken-and-egg.  Once Enter_Mode is ACKed let cdn_dp
+	 * start; the bridge picks up DP and asserts HPD via Attention.
+	 */
+	sc->dp_altmode.dp_ready = sc->notify_is_enter_mode;
 	sc->dp_altmode.pin_assignment = sc->notify_pin_def;
+	/*
+	 * cdn_dp consumes dp_status bit 7 (HPD) as its own start gate.
+	 * Same chicken-and-egg as dp_ready above: overlay it ON once
+	 * Enter_Mode is ACKed; the bridge's real HPD comes through later
+	 * via VDM Attention.
+	 */
 	sc->dp_altmode.dp_status = sc->notify_dp_status;
+	if (sc->notify_is_enter_mode)
+		sc->dp_altmode.dp_status |= (1u << 7);
 	/*
 	 * Mark the SRC fallback as already-fired-equivalent: cdn_dp is
 	 * about to be brought up by the policy event our caller fires
