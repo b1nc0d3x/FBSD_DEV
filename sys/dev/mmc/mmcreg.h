@@ -311,6 +311,7 @@ struct mmc_request {
 			/* reserved for mfg: 63 */
 
 /* Class 9: I/O cards (sd) */
+#define	SD_IO_SEND_OP_COND	5
 #define	SD_IO_RW_DIRECT		52
 /* CMD52 arguments */
 #define	 SD_ARG_CMD52_READ		(0 << 31)

@@ -137,7 +137,7 @@ struct mmc_ios {
 };
 
 enum mmc_card_mode {
-	mode_mmc, mode_sd
+	mode_mmc, mode_sd, mode_sdio
 };
 
 enum mmc_retune_req {

@@ -72,6 +72,7 @@
 #include <dev/mmc/mmcreg.h>
 #include <dev/mmc/mmcbrvar.h>
 #include <dev/mmc/mmcvar.h>
+#include <dev/mmc/sdio_func.h>
 
 #include "mmcbr_if.h"
 #include "mmcbus_if.h"
@@ -205,6 +206,8 @@ static int mmc_send_app_op_cond(struct mmc_softc *sc, uint32_t ocr,
 static int mmc_send_csd(struct mmc_softc *sc, uint16_t rca, uint32_t *rawcsd);
 static int mmc_send_if_cond(struct mmc_softc *sc, uint8_t vhs);
 static int mmc_send_op_cond(struct mmc_softc *sc, uint32_t ocr,
+    uint32_t *rocr);
+static int mmc_send_io_op_cond(struct mmc_softc *sc, uint32_t ocr,
     uint32_t *rocr);
 static int mmc_send_relative_addr(struct mmc_softc *sc, uint32_t *resp);
 static int mmc_set_blocklen(struct mmc_softc *sc, uint32_t len);
@@ -635,6 +638,51 @@ mmc_send_op_cond(struct mmc_softc *sc, uint32_t ocr, uint32_t *rocr)
 	}
 	if (rocr && err == MMC_ERR_NONE)
 		*rocr = cmd.resp[0];
+	return (err);
+}
+
+/*
+ * Probe for an SDIO (non-storage) device on the bus.  CMD5 is the
+ * SDIO-specific OCR exchange — opcode 5, R4 response.  The first
+ * call with arg=0 returns the card's OCR voltage window plus the
+ * number of I/O functions (R4_IO_NUM_FUNCTIONS) and the memory-
+ * present bit (combo cards).  A second call with the negotiated
+ * voltage window in arg drives the card to the "ready" state
+ * (MMC_OCR_CARD_BUSY a.k.a. SDIO's IORDY in R4 bit 31).
+ *
+ * Returns MMC_ERR_NONE on success and fills *rocr with the R4
+ * response if rocr is non-NULL.  A non-SDIO bus simply times out
+ * — the caller treats that as "no SDIO device here" and continues.
+ */
+static int
+mmc_send_io_op_cond(struct mmc_softc *sc, uint32_t ocr, uint32_t *rocr)
+{
+	struct mmc_command cmd;
+	int err = MMC_ERR_NONE, i;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opcode = SD_IO_SEND_OP_COND;
+	cmd.arg = ocr;
+	cmd.flags = MMC_RSP_R4 | MMC_CMD_BCR;
+	cmd.data = NULL;
+
+	for (i = 0; i < 1000; i++) {
+		err = mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, CMD_RETRIES);
+		if (err != MMC_ERR_NONE)
+			break;
+		if ((cmd.resp[0] & MMC_OCR_CARD_BUSY) ||
+		    (ocr & R4_IO_OCR_MASK) == 0)
+			break;
+		err = MMC_ERR_TIMEOUT;
+		mmc_ms_delay(10);
+	}
+	if (rocr && err == MMC_ERR_NONE)
+		*rocr = cmd.resp[0];
+	/* Unconditional during initial bring-up: show raw R4 resp slots. */
+	device_printf(sc->dev,
+	    "mmc_send_io_op_cond: err=%d resp[0]=0x%08x resp[1]=0x%08x "
+	    "resp[2]=0x%08x resp[3]=0x%08x\n",
+	    err, cmd.resp[0], cmd.resp[1], cmd.resp[2], cmd.resp[3]);
 	return (err);
 }
 
@@ -2055,20 +2103,52 @@ mmc_go_discovery(struct mmc_softc *sc)
 			device_printf(sc->dev,
 			    "SD 2.0 interface conditions: OK\n");
 		if (mmc_send_app_op_cond(sc, 0, &ocr) != MMC_ERR_NONE) {
+			int io_err;
+
 			if (bootverbose || mmc_debug)
 				device_printf(sc->dev, "SD probe: failed\n");
 			/*
-			 * Failed, try MMC
+			 * SD storage failed; try SDIO (non-storage I/O card)
+			 * before falling back to legacy MMC.  CMD5 doesn't
+			 * exist on MMC cards, so this is a clean probe.
+			 *
+			 * Re-idle the bus before CMD5.  CMD55 (the AC of
+			 * ACMD41) leaves an SDIO card in an "expecting an
+			 * application command" state that makes CMD5
+			 * return all zeros.  CMD0 puts every card type back
+			 * to a clean idle so CMD5 gets a meaningful response.
 			 */
-			mmcbr_set_mode(dev, mode_mmc);
-			if (mmc_send_op_cond(sc, 0, &ocr) != MMC_ERR_NONE) {
+			mmc_idle_cards(sc);
+			io_err = mmc_send_io_op_cond(sc, 0, &ocr);
+			/* Unconditional during initial bring-up. */
+			device_printf(sc->dev,
+			    "SDIO probe: err=%d ocr=0x%08x nfn=%u\n",
+			    io_err, ocr,
+			    io_err == MMC_ERR_NONE ?
+			    R4_IO_NUM_FUNCTIONS(ocr) : 0);
+			if (io_err == MMC_ERR_NONE &&
+			    R4_IO_NUM_FUNCTIONS(ocr) != 0) {
+				mmcbr_set_mode(dev, mode_sdio);
+				/*
+				 * Keep only the OCR voltage bits — bits
+				 * 28-31 carry NF / MEM_PRESENT / IORDY,
+				 * not voltage.
+				 */
+				ocr &= R4_IO_OCR_MASK;
+			} else if (mmc_send_op_cond(sc, 0, &ocr) !=
+			    MMC_ERR_NONE) {
+				mmcbr_set_mode(dev, mode_mmc);
 				if (bootverbose || mmc_debug)
 					device_printf(sc->dev,
 					    "MMC probe: failed\n");
-				ocr = 0; /* Failed both, powerdown. */
-			} else if (bootverbose || mmc_debug)
-				device_printf(sc->dev,
-				    "MMC probe: OK (OCR: 0x%08x)\n", ocr);
+				ocr = 0; /* Failed all, powerdown. */
+			} else {
+				mmcbr_set_mode(dev, mode_mmc);
+				if (bootverbose || mmc_debug)
+					device_printf(sc->dev,
+					    "MMC probe: OK (OCR: 0x%08x)\n",
+					    ocr);
+			}
 		} else if (bootverbose || mmc_debug)
 			device_printf(sc->dev, "SD probe: OK (OCR: 0x%08x)\n",
 			    ocr);
@@ -2099,14 +2179,89 @@ mmc_go_discovery(struct mmc_softc *sc)
 	/*
 	 * Reselect the cards after we've idled them above.
 	 */
-	if (mmcbr_get_mode(dev) == mode_sd) {
+	switch (mmcbr_get_mode(dev)) {
+	case mode_sd:
 		err = mmc_send_if_cond(sc, 1);
 		mmc_send_app_op_cond(sc,
 		    (err ? 0 : MMC_OCR_CCS) | mmcbr_get_ocr(dev), NULL);
-	} else
+		mmc_discover_cards(sc);
+		mmc_rescan_cards(sc);
+		break;
+	case mode_sdio: {
+		/*
+		 * Drive the SDIO card from idle to transfer state:
+		 *   CMD5 (with OCR) -> finalises voltage negotiation; the
+		 *                       response's IORDY bit (31) tells us
+		 *                       the card is powered up.
+		 *   CMD3            -> card hands us its own RCA so we can
+		 *                       address it on a multi-card bus.
+		 *   CMD7            -> select that RCA; card is now in
+		 *                       CMD52/CMD53 "transfer" state.
+		 *
+		 * Then we create an `sdio` newbus child of the mmc bus and
+		 * attach `sdio_bus_ivars` to it carrying the negotiated
+		 * (rca, nfn, ocr).  The sdio function-bus driver
+		 * (sys/dev/mmc/sdio_func.c) probes that child, walks the
+		 * CCCR/CIS, and instantiates one grand-child per I/O
+		 * function so per-vendor drivers (bwfm_sdio etc.) can
+		 * match.  Storage discover_cards / rescan_cards are
+		 * skipped — SDIO children come up through this path
+		 * instead.
+		 */
+		uint32_t io_resp = 0;
+		uint32_t rca_resp = 0;
+		uint16_t rca;
+		uint8_t nfn;
+		struct sdio_bus_ivars *sbi;
+		device_t sdio_child;
+		int err;
+
+		(void)mmc_send_io_op_cond(sc, mmcbr_get_ocr(dev), &io_resp);
+		nfn = R4_IO_NUM_FUNCTIONS(io_resp);
+
+		err = mmc_send_relative_addr(sc, &rca_resp);
+		if (err != MMC_ERR_NONE) {
+			device_printf(sc->dev,
+			    "SDIO: CMD3 (SEND_RCA) failed err=%d\n", err);
+			break;
+		}
+		rca = (uint16_t)(rca_resp >> 16);
+
+		err = mmc_select_card(sc, rca);
+		if (err != MMC_ERR_NONE) {
+			device_printf(sc->dev,
+			    "SDIO: CMD7 (SELECT) failed err=%d rca=0x%04x\n",
+			    err, rca);
+			break;
+		}
+
+		sbi = malloc(sizeof(*sbi), M_DEVBUF, M_WAITOK | M_ZERO);
+		sbi->sbi_ocr = io_resp;
+		sbi->sbi_rca = rca;
+		sbi->sbi_nfn = nfn;
+
+		sdio_child = device_add_child(sc->dev, "sdio",
+		    DEVICE_UNIT_ANY);
+		if (sdio_child == NULL) {
+			device_printf(sc->dev,
+			    "SDIO: device_add_child failed\n");
+			free(sbi, M_DEVBUF);
+			break;
+		}
+		device_set_ivars(sdio_child, sbi);
+		device_printf(sc->dev,
+		    "SDIO: handing off to function bus "
+		    "(nfn=%u rca=0x%04x ocr=0x%08x)\n",
+		    nfn, rca, io_resp);
+		break;
+	}
+	case mode_mmc:
+	default:
 		mmc_send_op_cond(sc, MMC_OCR_CCS | mmcbr_get_ocr(dev), NULL);
-	mmc_discover_cards(sc);
-	mmc_rescan_cards(sc);
+		mmc_discover_cards(sc);
+		mmc_rescan_cards(sc);
+		break;
+	}
 
 	mmcbr_set_bus_mode(dev, pushpull);
 	mmcbr_update_ios(dev);

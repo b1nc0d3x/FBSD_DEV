@@ -2456,6 +2456,7 @@ dev/mlx/mlx_pci.c		optional mlx pci
 dev/mmc/host/dwmmc.c		optional dwmmc fdt
 dev/mmc/mmc_subr.c		optional mmc | mmcsd !mmccam
 dev/mmc/mmc.c			optional mmc !mmccam
+dev/mmc/sdio_func.c		optional mmc !mmccam
 dev/mmc/mmcbr_if.m		standard
 dev/mmc/mmcbus_if.m		standard
 dev/mmc/mmcsd.c			optional mmcsd !mmccam
