@@ -577,6 +577,7 @@ arm/broadcom/bcm2835/bcm2835_mbox.c			optional soc_brcm_bcm2837 fdt | soc_brcm_b
 arm/broadcom/bcm2835/bcm2835_rng.c			optional !random_loadable soc_brcm_bcm2837 fdt | !random_loadable soc_brcm_bcm2838 fdt
 arm/broadcom/bcm2835/bcm2835_sdhci.c			optional sdhci soc_brcm_bcm2837 fdt | sdhci soc_brcm_bcm2838 fdt
 arm/broadcom/bcm2835/bcm2835_sdhost.c			optional sdhci soc_brcm_bcm2837 fdt | sdhci soc_brcm_bcm2838 fdt
+arm/broadcom/bcm2835/sdhci_iproc.c			optional sdhci soc_brcm_bcm2838 fdt
 arm/broadcom/bcm2835/bcm2835_spi.c			optional bcm2835_spi fdt
 arm/broadcom/bcm2835/bcm2835_vcbus.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
 arm/broadcom/bcm2835/bcm2835_vcio.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
