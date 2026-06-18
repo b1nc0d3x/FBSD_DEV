@@ -145,6 +145,24 @@ sdio_write_byte(device_t func, uint32_t addr, uint8_t val)
 }
 
 /*
+ * CCCR access shortcuts.  Same CMD52, but hard-wired func_num=0
+ * regardless of which sdio child invoked us.  Useful from func-1..7
+ * drivers that need to flip CCCR.IO_EN / poll IO_READY / etc.
+ * without crafting a CMD52 themselves.
+ */
+int
+sdio_cccr_read_byte(device_t func, uint32_t addr, uint8_t *val)
+{
+	return (sdio_cmd52(func, 0, addr, false, 0, val));
+}
+
+int
+sdio_cccr_write_byte(device_t func, uint32_t addr, uint8_t val)
+{
+	return (sdio_cmd52(func, 0, addr, true, val, NULL));
+}
+
+/*
  * CMD53 byte-mode workhorse.  One CMD53 carries up to 512 bytes via
  * mmc_data + the host's DMA path.  Larger transfers are chunked by the
  * public sdio_{read,write}_multi() wrappers below.

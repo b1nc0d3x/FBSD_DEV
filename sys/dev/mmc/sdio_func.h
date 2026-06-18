@@ -66,6 +66,18 @@ int sdio_read_byte(device_t func, uint32_t addr, uint8_t *val);
 int sdio_write_byte(device_t func, uint32_t addr, uint8_t val);
 
 /*
+ * CCCR access from a non-zero function child.  Function drivers that
+ * attach to func 1..7 still need to reach CCCR (function 0) to
+ * enable themselves (CCCR.IO_EN), poll CCCR.IO_READY, configure the
+ * interrupt mask (CCCR.INT_ENABLE), etc.  Both helpers route the
+ * underlying CMD52 with func_num=0 regardless of which child invoked
+ * them.  Pass any sdio child as `func`; the helpers find the parent
+ * sdio bus internally.
+ */
+int sdio_cccr_read_byte(device_t func, uint32_t addr, uint8_t *val);
+int sdio_cccr_write_byte(device_t func, uint32_t addr, uint8_t val);
+
+/*
  * CMD53 — multi-byte / multi-block transfer.  `incr` true means
  * the on-chip address advances with each byte; false leaves it
  * fixed (typical for FIFO-style registers).  When `len` is a
