@@ -38,19 +38,6 @@
 MALLOC_DECLARE(M_SDIO);
 MALLOC_DEFINE(M_SDIO, "sdio", "SDIO function-bus state");
 
-/*
- * Bring-up debug knob.  When >0, every CMD52 against function 0 prints
- * the raw R5 response (cmd.resp[0]).  Lets us tell at a glance whether
- * the card is genuinely returning data-byte=0 (suspect quirk) vs our
- * R5 parser is reading the wrong field.  Default 1 until SDIO bring-up
- * is stable, then drop to 0.
- */
-static int sdio_debug = 1;
-SYSCTL_NODE(_hw, OID_AUTO, sdio, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
-    "SDIO function bus");
-SYSCTL_INT(_hw_sdio, OID_AUTO, debug, CTLFLAG_RWTUN, &sdio_debug, 0,
-    "debug verbosity: 0=silent 1=show raw R5 responses 2=tuple bytes");
-
 struct sdio_softc {
 	device_t		 sc_dev;	/* the sdio bus device */
 	device_t		 sc_mmcbus;	/* parent mmc bus */
@@ -58,7 +45,24 @@ struct sdio_softc {
 	uint16_t		 sc_prodid;	/* CISTPL_MANFID product */
 	uint8_t			 sc_nfn;	/* # I/O functions present */
 	device_t		 sc_func[8];	/* function children */
+	int			 sc_debug;	/* dev.sdio.N.debug */
 };
+
+/*
+ * Per-instance DPRINTF.  Each sdio bus device gets its own
+ * dev.sdio.N.debug sysctl (CTLFLAG_RWTUN) added at attach time, so a
+ * bus carrying a card under investigation can be made noisy without
+ * spamming sibling buses.  Levels:
+ *   0 = silent (default)
+ *   1 = milestones (CCCR header dump, function-attach summary)
+ *   2 = protocol (per-CMD52 raw R5 response, CIS tuple bytes)
+ *   3 = reserved for per-byte hex dumps once CMD53 lands
+ */
+#define	DPRINTF(sc, level, fmt, ...)					\
+	do {								\
+		if ((sc)->sc_debug >= (level))				\
+			device_printf((sc)->sc_dev, fmt, ##__VA_ARGS__); \
+	} while (0)
 
 /* Per-function ivars carried on each newbus child. */
 struct sdio_func_ivars {
@@ -222,12 +226,9 @@ sdio_f0_read_byte(struct sdio_softc *sc, uint32_t addr, uint8_t *val)
 	    ((addr & SD_ARG_CMD52_REG_MASK) << SD_ARG_CMD52_REG_SHIFT);
 
 	err = mmc_wait_for_cmd(sc->sc_mmcbus, sc->sc_dev, &cmd, 0);
-	if (sdio_debug >= 1) {
-		device_printf(sc->sc_dev,
-		    "F0 read [0x%05x]: mmc_err=%d resp[0]=0x%08x "
-		    "resp[1]=0x%08x\n",
-		    addr, err, cmd.resp[0], cmd.resp[1]);
-	}
+	DPRINTF(sc, 2,
+	    "F0 read [0x%05x]: mmc_err=%d resp[0]=0x%08x resp[1]=0x%08x\n",
+	    addr, err, cmd.resp[0], cmd.resp[1]);
 	if (err != MMC_ERR_NONE)
 		return (EIO);
 	if ((cmd.resp[0] & 0xCB00) != 0)
@@ -351,17 +352,17 @@ sdio_attach_children(struct sdio_softc *sc)
 	 * (vs talking but reporting empty fields), which sharply narrows
 	 * the diagnosis next.
 	 */
-	if (sdio_debug >= 1) {
+	if (sc->sc_debug >= 1) {
 		uint8_t cccr[0x18];
 		int j;
+
 		for (j = 0; j < (int)sizeof(cccr); j++) {
 			if (sdio_f0_read_byte(sc, j, &cccr[j]) != 0)
 				cccr[j] = 0xff;
 		}
-		device_printf(sc->sc_dev,
-		    "CCCR 0x00-0x17 dump:\n");
+		DPRINTF(sc, 1, "CCCR 0x00-0x17 dump:\n");
 		for (j = 0; j < (int)sizeof(cccr); j += 8) {
-			device_printf(sc->sc_dev,
+			DPRINTF(sc, 1,
 			    "  %02x: %02x %02x %02x %02x %02x %02x %02x %02x\n",
 			    j, cccr[j+0], cccr[j+1], cccr[j+2], cccr[j+3],
 			    cccr[j+4], cccr[j+5], cccr[j+6], cccr[j+7]);
@@ -440,11 +441,21 @@ sdio_attach(device_t dev)
 	sc->sc_mmcbus = device_get_parent(dev);
 
 	/*
+	 * Per-instance debug knob: dev.sdio.N.debug.  Default 0; bump to
+	 * 1 for milestones, 2 for per-CMD52 raw responses + CIS tuple
+	 * bytes.  Loader-tunable so an investigator can pre-arm it.
+	 */
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
+	    OID_AUTO, "debug", CTLFLAG_RWTUN, &sc->sc_debug, 0,
+	    "DPRINTF level: 0=silent 1=milestones 2=protocol 3=hex");
+
+	/*
 	 * mmc_go_discovery() does the CMD5/CMD3/CMD7 sequence and hands
 	 * us the negotiated (rca, nfn, ocr) via newbus ivars.  Pull them
 	 * here so sdio_attach_children() knows how many function slots
 	 * to walk.  If ivars are missing the SDIO probe never finished,
-	 * which is a bug in mmc.c — bail with ENXIO rather than silently
+	 * which is a bug in mmc.c -- bail with ENXIO rather than silently
 	 * enumerating zero functions.
 	 */
 	sbi = device_get_ivars(dev);
@@ -462,9 +473,9 @@ sdio_attach(device_t dev)
 	 * Re-select the card.  mmc_go_discovery() did CMD7 to put the
 	 * card in TRAN state, but then mmc_calculate_clock() at the end
 	 * of go_discovery does mmc_select_card(sc, 0) which deselects
-	 * ALL cards back to STANDBY — including ours.  Without this
-	 * second CMD7, every subsequent CMD52 times out.  Found 2026-06-17
-	 * during BCM43455 bring-up on Pi 4.
+	 * ALL cards back to STANDBY -- including ours.  Without this
+	 * second CMD7, every subsequent CMD52 times out.  Found during
+	 * BCM43xxx bring-up on Pi 4 (2026-06-17).
 	 */
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opcode = MMC_SELECT_CARD;
@@ -477,7 +488,7 @@ sdio_attach(device_t dev)
 		    sbi->sbi_rca, err);
 		return (ENXIO);
 	}
-	device_printf(dev, "CMD7 reselect OK, card in TRAN state\n");
+	DPRINTF(sc, 1, "CMD7 reselect OK, card in TRAN state\n");
 
 	return (sdio_attach_children(sc));
 }
