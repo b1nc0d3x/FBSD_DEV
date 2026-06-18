@@ -144,30 +144,94 @@ sdio_write_byte(device_t func, uint32_t addr, uint8_t val)
 	return (sdio_cmd52(func, fn, addr, true, val, NULL));
 }
 
+/*
+ * CMD53 byte-mode workhorse.  One CMD53 carries up to 512 bytes via
+ * mmc_data + the host's DMA path.  Larger transfers are chunked by the
+ * public sdio_{read,write}_multi() wrappers below.
+ *
+ * Block-mode CMD53 (where the host pre-arms a per-function block size
+ * and the count field carries number-of-blocks) is faster for large
+ * payloads but requires:
+ *   - writing the FBR.IOBLKSZ for the target function (0x10..0x11 in
+ *     the function's FBR address space) to set the controller-side
+ *     block size, AND
+ *   - the host driver's CMD53 path honoring MMC_DATA_BLOCK_SIZE /
+ *     MMC_DATA_MULTI.
+ * Implement when bwfm_sdio's firmware upload starts feeling slow.
+ * Byte mode at 50 MHz / 4-bit is ~25 MB/s steady-state -- plenty for
+ * CCCR walk and the brcmfmac NVRAM (~3 KB).
+ */
+static int
+sdio_cmd53_byte(struct sdio_softc *sc, uint8_t fn, uint32_t addr,
+    bool write, void *buf, size_t len, bool incr)
+{
+	struct mmc_command cmd;
+	struct mmc_data data;
+	uint32_t arg, lenfield;
+	int err;
+
+	if (addr & ~SD_ARG_CMD53_REG_MASK)
+		return (EINVAL);
+	if (len == 0 || len > 512)
+		return (EINVAL);
+
+	memset(&cmd, 0, sizeof(cmd));
+	memset(&data, 0, sizeof(data));
+
+	/*
+	 * Byte-mode count field: 1..511 = N bytes, 0 = 512 bytes (the
+	 * "wraparound" encoding from the SDIO spec).
+	 */
+	lenfield = (len == 512) ? 0 : (uint32_t)len;
+
+	arg = ((uint32_t)fn & SD_ARG_CMD53_FUNC_MASK) <<
+	    SD_ARG_CMD53_FUNC_SHIFT;
+	arg |= (addr & SD_ARG_CMD53_REG_MASK) << SD_ARG_CMD53_REG_SHIFT;
+	arg |= (lenfield & SD_ARG_CMD53_LENGTH_MASK);
+	if (write)
+		arg |= SD_ARG_CMD53_WRITE;
+	if (incr)
+		arg |= SD_ARG_CMD53_INCREMENT;
+
+	cmd.opcode = SD_IO_RW_EXTENDED;
+	cmd.arg = arg;
+	cmd.flags = MMC_RSP_R5 | MMC_CMD_ADTC;
+	cmd.data = &data;
+
+	data.data = buf;
+	data.len = len;
+	data.flags = write ? MMC_DATA_WRITE : MMC_DATA_READ;
+
+	err = mmc_wait_for_cmd(sc->sc_mmcbus, sc->sc_dev, &cmd, 0);
+	DPRINTF(sc, 2,
+	    "CMD53 %s fn=%u addr=0x%05x len=%zu incr=%d -> mmc_err=%d "
+	    "resp[0]=0x%08x\n",
+	    write ? "WR" : "RD", fn, addr, len, incr, err, cmd.resp[0]);
+	if (err != MMC_ERR_NONE)
+		return (EIO);
+	if ((cmd.resp[0] & 0xCB00) != 0)
+		return (EIO);
+	return (0);
+}
+
 int
 sdio_read_multi(device_t func, uint32_t addr, void *buf, size_t len, bool incr)
 {
-	/*
-	 * CMD53 read — block mode when len is a multiple of the function
-	 * block size, byte mode otherwise.  Built on a struct mmc_data
-	 * scatter-gather; the host driver (sdhci_bcm in our case)
-	 * handles DMA.
-	 *
-	 * TODO: when the host controller wiring is debugged, replace
-	 * this stub with the real implementation.  For now bytes-only
-	 * via repeated CMD52 keeps test code running.
-	 */
-	uint8_t *p = buf;
-	int err;
+	struct sdio_softc *sc = device_get_softc(device_get_parent(func));
 	uint8_t fn = sdio_get_func_num(func);
+	uint8_t *p = buf;
+	size_t chunk;
+	int err;
 
-	for (; len > 0; len--) {
-		err = sdio_cmd52(func, fn, addr, false, 0, p);
+	while (len > 0) {
+		chunk = MIN(len, 512);
+		err = sdio_cmd53_byte(sc, fn, addr, false, p, chunk, incr);
 		if (err != 0)
 			return (err);
-		p++;
+		p += chunk;
+		len -= chunk;
 		if (incr)
-			addr++;
+			addr += chunk;
 	}
 	return (0);
 }
@@ -176,17 +240,22 @@ int
 sdio_write_multi(device_t func, uint32_t addr, const void *buf, size_t len,
     bool incr)
 {
-	const uint8_t *p = buf;
-	int err;
+	struct sdio_softc *sc = device_get_softc(device_get_parent(func));
 	uint8_t fn = sdio_get_func_num(func);
+	const uint8_t *p = buf;
+	size_t chunk;
+	int err;
 
-	for (; len > 0; len--) {
-		err = sdio_cmd52(func, fn, addr, true, *p, NULL);
+	while (len > 0) {
+		chunk = MIN(len, 512);
+		err = sdio_cmd53_byte(sc, fn, addr, true,
+		    __DECONST(void *, p), chunk, incr);
 		if (err != 0)
 			return (err);
-		p++;
+		p += chunk;
+		len -= chunk;
 		if (incr)
-			addr++;
+			addr += chunk;
 	}
 	return (0);
 }
