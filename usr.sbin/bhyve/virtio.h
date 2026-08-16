@@ -326,6 +326,11 @@ struct vqueue_info {
 	struct vring_avail *vq_avail;	/* the "avail" ring */
 	struct vring_used *vq_used;	/* the "used" ring */
 
+	/* Modern transport per-queue state (spec 1.0 common_cfg). */
+	uint64_t vq_desc_addr;
+	uint64_t vq_avail_addr;
+	uint64_t vq_used_addr;
+	uint16_t vq_enable;		/* 0/1 written by driver */
 };
 /* as noted above, these are sort of backwards, name-wise */
 #define VQ_AVAIL_EVENT_IDX(vq) \
@@ -425,6 +430,9 @@ int	vi_intr_init(struct virtio_softc *vs, int barnum, int use_msix);
 void	vi_reset_dev(struct virtio_softc *);
 void	vi_set_io_bar(struct virtio_softc *, int);
 int	vi_add_modern_capabilities(struct virtio_softc *, int barnum);
+uint64_t vi_pci_modern_read(struct pci_devinst *, uint64_t offset, int size);
+void	vi_pci_modern_write(struct pci_devinst *, uint64_t offset, int size,
+	    uint64_t value);
 
 int	vq_getchain(struct vqueue_info *vq, struct iovec *iov, int niov,
 	    struct vi_req *reqp);

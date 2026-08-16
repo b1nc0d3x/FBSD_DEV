@@ -34,6 +34,7 @@
 
 #include <dev/virtio/pci/virtio_pci_legacy_var.h>
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -637,6 +638,226 @@ vi_find_cr(int offset) {
 }
 
 /*
+ * Modern virtio-pci transport BAR read/write (spec 1.0 §4.1.4).
+ * The BAR is carved into four 4-KiB regions installed by
+ * vi_add_modern_capabilities().  See VTCFG_MODERN_*_OFF above.
+ */
+
+static uint64_t
+vi_modern_common_read(struct virtio_softc *vs, uint64_t off, int size)
+{
+	struct vqueue_info *vq;
+	uint64_t v = 0;
+
+	switch (off) {
+	case offsetof(struct virtio_pci_common_cfg, device_feature_select):
+		v = vs->vs_feature_select;
+		break;
+	case offsetof(struct virtio_pci_common_cfg, device_feature):
+		v = vs->vs_feature_select == 0 ?
+		    (vs->vs_vc->vc_hv_caps & 0xffffffff) :
+		    (vs->vs_vc->vc_hv_caps >> 32);
+		break;
+	case offsetof(struct virtio_pci_common_cfg, guest_feature_select):
+		v = vs->vs_guest_feature_select;
+		break;
+	case offsetof(struct virtio_pci_common_cfg, guest_feature):
+		v = vs->vs_guest_feature_select == 0 ?
+		    (vs->vs_negotiated_caps & 0xffffffff) :
+		    ((uint64_t)vs->vs_negotiated_caps >> 32);
+		break;
+	case offsetof(struct virtio_pci_common_cfg, msix_config):
+		v = vs->vs_msix_cfg_idx;
+		break;
+	case offsetof(struct virtio_pci_common_cfg, num_queues):
+		v = vs->vs_vc->vc_nvq;
+		break;
+	case offsetof(struct virtio_pci_common_cfg, device_status):
+		v = vs->vs_status;
+		break;
+	case offsetof(struct virtio_pci_common_cfg, config_generation):
+		v = vs->vs_config_generation;
+		break;
+	case offsetof(struct virtio_pci_common_cfg, queue_select):
+		v = vs->vs_curq;
+		break;
+	default:
+		if (vs->vs_curq >= vs->vs_vc->vc_nvq)
+			break;
+		vq = &vs->vs_queues[vs->vs_curq];
+		switch (off) {
+		case offsetof(struct virtio_pci_common_cfg, queue_size):
+			v = vq->vq_qsize; break;
+		case offsetof(struct virtio_pci_common_cfg, queue_msix_vector):
+			v = vq->vq_msix_idx; break;
+		case offsetof(struct virtio_pci_common_cfg, queue_enable):
+			v = vq->vq_enable; break;
+		case offsetof(struct virtio_pci_common_cfg, queue_notify_off):
+			v = vs->vs_curq; break;
+		case offsetof(struct virtio_pci_common_cfg, queue_desc_lo):
+			v = vq->vq_desc_addr & 0xffffffff; break;
+		case offsetof(struct virtio_pci_common_cfg, queue_desc_hi):
+			v = vq->vq_desc_addr >> 32; break;
+		case offsetof(struct virtio_pci_common_cfg, queue_avail_lo):
+			v = vq->vq_avail_addr & 0xffffffff; break;
+		case offsetof(struct virtio_pci_common_cfg, queue_avail_hi):
+			v = vq->vq_avail_addr >> 32; break;
+		case offsetof(struct virtio_pci_common_cfg, queue_used_lo):
+			v = vq->vq_used_addr & 0xffffffff; break;
+		case offsetof(struct virtio_pci_common_cfg, queue_used_hi):
+			v = vq->vq_used_addr >> 32; break;
+		}
+	}
+	(void)size;
+	return (v);
+}
+
+static void
+vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
+    uint64_t v)
+{
+	struct vqueue_info *vq;
+
+	switch (off) {
+	case offsetof(struct virtio_pci_common_cfg, device_feature_select):
+		vs->vs_feature_select = v;
+		return;
+	case offsetof(struct virtio_pci_common_cfg, guest_feature_select):
+		vs->vs_guest_feature_select = v;
+		return;
+	case offsetof(struct virtio_pci_common_cfg, guest_feature):
+		if (vs->vs_guest_feature_select == 0)
+			vs->vs_negotiated_caps =
+			    (vs->vs_negotiated_caps & ~0xffffffffULL) | v;
+		else
+			vs->vs_negotiated_caps =
+			    (vs->vs_negotiated_caps & 0xffffffffULL) |
+			    (v << 32);
+		return;
+	case offsetof(struct virtio_pci_common_cfg, msix_config):
+		vs->vs_msix_cfg_idx = v;
+		return;
+	case offsetof(struct virtio_pci_common_cfg, device_status):
+		vs->vs_status = v;
+		if (v == 0 && vs->vs_vc->vc_reset != NULL)
+			(*vs->vs_vc->vc_reset)(DEV_SOFTC(vs));
+		if ((v & VIRTIO_CONFIG_S_FEATURES_OK) &&
+		    vs->vs_vc->vc_apply_features != NULL)
+			(*vs->vs_vc->vc_apply_features)(DEV_SOFTC(vs),
+			    vs->vs_negotiated_caps);
+		return;
+	case offsetof(struct virtio_pci_common_cfg, queue_select):
+		vs->vs_curq = v;
+		return;
+	}
+
+	if (vs->vs_curq >= vs->vs_vc->vc_nvq)
+		return;
+	vq = &vs->vs_queues[vs->vs_curq];
+	switch (off) {
+	case offsetof(struct virtio_pci_common_cfg, queue_size):
+		vq->vq_qsize = v; break;
+	case offsetof(struct virtio_pci_common_cfg, queue_msix_vector):
+		vq->vq_msix_idx = v; break;
+	case offsetof(struct virtio_pci_common_cfg, queue_enable):
+		vq->vq_enable = v;
+		if (v == 1)
+			vq->vq_flags |= VQ_ALLOC;
+		break;
+	case offsetof(struct virtio_pci_common_cfg, queue_desc_lo):
+		vq->vq_desc_addr =
+		    (vq->vq_desc_addr & ~0xffffffffULL) | v; break;
+	case offsetof(struct virtio_pci_common_cfg, queue_desc_hi):
+		vq->vq_desc_addr =
+		    (vq->vq_desc_addr & 0xffffffffULL) | (v << 32); break;
+	case offsetof(struct virtio_pci_common_cfg, queue_avail_lo):
+		vq->vq_avail_addr =
+		    (vq->vq_avail_addr & ~0xffffffffULL) | v; break;
+	case offsetof(struct virtio_pci_common_cfg, queue_avail_hi):
+		vq->vq_avail_addr =
+		    (vq->vq_avail_addr & 0xffffffffULL) | (v << 32); break;
+	case offsetof(struct virtio_pci_common_cfg, queue_used_lo):
+		vq->vq_used_addr =
+		    (vq->vq_used_addr & ~0xffffffffULL) | v; break;
+	case offsetof(struct virtio_pci_common_cfg, queue_used_hi):
+		vq->vq_used_addr =
+		    (vq->vq_used_addr & 0xffffffffULL) | (v << 32); break;
+	}
+	(void)size;
+}
+
+uint64_t
+vi_pci_modern_read(struct pci_devinst *pi, uint64_t offset, int size)
+{
+	struct virtio_softc *vs = pi->pi_arg;
+	uint64_t region_off = offset & (VTCFG_MODERN_REGION_SIZE - 1);
+	uint32_t v;
+
+	VS_LOCK(vs);
+	if (offset >= VTCFG_MODERN_DEVICE_OFF) {
+		if (vs->vs_vc->vc_cfgread != NULL &&
+		    vs->vs_vc->vc_cfgread(DEV_SOFTC(vs), region_off,
+		    size, &v) == 0) {
+			VS_UNLOCK(vs);
+			return (v);
+		}
+		VS_UNLOCK(vs);
+		return (0);
+	}
+	if (offset >= VTCFG_MODERN_NOTIFY_OFF) {
+		VS_UNLOCK(vs);
+		return (0);
+	}
+	if (offset >= VTCFG_MODERN_ISR_OFF) {
+		v = vs->vs_isr;
+		vs->vs_isr = 0;
+		VS_UNLOCK(vs);
+		return (v);
+	}
+	v = vi_modern_common_read(vs, region_off, size);
+	VS_UNLOCK(vs);
+	return (v);
+}
+
+void
+vi_pci_modern_write(struct pci_devinst *pi, uint64_t offset, int size,
+    uint64_t value)
+{
+	struct virtio_softc *vs = pi->pi_arg;
+	uint64_t region_off = offset & (VTCFG_MODERN_REGION_SIZE - 1);
+	uint32_t idx;
+
+	VS_LOCK(vs);
+	if (offset >= VTCFG_MODERN_DEVICE_OFF) {
+		if (vs->vs_vc->vc_cfgwrite != NULL)
+			vs->vs_vc->vc_cfgwrite(DEV_SOFTC(vs), region_off,
+			    size, value);
+		VS_UNLOCK(vs);
+		return;
+	}
+	if (offset >= VTCFG_MODERN_NOTIFY_OFF) {
+		idx = region_off / VTCFG_MODERN_NOTIFY_MULT;
+		if (idx < (uint32_t)vs->vs_vc->vc_nvq) {
+			struct vqueue_info *vq = &vs->vs_queues[idx];
+			VS_UNLOCK(vs);
+			if (vq->vq_notify)
+				vq->vq_notify(DEV_SOFTC(vs), vq);
+			else if (vs->vs_vc->vc_qnotify)
+				vs->vs_vc->vc_qnotify(DEV_SOFTC(vs), vq);
+			return;
+		}
+		VS_UNLOCK(vs);
+		return;
+	}
+	if (offset >= VTCFG_MODERN_ISR_OFF) {
+		VS_UNLOCK(vs);
+		return;
+	}
+	vi_modern_common_write(vs, region_off, size, value);
+	VS_UNLOCK(vs);
+}
+
+/*
  * Handle pci config space reads.
  * If it's to the MSI-X info, do that.
  * If it's part of the virtio standard stuff, do that.
@@ -661,6 +882,8 @@ vi_pci_read(struct pci_devinst *pi, int baridx, uint64_t offset, int size)
 		}
 	}
 
+	if (baridx == vs->vs_modern_bar)
+		return (vi_pci_modern_read(pi, offset, size));
 	/* XXX probably should do something better than just assert() */
 	assert(baridx == 0);
 
@@ -782,6 +1005,10 @@ vi_pci_write(struct pci_devinst *pi, int baridx, uint64_t offset, int size,
 		}
 	}
 
+	if (baridx == vs->vs_modern_bar) {
+		vi_pci_modern_write(pi, offset, size, value);
+		return;
+	}
 	/* XXX probably should do something better than just assert() */
 	assert(baridx == 0);
 
