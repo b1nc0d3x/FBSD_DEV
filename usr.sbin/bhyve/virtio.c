@@ -761,8 +761,18 @@ vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
 		vq->vq_msix_idx = v; break;
 	case offsetof(struct virtio_pci_common_cfg, queue_enable):
 		vq->vq_enable = v;
-		if (v == 1)
+		if (v == 1) {
+			struct vmctx *ctx = vs->vs_pi->pi_vmctx;
+			size_t nq = vq->vq_qsize;
+
+			vq->vq_desc = paddr_guest2host(ctx,
+			    vq->vq_desc_addr, 16 * nq);
+			vq->vq_avail = paddr_guest2host(ctx,
+			    vq->vq_avail_addr, 6 + 2 * nq);
+			vq->vq_used = paddr_guest2host(ctx,
+			    vq->vq_used_addr, 6 + 8 * nq);
 			vq->vq_flags |= VQ_ALLOC;
+		}
 		break;
 	case offsetof(struct virtio_pci_common_cfg, queue_desc_lo):
 		vq->vq_desc_addr =
