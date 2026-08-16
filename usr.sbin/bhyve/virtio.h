@@ -34,6 +34,7 @@
 #include <dev/virtio/virtio.h>
 #include <dev/virtio/virtio_ring.h>
 #include <dev/virtio/pci/virtio_pci_var.h>
+#include <dev/virtio/pci/virtio_pci_modern_var.h>
 
 /*
  * These are derived from several virtio specifications.
@@ -242,6 +243,16 @@ struct virtio_softc {
 	uint8_t	vs_status;		/* value from last status write */
 	uint8_t	vs_isr;			/* ISR flags, if not MSI-X */
 	uint16_t vs_msix_cfg_idx;	/* MSI-X vector for config event */
+
+	/*
+	 * Modern virtio-pci transport (spec 1.0 §4.1.4).  vs_modern_bar
+	 * == -1 means legacy-only; vi_add_modern_capabilities sets it and
+	 * publishes the four cap regions into config space.
+	 */
+	int	vs_modern_bar;
+	uint32_t vs_feature_select;	/* device_feature_select */
+	uint32_t vs_guest_feature_select;
+	uint8_t vs_config_generation;	/* bumped on cfg change */
 };
 
 #define	VS_LOCK(vs)							\
@@ -413,6 +424,7 @@ void	vi_softc_linkup(struct virtio_softc *vs, struct virtio_consts *vc,
 int	vi_intr_init(struct virtio_softc *vs, int barnum, int use_msix);
 void	vi_reset_dev(struct virtio_softc *);
 void	vi_set_io_bar(struct virtio_softc *, int);
+int	vi_add_modern_capabilities(struct virtio_softc *, int barnum);
 
 int	vq_getchain(struct vqueue_info *vq, struct iovec *iov, int niov,
 	    struct vi_req *reqp);

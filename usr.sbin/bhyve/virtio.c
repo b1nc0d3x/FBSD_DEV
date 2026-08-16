@@ -75,6 +75,7 @@ vi_softc_linkup(struct virtio_softc *vs, struct virtio_consts *vc,
 	assert((void *)vs == dev_softc);
 	vs->vs_vc = vc;
 	vs->vs_pi = pi;
+	vs->vs_modern_bar = -1;		/* legacy-only until modern caps added */
 	pi->pi_arg = vs;
 
 	vs->vs_queues = queues;
@@ -134,6 +135,17 @@ vi_set_io_bar(struct virtio_softc *vs, int barnum)
 	 */
 	size = VIRTIO_PCI_CONFIG_OFF(1) + vs->vs_vc->vc_cfgsize;
 	pci_emul_alloc_bar(vs->vs_pi, barnum, PCIBAR_IO, size);
+}
+
+/*
+ * Modern virtio-pci transport (spec 1.0 §4.1.4).  Placeholder for
+ * iter 0.5-b: allocates a BAR carved into COMMON_CFG / NOTIFY / ISR /
+ * DEVICE_CFG regions and publishes the four PCI vendor capabilities.
+ */
+int
+vi_add_modern_capabilities(struct virtio_softc *vs __unused, int barnum __unused)
+{
+	return (0);
 }
 
 /*
