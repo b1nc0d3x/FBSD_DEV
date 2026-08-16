@@ -138,13 +138,82 @@ vi_set_io_bar(struct virtio_softc *vs, int barnum)
 }
 
 /*
- * Modern virtio-pci transport (spec 1.0 §4.1.4).  Placeholder for
- * iter 0.5-b: allocates a BAR carved into COMMON_CFG / NOTIFY / ISR /
- * DEVICE_CFG regions and publishes the four PCI vendor capabilities.
+ * Modern virtio-pci transport (spec 1.0 §4.1.4).  BAR layout:
+ *
+ *   0x0000  COMMON_CFG    4K  virtio_pci_common_cfg
+ *   0x1000  ISR_CFG       4K  1-byte ISR-status
+ *   0x2000  NOTIFY_CFG    4K  per-queue doorbells (multiplier = 4)
+ *   0x3000  DEVICE_CFG    4K  driver-provided vc_cfgsize bytes
+ *
+ * Total 16 KiB MEM32 BAR.  All four regions live inside the same BAR
+ * so a driver's PCI-cap walk finds them via one allocation.  Read/
+ * write dispatch across the four regions lands in iter 0.5-c.
  */
-int
-vi_add_modern_capabilities(struct virtio_softc *vs __unused, int barnum __unused)
+#define	VTCFG_MODERN_BAR_SIZE		0x4000
+#define	VTCFG_MODERN_COMMON_OFF		0x0000
+#define	VTCFG_MODERN_ISR_OFF		0x1000
+#define	VTCFG_MODERN_NOTIFY_OFF		0x2000
+#define	VTCFG_MODERN_DEVICE_OFF		0x3000
+#define	VTCFG_MODERN_REGION_SIZE	0x1000
+#define	VTCFG_MODERN_NOTIFY_MULT	4
+
+static int
+vi_emit_modern_cap(struct pci_devinst *pi, uint8_t cfg_type,
+    uint8_t bar, uint32_t offset, uint32_t length)
 {
+	struct virtio_pci_cap cap;
+
+	memset(&cap, 0, sizeof(cap));
+	cap.cap_vndr = PCIY_VENDOR;
+	cap.cap_len = sizeof(cap);
+	cap.cfg_type = cfg_type;
+	cap.bar = bar;
+	cap.offset = offset;
+	cap.length = length;
+	return (pci_emul_add_capability(pi, (u_char *)&cap, sizeof(cap)));
+}
+
+int
+vi_add_modern_capabilities(struct virtio_softc *vs, int barnum)
+{
+	struct pci_devinst *pi = vs->vs_pi;
+	struct virtio_pci_notify_cap ncap;
+	int err;
+
+	err = pci_emul_alloc_bar(pi, barnum, PCIBAR_MEM32,
+	    VTCFG_MODERN_BAR_SIZE);
+	if (err != 0)
+		return (err);
+
+	err = vi_emit_modern_cap(pi, VIRTIO_PCI_CAP_COMMON_CFG, barnum,
+	    VTCFG_MODERN_COMMON_OFF,
+	    sizeof(struct virtio_pci_common_cfg));
+	if (err != 0)
+		return (err);
+
+	err = vi_emit_modern_cap(pi, VIRTIO_PCI_CAP_ISR_CFG, barnum,
+	    VTCFG_MODERN_ISR_OFF, 1);
+	if (err != 0)
+		return (err);
+
+	memset(&ncap, 0, sizeof(ncap));
+	ncap.cap.cap_vndr = PCIY_VENDOR;
+	ncap.cap.cap_len = sizeof(ncap);
+	ncap.cap.cfg_type = VIRTIO_PCI_CAP_NOTIFY_CFG;
+	ncap.cap.bar = barnum;
+	ncap.cap.offset = VTCFG_MODERN_NOTIFY_OFF;
+	ncap.cap.length = VTCFG_MODERN_REGION_SIZE;
+	ncap.notify_off_multiplier = VTCFG_MODERN_NOTIFY_MULT;
+	err = pci_emul_add_capability(pi, (u_char *)&ncap, sizeof(ncap));
+	if (err != 0)
+		return (err);
+
+	err = vi_emit_modern_cap(pi, VIRTIO_PCI_CAP_DEVICE_CFG, barnum,
+	    VTCFG_MODERN_DEVICE_OFF, vs->vs_vc->vc_cfgsize);
+	if (err != 0)
+		return (err);
+
+	vs->vs_modern_bar = barnum;
 	return (0);
 }
 
