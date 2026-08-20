@@ -62,6 +62,11 @@
 #define	DEV_SOFTC(vs) ((void *)(vs))
 
 /*
+ * Bumped whenever the virtio_softc / vqueue_info snapshot layout changes.
+ */
+#define	VI_SNAPSHOT_VERSION	2
+
+/*
  * Link a virtio_softc to its constants, the device softc, and
  * the PCI emulation.
  */
@@ -116,6 +121,28 @@ vi_reset_dev(struct virtio_softc *vs)
 		vq->vq_avail_addr = 0;
 		vq->vq_used_addr = 0;
 		vq->vq_enable = 0;
+		/*
+		 * Drop the driver's size selection so the device
+		 * re-advertises its real size to the next driver.  Do NOT
+		 * move vq_qsize itself: this function deliberately leaves
+		 * vq_desc/vq_avail/vq_used mapped, and an I/O still in
+		 * flight completes into vq_relchain()/vq_endchains(), which
+		 * mask with vq_qsize and index the event-index slot at
+		 * vq_qsize without checking VQ_ALLOC.  Growing it here would
+		 * run those past the extent paddr_guest2host() validated.
+		 * vq_qsize is only ever moved by vi_modern_vq_map(), where
+		 * the new value and its mapping are established together.
+		 *
+		 * What this buys is host-side safety only: whatever a late
+		 * completion touches is a mapping that was validated for the
+		 * size in effect at the time.  It does not make the request
+		 * itself survive.  A guest that resets with I/O outstanding
+		 * and then programs a fresh ring will have the completion
+		 * publish a stale descriptor head into the new used ring --
+		 * guest-visible corruption of the guest's own making, which
+		 * the device does not try to prevent.
+		 */
+		vq->vq_qsize_neg = 0;
 	}
 	vs->vs_negotiated_caps = 0;
 	vs->vs_curq = 0;
@@ -187,11 +214,53 @@ vi_add_modern_capabilities(struct virtio_softc *vs, int barnum)
 	struct virtio_pci_notify_cap ncap;
 	int err, i;
 
-	err = pci_emul_alloc_bar(pi, barnum, PCIBAR_MEM32,
-	    VTCFG_MODERN_BAR_SIZE);
-	if (err != 0)
-		return (err);
+	/*
+	 * VIRTIO_F_VERSION_1 is the backend's decision, not the transport's:
+	 * a 1.0 device changes wire contracts a legacy backend may not
+	 * implement (virtio-net, for one, must use the 12-byte v1 header
+	 * unconditionally once it is negotiated).  Requiring it here turns
+	 * a device that could never complete the 1.0 handshake into a loud
+	 * failure at init instead of a silent one at probe.
+	 */
+	if ((vs->vs_vc->vc_hv_caps & VIRTIO_F_VERSION_1) == 0)
+		return (-1);
 
+	/*
+	 * The DEVICE_CFG region is one VTCFG_MODERN_REGION_SIZE slot at the
+	 * top of the BAR, and vi_pci_modern_read() masks the offset to that
+	 * width, so a larger config could never be served.
+	 *
+	 * Check it here, with the other virtio_consts invariants, and
+	 * before anything is allocated.  Failing after pci_emul_alloc_bar()
+	 * would leave a registered mem_range whose arg1 points at the
+	 * pci_devinst that pci_emul_init() frees on a non-zero pe_init
+	 * return -- there is no unregister on that path, so the first guest
+	 * access to the BAR would be a use-after-free.
+	 */
+	if (vs->vs_vc->vc_cfgsize > VTCFG_MODERN_REGION_SIZE)
+		return (-1);
+
+	/*
+	 * The modern BAR must be its own.  vi_pci_read()/vi_pci_write()
+	 * test baridx against vs_modern_bar before the legacy
+	 * assert(baridx == 0), so handing this the legacy I/O BAR or an
+	 * MSI-X BAR would silently divert those accesses into the modern
+	 * handlers with nothing to catch it.
+	 */
+	if (barnum == 0 || barnum == pci_msix_table_bar(pi) ||
+	    barnum == pci_msix_pba_bar(pi))
+		return (-1);
+
+	/*
+	 * Emit the capabilities first.  pci_emul_add_capability() can fail
+	 * on a full config space, and every fallible step must complete
+	 * before anything is allocated or armed: a non-zero return from
+	 * here leaves pci_emul_init() to free the pci_devinst, and it does
+	 * not unregister a BAR, so a half-configured device would leave a
+	 * queued pci_bar_allocation and a live mem_range pointing at freed
+	 * memory.  Capabilities are just bytes in config space and need no
+	 * unwinding.
+	 */
 	err = vi_emit_modern_cap(pi, VIRTIO_PCI_CAP_COMMON_CFG, barnum,
 	    VTCFG_MODERN_COMMON_OFF,
 	    sizeof(struct virtio_pci_common_cfg));
@@ -215,8 +284,32 @@ vi_add_modern_capabilities(struct virtio_softc *vs, int barnum)
 	if (err != 0)
 		return (err);
 
-	err = vi_emit_modern_cap(pi, VIRTIO_PCI_CAP_DEVICE_CFG, barnum,
-	    VTCFG_MODERN_DEVICE_OFF, vs->vs_vc->vc_cfgsize);
+	/*
+	 * Not emitted: VIRTIO_PCI_CAP_PCI_CFG.  Spec 1.0 §4.1.4.9 says a
+	 * device MUST offer the PCI-config access window, but serving it
+	 * means intercepting PCI config space for the device, which the
+	 * virtio layer is not wired into.  Neither the Linux nor the
+	 * FreeBSD modern driver looks for it -- both probe on
+	 * COMMON/ISR/NOTIFY only -- so this is a conformance gap, not a
+	 * boot failure.  A driver or validation suite that uses the window
+	 * will need it implemented.
+	 */
+
+	/*
+	 * Only publish DEVICE_CFG when the backend has a config region.
+	 * virtio-rnd sets vc_cfgsize to 0, and a zero-length capability is
+	 * rejected by the Linux and FreeBSD modern drivers, which fails the
+	 * whole probe rather than just skipping the region.
+	 */
+	if (vs->vs_vc->vc_cfgsize != 0) {
+		err = vi_emit_modern_cap(pi, VIRTIO_PCI_CAP_DEVICE_CFG, barnum,
+		    VTCFG_MODERN_DEVICE_OFF, vs->vs_vc->vc_cfgsize);
+		if (err != 0)
+			return (err);
+	}
+
+	err = pci_emul_alloc_bar(pi, barnum, PCIBAR_MEM32,
+	    VTCFG_MODERN_BAR_SIZE);
 	if (err != 0)
 		return (err);
 
@@ -231,6 +324,7 @@ vi_add_modern_capabilities(struct virtio_softc *vs, int barnum)
 	for (i = 0; i < vs->vs_vc->vc_nvq; i++)
 		vs->vs_queues[i].vq_qsize_max = vs->vs_queues[i].vq_qsize;
 
+	/* Nothing below can fail; arm modern dispatch last. */
 	vs->vs_modern_bar = barnum;
 	return (0);
 }
@@ -243,13 +337,41 @@ vi_add_modern_capabilities(struct virtio_softc *vs, int barnum)
  * that it raced an update and retry.  Backends that mutate their config
  * (display resize, link status, capacity change) call this, which bumps
  * the generation and raises a configuration-change interrupt.
+ *
+ * Must be called WITHOUT vs_mtx held.  vi_interrupt() takes VS_LOCK on
+ * the non-MSI-X path and vs_mtx is not recursive, so a caller holding it
+ * would deadlock on a guest booted without MSI-X.  This matches
+ * pci_vtblk_resized(), the one config-change interrupt caller in the
+ * tree, which raises VIRTIO_PCI_ISR_CONFIG from a blockif callback with
+ * no lock held.  (The queue path is not a precedent: pci_vtblk_done()
+ * calls vq_interrupt() under vsc_mtx, which has the same non-MSI-X
+ * hazard -- pre-existing, not something to copy.)
+ *
+ * Because the bump therefore cannot happen inside the backend's own
+ * critical section, this closes the common case but not the whole race:
+ * a driver can still read gen, read a config the backend has already
+ * begun updating, and read the same gen again before the increment
+ * lands.  A backend that needs the window fully closed should mutate
+ * its config and call vi_config_generation_bump() in the same region
+ * under vs_mtx, then call this afterwards for the interrupt; the extra
+ * bump is harmless, since drivers compare generations rather than
+ * counting them.
  */
 void
 vi_config_changed(struct virtio_softc *vs)
 {
+	uint16_t msix_idx;
 
-	vs->vs_config_generation++;
-	vi_interrupt(vs, VIRTIO_PCI_ISR_CONFIG, vs->vs_msix_cfg_idx);
+	/*
+	 * vs_msix_cfg_idx is written by the guest through common_cfg under
+	 * vs_mtx, so sample it here rather than racing a concurrent
+	 * msix_config write and delivering to a stale vector.
+	 */
+	VS_LOCK(vs);
+	vi_config_generation_bump(vs);
+	msix_idx = vs->vs_msix_cfg_idx;
+	VS_UNLOCK(vs);
+	vi_interrupt(vs, VIRTIO_PCI_ISR_CONFIG, msix_idx);
 }
 
 /*
@@ -289,6 +411,18 @@ vi_intr_init(struct virtio_softc *vs, int barnum, int use_msix)
  * The guest just gave us a page frame number, from which we can
  * calculate the addresses of the queue.
  */
+/*
+ * The queue size the device advertises: the ceiling latched when the
+ * modern capabilities were published, or the backend's own size on a
+ * device that never published them.
+ */
+static uint16_t
+vi_vq_advertised_size(struct vqueue_info *vq)
+{
+
+	return (vq->vq_qsize_max != 0 ? vq->vq_qsize_max : vq->vq_qsize);
+}
+
 static void
 vi_vq_init(struct virtio_softc *vs, uint32_t pfn)
 {
@@ -298,6 +432,13 @@ vi_vq_init(struct virtio_softc *vs, uint32_t pfn)
 	char *base;
 
 	vq = &vs->vs_queues[vs->vs_curq];
+	/*
+	 * The legacy transport has no driver-selectable size: the ring is
+	 * whatever QUEUE_NUM advertised.  Commit that here, alongside the
+	 * mapping it sizes, so a size a previous modern driver negotiated
+	 * down to cannot outlive it.
+	 */
+	vq->vq_qsize = vi_vq_advertised_size(vq);
 	vq->vq_pfn = pfn;
 	phys = (uint64_t)pfn << VRING_PFN;
 	size = vring_size_aligned(vq->vq_qsize);
@@ -677,6 +818,44 @@ vi_find_cr(int offset) {
  * vi_add_modern_capabilities().  See VTCFG_MODERN_*_OFF above.
  */
 
+/*
+ * Width of each common_cfg register, so an access that spans two of them
+ * can be rejected rather than silently matching the first and zeroing the
+ * rest: a 4-byte read at offset 16 covers msix_config and num_queues, and
+ * would otherwise report the device as having no queues.
+ */
+static int
+vi_modern_common_width(uint64_t off)
+{
+#define	VTCFG_CC(field)							\
+	case offsetof(struct virtio_pci_common_cfg, field):		\
+		return (sizeof(((struct virtio_pci_common_cfg *)0)->field))
+
+	switch (off) {
+	VTCFG_CC(device_feature_select);
+	VTCFG_CC(device_feature);
+	VTCFG_CC(guest_feature_select);
+	VTCFG_CC(guest_feature);
+	VTCFG_CC(msix_config);
+	VTCFG_CC(num_queues);
+	VTCFG_CC(device_status);
+	VTCFG_CC(config_generation);
+	VTCFG_CC(queue_select);
+	VTCFG_CC(queue_size);
+	VTCFG_CC(queue_msix_vector);
+	VTCFG_CC(queue_enable);
+	VTCFG_CC(queue_notify_off);
+	VTCFG_CC(queue_desc_lo);
+	VTCFG_CC(queue_desc_hi);
+	VTCFG_CC(queue_avail_lo);
+	VTCFG_CC(queue_avail_hi);
+	VTCFG_CC(queue_used_lo);
+	VTCFG_CC(queue_used_hi);
+	}
+	return (0);
+#undef	VTCFG_CC
+}
+
 static uint64_t
 vi_modern_common_read(struct virtio_softc *vs, uint64_t off, int size)
 {
@@ -688,17 +867,28 @@ vi_modern_common_read(struct virtio_softc *vs, uint64_t off, int size)
 		v = vs->vs_feature_select;
 		break;
 	case offsetof(struct virtio_pci_common_cfg, device_feature):
-		v = vs->vs_feature_select == 0 ?
-		    (vs->vs_vc->vc_hv_caps & 0xffffffff) :
-		    (vs->vs_vc->vc_hv_caps >> 32);
+		/*
+		 * Spec 1.0 §4.1.4.3.1: selects beyond the implemented range
+		 * read as 0, rather than aliasing onto the high word and
+		 * letting a driver probing for 64+ feature bits mis-negotiate.
+		 */
+		if (vs->vs_feature_select == 0)
+			v = vs->vs_vc->vc_hv_caps & 0xffffffff;
+		else if (vs->vs_feature_select == 1)
+			v = vs->vs_vc->vc_hv_caps >> 32;
+		else
+			v = 0;
 		break;
 	case offsetof(struct virtio_pci_common_cfg, guest_feature_select):
 		v = vs->vs_guest_feature_select;
 		break;
 	case offsetof(struct virtio_pci_common_cfg, guest_feature):
-		v = vs->vs_guest_feature_select == 0 ?
-		    (vs->vs_negotiated_caps & 0xffffffff) :
-		    (vs->vs_negotiated_caps >> 32);
+		if (vs->vs_guest_feature_select == 0)
+			v = vs->vs_negotiated_caps & 0xffffffff;
+		else if (vs->vs_guest_feature_select == 1)
+			v = vs->vs_negotiated_caps >> 32;
+		else
+			v = 0;
 		break;
 	case offsetof(struct virtio_pci_common_cfg, msix_config):
 		v = vs->vs_msix_cfg_idx;
@@ -721,7 +911,10 @@ vi_modern_common_read(struct virtio_softc *vs, uint64_t off, int size)
 		vq = &vs->vs_queues[vs->vs_curq];
 		switch (off) {
 		case offsetof(struct virtio_pci_common_cfg, queue_size):
-			v = vq->vq_qsize; break;
+			v = vq->vq_qsize_neg != 0 ? vq->vq_qsize_neg :
+			    (vq->vq_qsize_max != 0 ? vq->vq_qsize_max :
+			    vq->vq_qsize);
+			break;
 		case offsetof(struct virtio_pci_common_cfg, queue_msix_vector):
 			v = vq->vq_msix_idx; break;
 		case offsetof(struct virtio_pci_common_cfg, queue_enable):
@@ -763,8 +956,16 @@ vi_modern_vq_map(struct virtio_softc *vs, struct vqueue_info *vq)
 	struct vring_desc *desc;
 	struct vring_avail *avail;
 	struct vring_used *used;
-	size_t nq = vq->vq_qsize;
+	size_t nq;
 
+	/*
+	 * The size the driver selected, defaulting to what the device
+	 * advertised if it never wrote queue_size.  vq_qsize is committed
+	 * from this only once the mapping below succeeds, so the ring size
+	 * and the validated extents can never disagree.
+	 */
+	nq = vq->vq_qsize_neg != 0 ? vq->vq_qsize_neg :
+	    vi_vq_advertised_size(vq);
 	if (nq == 0 || (nq & (nq - 1)) != 0 || nq > vq->vq_qsize_max)
 		return (-1);
 	if (vq->vq_desc_addr == 0 || vq->vq_avail_addr == 0 ||
@@ -784,9 +985,21 @@ vi_modern_vq_map(struct virtio_softc *vs, struct vqueue_info *vq)
 	if (desc == NULL || avail == NULL || used == NULL)
 		return (-1);
 
+	vq->vq_qsize = nq;
 	vq->vq_desc = desc;
 	vq->vq_avail = avail;
 	vq->vq_used = used;
+
+	/*
+	 * A ring that has just become live starts at index 0, as
+	 * vi_vq_init() does for the legacy transport.  Without this a
+	 * disable/re-enable cycle short of a full device reset would
+	 * resume consuming a freshly programmed ring from the old
+	 * position and emit bogus used entries.
+	 */
+	vq->vq_last_avail = 0;
+	vq->vq_next_used = 0;
+	vq->vq_save_used = 0;
 	vq->vq_flags |= VQ_ALLOC;
 	return (0);
 }
@@ -796,6 +1009,8 @@ vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
     uint64_t v)
 {
 	struct vqueue_info *vq;
+	uint64_t caps;
+	int fok;
 
 	switch (off) {
 	case offsetof(struct virtio_pci_common_cfg, device_feature_select):
@@ -805,41 +1020,126 @@ vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
 		vs->vs_guest_feature_select = v;
 		return;
 	case offsetof(struct virtio_pci_common_cfg, guest_feature):
+		/*
+		 * Mask against what the device actually offers, as the
+		 * legacy VIRTIO_PCI_GUEST_FEATURES path does.  A driver
+		 * must not be able to negotiate a feature the backend
+		 * cannot implement: vc_apply_features() would then switch
+		 * the backend to a layout it cannot produce.  Because the
+		 * value is masked here it can never carry an unoffered
+		 * bit, so FEATURES_OK below needs no separate refusal.
+		 */
+		/*
+		 * Spec 1.0 §2.2.2: the device ignores feature writes after
+		 * FEATURES_OK.  vc_apply_features() only fires on the
+		 * FEATURES_OK edge, so a late write would leave the backend
+		 * configured for one feature set while vq_endchains() reads
+		 * another live out of vs_negotiated_caps -- enough to switch
+		 * on event-index suppression against a ring the driver does
+		 * not maintain an event index for.
+		 */
+		if (vs->vs_status & VIRTIO_CONFIG_S_FEATURES_OK)
+			return;
+		caps = vs->vs_vc->vc_hv_caps;
 		if (vs->vs_guest_feature_select == 0)
 			vs->vs_negotiated_caps =
-			    (vs->vs_negotiated_caps & ~0xffffffffULL) | v;
-		else
+			    (vs->vs_negotiated_caps & ~0xffffffffULL) |
+			    (v & caps & 0xffffffffULL);
+		else if (vs->vs_guest_feature_select == 1)
 			vs->vs_negotiated_caps =
 			    (vs->vs_negotiated_caps & 0xffffffffULL) |
-			    (v << 32);
+			    ((v << 32) & caps & ~0xffffffffULL);
 		return;
 	case offsetof(struct virtio_pci_common_cfg, msix_config):
 		vs->vs_msix_cfg_idx = v;
 		return;
 	case offsetof(struct virtio_pci_common_cfg, device_status):
-		vs->vs_status = v;
-		if (v == 0 && vs->vs_vc->vc_reset != NULL)
-			(*vs->vs_vc->vc_reset)(DEV_SOFTC(vs));
+		if (v == 0) {
+			vs->vs_status = 0;
+			/*
+			 * A backend without vc_reset must still get the
+			 * transport reset, or VQ_ALLOC stays set forever and
+			 * the geometry freeze below rejects every subsequent
+			 * queue register write -- the driver could never
+			 * re-initialise the device.
+			 */
+			if (vs->vs_vc->vc_reset != NULL)
+				(*vs->vs_vc->vc_reset)(DEV_SOFTC(vs));
+			else
+				vi_reset_dev(vs);
+			return;
+		}
+		/*
+		 * Spec 1.0 §3.1.1: a driver that does not accept
+		 * VIRTIO_F_VERSION_1 is not a 1.0 driver, and the device
+		 * must refuse to latch FEATURES_OK so it finds out.  The
+		 * guest_feature masking above stops it adding features the
+		 * backend never offered, but cannot stop it dropping this
+		 * one.
+		 */
 		if ((v & VIRTIO_CONFIG_S_FEATURES_OK) &&
-		    vs->vs_vc->vc_apply_features != NULL)
+		    (vs->vs_negotiated_caps & VIRTIO_F_VERSION_1) == 0)
+			v &= ~VIRTIO_CONFIG_S_FEATURES_OK;
+		/*
+		 * device_status is cumulative and the 1.0 handshake writes
+		 * it repeatedly, so fire vc_apply_features() on the 0->1
+		 * edge only.  The legacy path calls it exactly once, from
+		 * the GUEST_FEATURES write; backends are not required to be
+		 * idempotent.
+		 */
+		fok = (v & VIRTIO_CONFIG_S_FEATURES_OK) != 0 &&
+		    (vs->vs_status & VIRTIO_CONFIG_S_FEATURES_OK) == 0;
+		vs->vs_status = v;
+		if (fok && vs->vs_vc->vc_apply_features != NULL)
 			(*vs->vs_vc->vc_apply_features)(DEV_SOFTC(vs),
 			    vs->vs_negotiated_caps);
 		return;
 	case offsetof(struct virtio_pci_common_cfg, queue_select):
 		/*
-		 * Keep the stored index in range.  It is used as an array
-		 * subscript below, and vs_curq is an int, so a wide write
-		 * would otherwise truncate to a negative value and slip
-		 * past the "too large" bound check.
+		 * Read-write per spec 1.0 §4.1.4.3, so store what was
+		 * written rather than clamping -- a driver must read back
+		 * what it wrote.  Every use as an array subscript is guarded
+		 * by vs_curq >= vc_nvq, and the width check in
+		 * vi_pci_modern_write() limits this to a 2-byte value, so it
+		 * cannot truncate to a negative int.
 		 */
-		vs->vs_curq = v < (uint64_t)vs->vs_vc->vc_nvq ? (int)v :
-		    vs->vs_vc->vc_nvq;
+		vs->vs_curq = (int)(v & 0xffff);
 		return;
 	}
 
 	if (vs->vs_curq >= vs->vs_vc->vc_nvq)
 		return;
 	vq = &vs->vs_queues[vs->vs_curq];
+
+	/*
+	 * Ring geometry is latched when the queue is mapped, and the mapped
+	 * extents are validated against the size in effect at that moment.
+	 * Growing queue_size afterwards (still within vq_qsize_max, so
+	 * otherwise acceptable) would let vq_getchain() index past the end
+	 * of the region paddr_guest2host() actually validated, and the
+	 * event-index macros address at vq_qsize itself.
+	 *
+	 * Key this on VQ_ALLOC rather than vq_enable.  A transitional
+	 * device can have a live ring with vq_enable == 0, because the
+	 * legacy vi_vq_init() path sets VQ_ALLOC without ever touching
+	 * vq_enable; and the disable path below intentionally leaves the
+	 * mapping in place for I/O still in flight.  Only vi_reset_dev()
+	 * clears VQ_ALLOC, which is the point at which a driver is allowed
+	 * to reprogram the queue.
+	 */
+	if (vq->vq_enable != 0 || (vq->vq_flags & VQ_ALLOC) != 0) {
+		switch (off) {
+		case offsetof(struct virtio_pci_common_cfg, queue_size):
+		case offsetof(struct virtio_pci_common_cfg, queue_desc_lo):
+		case offsetof(struct virtio_pci_common_cfg, queue_desc_hi):
+		case offsetof(struct virtio_pci_common_cfg, queue_avail_lo):
+		case offsetof(struct virtio_pci_common_cfg, queue_avail_hi):
+		case offsetof(struct virtio_pci_common_cfg, queue_used_lo):
+		case offsetof(struct virtio_pci_common_cfg, queue_used_hi):
+			return;
+		}
+	}
+
 	switch (off) {
 	case offsetof(struct virtio_pci_common_cfg, queue_size):
 		/*
@@ -850,17 +1150,42 @@ vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
 		 */
 		if (v == 0 || v > vq->vq_qsize_max || (v & (v - 1)) != 0)
 			break;
-		vq->vq_qsize = v;
+		vq->vq_qsize_neg = v;
 		break;
 	case offsetof(struct virtio_pci_common_cfg, queue_msix_vector):
 		vq->vq_msix_idx = v; break;
 	case offsetof(struct virtio_pci_common_cfg, queue_enable):
 		if (v != 1) {
+			/*
+			 * Stop accepting notifications, but leave the
+			 * mapping intact: an I/O already in flight completes
+			 * asynchronously into vq_relchain()/vq_endchains(),
+			 * which dereference vq_desc/vq_avail/vq_used and
+			 * mask with vq_qsize without checking VQ_ALLOC.
+			 * Tearing any of that down here turns a queue
+			 * disable into a guest-triggerable bhyve segfault or
+			 * an out-of-bounds ring write.  vi_reset_dev() is
+			 * what releases the queue.
+			 */
 			vq->vq_enable = 0;
-			vq->vq_flags &= ~VQ_ALLOC;
-			vq->vq_desc = NULL;
-			vq->vq_avail = NULL;
-			vq->vq_used = NULL;
+			break;
+		}
+		/*
+		 * Re-enabling a queue that is already mapped must not rewind
+		 * vq_last_avail/vq_next_used under the driver, or the device
+		 * re-consumes avail entries and republishes used entries
+		 * from index 0.  Just reopen the gate.
+		 *
+		 * A consequence: disable, reprogram the addresses, re-enable
+		 * reuses the old ring, because the geometry freeze above
+		 * ignored the address writes.  That is deliberate -- keeping
+		 * the mapping is what makes a late completion safe -- and no
+		 * 1.0 driver does it, since resetting the device is the
+		 * defined way to reprogram a queue and VIRTIO_F_RING_RESET
+		 * is not offered.
+		 */
+		if (vq->vq_flags & VQ_ALLOC) {
+			vq->vq_enable = 1;
 			break;
 		}
 		if (vi_modern_vq_map(vs, vq) != 0)
@@ -868,20 +1193,20 @@ vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
 		vq->vq_enable = 1;
 		break;
 	case offsetof(struct virtio_pci_common_cfg, queue_desc_lo):
-		vq->vq_desc_addr =
-		    (vq->vq_desc_addr & ~0xffffffffULL) | v; break;
+		vq->vq_desc_addr = (vq->vq_desc_addr & ~0xffffffffULL) |
+		    (v & 0xffffffffULL); break;
 	case offsetof(struct virtio_pci_common_cfg, queue_desc_hi):
 		vq->vq_desc_addr =
 		    (vq->vq_desc_addr & 0xffffffffULL) | (v << 32); break;
 	case offsetof(struct virtio_pci_common_cfg, queue_avail_lo):
-		vq->vq_avail_addr =
-		    (vq->vq_avail_addr & ~0xffffffffULL) | v; break;
+		vq->vq_avail_addr = (vq->vq_avail_addr & ~0xffffffffULL) |
+		    (v & 0xffffffffULL); break;
 	case offsetof(struct virtio_pci_common_cfg, queue_avail_hi):
 		vq->vq_avail_addr =
 		    (vq->vq_avail_addr & 0xffffffffULL) | (v << 32); break;
 	case offsetof(struct virtio_pci_common_cfg, queue_used_lo):
-		vq->vq_used_addr =
-		    (vq->vq_used_addr & ~0xffffffffULL) | v; break;
+		vq->vq_used_addr = (vq->vq_used_addr & ~0xffffffffULL) |
+		    (v & 0xffffffffULL); break;
 	case offsetof(struct virtio_pci_common_cfg, queue_used_hi):
 		vq->vq_used_addr =
 		    (vq->vq_used_addr & 0xffffffffULL) | (v << 32); break;
@@ -894,28 +1219,77 @@ vi_pci_modern_read(struct pci_devinst *pi, uint64_t offset, int size)
 {
 	struct virtio_softc *vs = pi->pi_arg;
 	uint64_t region_off = offset & (VTCFG_MODERN_REGION_SIZE - 1);
+	uint64_t max;
 	uint32_t v;
 
 	VS_LOCK(vs);
 	if (offset >= VTCFG_MODERN_DEVICE_OFF) {
+		/*
+		 * Bound the driver-supplied offset before handing it to the
+		 * backend.  region_off spans the whole 4 KiB region, while
+		 * the config struct is vc_cfgsize bytes; backends copy out
+		 * of it without validating because the legacy path already
+		 * guards this for them, so an unchecked offset reads past
+		 * the struct and leaks host heap to the guest.
+		 */
+		max = vs->vs_vc->vc_cfgsize;
+		if (size < 1 || size > 4 || region_off + size > max) {
+			VS_UNLOCK(vs);
+			/* Same all-ones convention as the paths below. */
+			return (size == 1 ? 0xff :
+			    (size == 2 ? 0xffff : 0xffffffff));
+		}
+		/*
+		 * Seed the result the way the legacy path does: a backend
+		 * fills only `size' bytes, so an unseeded v would return
+		 * stack garbage in the remainder.
+		 */
+		v = size == 1 ? 0xff : (size == 2 ? 0xffff : 0xffffffff);
 		if (vs->vs_vc->vc_cfgread != NULL &&
 		    vs->vs_vc->vc_cfgread(DEV_SOFTC(vs), region_off,
-		    size, &v) == 0) {
-			VS_UNLOCK(vs);
-			return (v);
+		    size, &v) != 0) {
+			/*
+			 * The backend rejected the read.  Return the seed,
+			 * which is what the legacy path's bad: label yields,
+			 * rather than whatever the callee may have left in v.
+			 */
+			v = size == 1 ? 0xff :
+			    (size == 2 ? 0xffff : 0xffffffff);
 		}
 		VS_UNLOCK(vs);
-		return (0);
+		return (v);
 	}
 	if (offset >= VTCFG_MODERN_NOTIFY_OFF) {
 		VS_UNLOCK(vs);
 		return (0);
 	}
 	if (offset >= VTCFG_MODERN_ISR_OFF) {
+		/*
+		 * The ISR capability advertises one byte at offset 0.
+		 * Clearing on a read anywhere in the 4 KiB window would let
+		 * a stray access swallow an interrupt the driver's real read
+		 * at offset 0 then never sees.
+		 */
+		if (region_off != 0) {
+			VS_UNLOCK(vs);
+			return (0);
+		}
 		v = vs->vs_isr;
-		vs->vs_isr = 0;
+		vs->vs_isr = 0;		/* a read clears this flag */
+		if (v)
+			pci_lintr_deassert(pi);
 		VS_UNLOCK(vs);
 		return (v);
+	}
+	/*
+	 * The decode below keys on offset alone, so an access that does not
+	 * match the register exactly would either drop part of a wider
+	 * neighbour or report an adjacent register as zero.  Reject rather
+	 * than guess.
+	 */
+	if (vi_modern_common_width(region_off) != size) {
+		VS_UNLOCK(vs);
+		return (0);
 	}
 	v = vi_modern_common_read(vs, region_off, size);
 	VS_UNLOCK(vs);
@@ -928,13 +1302,29 @@ vi_pci_modern_write(struct pci_devinst *pi, uint64_t offset, int size,
 {
 	struct virtio_softc *vs = pi->pi_arg;
 	uint64_t region_off = offset & (VTCFG_MODERN_REGION_SIZE - 1);
+	uint64_t max;
 	uint32_t idx;
 
 	VS_LOCK(vs);
 	if (offset >= VTCFG_MODERN_DEVICE_OFF) {
-		if (vs->vs_vc->vc_cfgwrite != NULL)
-			vs->vs_vc->vc_cfgwrite(DEV_SOFTC(vs), region_off,
-			    size, value);
+		/*
+		 * Bound as in vi_pci_modern_read().  Note the fallback the
+		 * legacy path uses for vc_cfgsize == 0 would be wrong here:
+		 * legacy offsets are already bounded by the I/O BAR size,
+		 * whereas region_off spans a full 4 KiB, so a backend with
+		 * no config region must reject everything.
+		 */
+		max = vs->vs_vc->vc_cfgsize;
+		if (size < 1 || size > 4 || region_off + size > max) {
+			VS_UNLOCK(vs);
+			return;
+		}
+		if (vs->vs_vc->vc_cfgwrite != NULL &&
+		    vs->vs_vc->vc_cfgwrite(DEV_SOFTC(vs), region_off,
+		    size, value) != 0)
+			EPRINTLN("%s: write to bad device-config offset/size "
+			    "%jd/%d", vs->vs_vc->vc_name,
+			    (uintmax_t)region_off, size);
 		VS_UNLOCK(vs);
 		return;
 	}
@@ -942,17 +1332,35 @@ vi_pci_modern_write(struct pci_devinst *pi, uint64_t offset, int size,
 		idx = region_off / VTCFG_MODERN_NOTIFY_MULT;
 		if (idx < (uint32_t)vs->vs_vc->vc_nvq) {
 			struct vqueue_info *vq = &vs->vs_queues[idx];
-			VS_UNLOCK(vs);
-			if (vq->vq_notify)
-				vq->vq_notify(DEV_SOFTC(vs), vq);
-			else if (vs->vs_vc->vc_qnotify)
-				vs->vs_vc->vc_qnotify(DEV_SOFTC(vs), vq);
-			return;
+
+			/*
+			 * Only ring the backend for a queue that is both
+			 * mapped and enabled: vq_has_descs() dereferences
+			 * vq_avail, which is NULL on a queue the driver
+			 * never programmed.
+			 *
+			 * The handler runs with vs_mtx held, matching the
+			 * legacy VIRTIO_PCI_QUEUE_NOTIFY path: backends rely
+			 * on that serialisation for vq_last_avail and the
+			 * used ring when two vCPUs ring the same doorbell.
+			 */
+			if (vq->vq_enable && (vq->vq_flags & VQ_ALLOC)) {
+				if (vq->vq_notify)
+					vq->vq_notify(DEV_SOFTC(vs), vq);
+				else if (vs->vs_vc->vc_qnotify)
+					vs->vs_vc->vc_qnotify(DEV_SOFTC(vs),
+					    vq);
+			}
 		}
 		VS_UNLOCK(vs);
 		return;
 	}
 	if (offset >= VTCFG_MODERN_ISR_OFF) {
+		VS_UNLOCK(vs);
+		return;
+	}
+	/* See the width note in vi_pci_modern_read(). */
+	if (vi_modern_common_width(region_off) != size) {
 		VS_UNLOCK(vs);
 		return;
 	}
@@ -1048,8 +1456,14 @@ bad:
 			value = vs->vs_queues[vs->vs_curq].vq_pfn;
 		break;
 	case VIRTIO_PCI_QUEUE_NUM:
+		/*
+		 * QUEUE_NUM is read-only and always reports what the device
+		 * offers.  On a transitional device vq_qsize may still hold
+		 * a size a previous modern driver negotiated down to, so
+		 * prefer the advertised ceiling when there is one.
+		 */
 		value = vs->vs_curq < vc->vc_nvq ?
-		    vs->vs_queues[vs->vs_curq].vq_qsize : 0;
+		    vi_vq_advertised_size(&vs->vs_queues[vs->vs_curq]) : 0;
 		break;
 	case VIRTIO_PCI_QUEUE_SEL:
 		value = vs->vs_curq;
@@ -1262,7 +1676,18 @@ vi_pci_resume(struct pci_devinst *pi)
 static int
 vi_pci_snapshot_softc(struct virtio_softc *vs, struct vm_snapshot_meta *meta)
 {
+	uint32_t vers = VI_SNAPSHOT_VERSION;
 	int ret;
+
+	/*
+	 * SNAPSHOT_VAR_OR_LEAVE is a raw sizeof-based blob with no format
+	 * version of its own, so a layout change deserialises misaligned
+	 * rather than failing.  This series widened vs_negotiated_caps and
+	 * added softc and per-queue fields, and vq_qsize -- previously a
+	 * compared invariant that would have caught the drift -- is now
+	 * restored state.  Compare a version first so a mismatch is loud.
+	 */
+	SNAPSHOT_VAR_CMP_OR_LEAVE(vers, meta, ret, done);
 
 	SNAPSHOT_VAR_OR_LEAVE(vs->vs_flags, meta, ret, done);
 	SNAPSHOT_VAR_OR_LEAVE(vs->vs_negotiated_caps, meta, ret, done);
@@ -1310,7 +1735,17 @@ vi_pci_snapshot_queues(struct virtio_softc *vs, struct vm_snapshot_meta *meta)
 	for (i = 0; i < vc->vc_nvq; i++) {
 		vq = &vs->vs_queues[i];
 
-		SNAPSHOT_VAR_CMP_OR_LEAVE(vq->vq_qsize, meta, ret, done);
+		/*
+		 * vq_qsize used to be device-constant, which is why it was a
+		 * compared invariant.  The modern transport lets the driver
+		 * shrink it, so a guest that negotiated a smaller queue would
+		 * fail the compare against a freshly initialised device on
+		 * restore.  vq_qsize_max is the invariant now; vq_qsize is
+		 * saved state.
+		 */
+		SNAPSHOT_VAR_CMP_OR_LEAVE(vq->vq_qsize_max, meta, ret, done);
+		SNAPSHOT_VAR_OR_LEAVE(vq->vq_qsize, meta, ret, done);
+		SNAPSHOT_VAR_OR_LEAVE(vq->vq_qsize_neg, meta, ret, done);
 		SNAPSHOT_VAR_CMP_OR_LEAVE(vq->vq_num, meta, ret, done);
 
 		SNAPSHOT_VAR_OR_LEAVE(vq->vq_flags, meta, ret, done);
@@ -1344,12 +1779,47 @@ vi_pci_snapshot_queues(struct virtio_softc *vs, struct vm_snapshot_meta *meta)
 		SNAPSHOT_GUEST2HOST_ADDR_OR_LEAVE(ctx, vq->vq_avail, addr_size,
 			false, meta, ret, done);
 
-		addr_size  = (2 + 2 * vq->vq_qsize + 1) * sizeof(uint16_t);
+		/*
+		 * flags + idx + avail_event as uint16_t, plus ring[qsize] of
+		 * vring_used_elem (8 bytes each).  The previous expression
+		 * counted a used element as two uint16_t and so validated
+		 * only half the ring; the modern branch below copies the
+		 * full extent through this pointer, which would then run off
+		 * the end of a mapping for a used ring placed near the end
+		 * of a guest memory segment.
+		 */
+		addr_size = 3 * sizeof(uint16_t) +
+		    vq->vq_qsize * sizeof(struct vring_used_elem);
 		SNAPSHOT_GUEST2HOST_ADDR_OR_LEAVE(ctx, vq->vq_used, addr_size,
 			false, meta, ret, done);
 
-		SNAPSHOT_BUF_OR_LEAVE(vq->vq_desc,
-			vring_size_aligned(vq->vq_qsize), meta, ret, done);
+		/*
+		 * Under the legacy transport desc/avail/used are one
+		 * contiguous guest allocation, so a single buffer starting
+		 * at vq_desc covers all three.  The modern transport lets
+		 * the driver place them independently, so saving
+		 * vring_size_aligned() bytes from vq_desc would copy
+		 * unrelated guest memory on save and, worse, clobber the
+		 * pages after the descriptor table on restore while missing
+		 * the real avail and used rings.  Save each region on its
+		 * own extent instead.
+		 */
+		if (vs->vs_modern_bar >= 0) {
+			SNAPSHOT_BUF_OR_LEAVE(vq->vq_desc,
+				vq->vq_qsize * sizeof(struct vring_desc),
+				meta, ret, done);
+			SNAPSHOT_BUF_OR_LEAVE(vq->vq_avail,
+				(3 + vq->vq_qsize) * sizeof(uint16_t),
+				meta, ret, done);
+			SNAPSHOT_BUF_OR_LEAVE(vq->vq_used,
+				3 * sizeof(uint16_t) +
+				vq->vq_qsize * sizeof(struct vring_used_elem),
+				meta, ret, done);
+		} else {
+			SNAPSHOT_BUF_OR_LEAVE(vq->vq_desc,
+				vring_size_aligned(vq->vq_qsize), meta, ret,
+				done);
+		}
 	}
 
 done:

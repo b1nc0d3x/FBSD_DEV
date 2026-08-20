@@ -332,6 +332,7 @@ struct vqueue_info {
 	uint64_t vq_used_addr;
 	uint16_t vq_enable;		/* 0/1 written by driver */
 	uint16_t vq_qsize_max;		/* device-set ceiling for vq_qsize */
+	uint16_t vq_qsize_neg;		/* driver-selected size, 0 = use max */
 };
 /* as noted above, these are sort of backwards, name-wise */
 #define VQ_AVAIL_EVENT_IDX(vq) \
@@ -430,8 +431,31 @@ void	vi_softc_linkup(struct virtio_softc *vs, struct virtio_consts *vc,
 int	vi_intr_init(struct virtio_softc *vs, int barnum, int use_msix);
 void	vi_reset_dev(struct virtio_softc *);
 void	vi_set_io_bar(struct virtio_softc *, int);
+/*
+ * Publish the modern virtio-pci transport on the given BAR.  The backend
+ * must have set VIRTIO_F_VERSION_1 in vc_hv_caps and sized its queues
+ * (vq_qsize) beforehand.
+ *
+ * Returns 0 on success.  On failure nothing has been allocated and modern
+ * dispatch is not armed -- every fallible step runs before either -- so
+ * the caller needs no unwind beyond its own error path.
+ */
 int	vi_add_modern_capabilities(struct virtio_softc *, int barnum);
 void	vi_config_changed(struct virtio_softc *);
+
+/*
+ * Note a device-config change without raising an interrupt.  Safe to
+ * call with vs_mtx held -- and that is the point: a backend that needs
+ * config_generation to change atomically with its own mutation calls
+ * this inside the same critical section, then vi_config_changed()
+ * after dropping the lock.
+ */
+static inline void
+vi_config_generation_bump(struct virtio_softc *vs)
+{
+
+	vs->vs_config_generation++;
+}
 uint64_t vi_pci_modern_read(struct pci_devinst *, uint64_t offset, int size);
 void	vi_pci_modern_write(struct pci_devinst *, uint64_t offset, int size,
 	    uint64_t value);
