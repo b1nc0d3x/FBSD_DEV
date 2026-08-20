@@ -1057,16 +1057,22 @@ vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
 		if (v == 0) {
 			vs->vs_status = 0;
 			/*
-			 * A backend without vc_reset must still get the
-			 * transport reset, or VQ_ALLOC stays set forever and
-			 * the geometry freeze below rejects every subsequent
-			 * queue register write -- the driver could never
-			 * re-initialise the device.
+			 * Reset the transport's own state first and
+			 * unconditionally, then let vc_reset deal with the
+			 * device's.  A backend whose hook does not itself
+			 * call vi_reset_dev() would otherwise come back from
+			 * a guest re-probe -- loader to kernel, kldunload
+			 * then kldload, reboot without restarting the VM --
+			 * with VQ_ALLOC still set and queue addresses still
+			 * pointing at the previous boot's guest pages.
+			 *
+			 * Order matters: doing this after the hook would
+			 * trip the mutex assert in vi_reset_dev() for any
+			 * backend whose vc_reset drops vs_mtx.
 			 */
+			vi_reset_dev(vs);
 			if (vs->vs_vc->vc_reset != NULL)
 				(*vs->vs_vc->vc_reset)(DEV_SOFTC(vs));
-			else
-				vi_reset_dev(vs);
 			return;
 		}
 		/*
