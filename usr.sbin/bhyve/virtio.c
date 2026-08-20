@@ -112,9 +112,15 @@ vi_reset_dev(struct virtio_softc *vs)
 		vq->vq_save_used = 0;
 		vq->vq_pfn = 0;
 		vq->vq_msix_idx = VIRTIO_MSI_NO_VECTOR;
+		vq->vq_desc_addr = 0;
+		vq->vq_avail_addr = 0;
+		vq->vq_used_addr = 0;
+		vq->vq_enable = 0;
 	}
 	vs->vs_negotiated_caps = 0;
 	vs->vs_curq = 0;
+	vs->vs_feature_select = 0;
+	vs->vs_guest_feature_select = 0;
 	/* vs->vs_status = 0; -- redundant */
 	if (vs->vs_isr)
 		pci_lintr_deassert(vs->vs_pi);
@@ -179,7 +185,7 @@ vi_add_modern_capabilities(struct virtio_softc *vs, int barnum)
 {
 	struct pci_devinst *pi = vs->vs_pi;
 	struct virtio_pci_notify_cap ncap;
-	int err;
+	int err, i;
 
 	err = pci_emul_alloc_bar(pi, barnum, PCIBAR_MEM32,
 	    VTCFG_MODERN_BAR_SIZE);
@@ -214,8 +220,36 @@ vi_add_modern_capabilities(struct virtio_softc *vs, int barnum)
 	if (err != 0)
 		return (err);
 
+	/*
+	 * Latch the backend's queue sizes as the ceiling the driver may
+	 * negotiate down from.  Spec 1.0 §4.1.4.3.2 lets the driver write
+	 * queue_size, but only to shrink the queue; without a remembered
+	 * maximum there is nothing to validate a write against.  Callers
+	 * must therefore set vq_qsize before calling this function -- the
+	 * same ordering vi_set_io_bar() already requires.
+	 */
+	for (i = 0; i < vs->vs_vc->vc_nvq; i++)
+		vs->vs_queues[i].vq_qsize_max = vs->vs_queues[i].vq_qsize;
+
 	vs->vs_modern_bar = barnum;
 	return (0);
+}
+
+/*
+ * Note a change to the device-specific configuration region.
+ *
+ * Spec 1.0 §4.1.4.3.1 requires config_generation to change whenever the
+ * device config does, so a driver reading a multi-word config can detect
+ * that it raced an update and retry.  Backends that mutate their config
+ * (display resize, link status, capacity change) call this, which bumps
+ * the generation and raises a configuration-change interrupt.
+ */
+void
+vi_config_changed(struct virtio_softc *vs)
+{
+
+	vs->vs_config_generation++;
+	vi_interrupt(vs, VIRTIO_PCI_ISR_CONFIG, vs->vs_msix_cfg_idx);
 }
 
 /*
@@ -664,7 +698,7 @@ vi_modern_common_read(struct virtio_softc *vs, uint64_t off, int size)
 	case offsetof(struct virtio_pci_common_cfg, guest_feature):
 		v = vs->vs_guest_feature_select == 0 ?
 		    (vs->vs_negotiated_caps & 0xffffffff) :
-		    ((uint64_t)vs->vs_negotiated_caps >> 32);
+		    (vs->vs_negotiated_caps >> 32);
 		break;
 	case offsetof(struct virtio_pci_common_cfg, msix_config):
 		v = vs->vs_msix_cfg_idx;
@@ -712,6 +746,51 @@ vi_modern_common_read(struct virtio_softc *vs, uint64_t off, int size)
 	return (v);
 }
 
+/*
+ * Translate the three guest-physical ring addresses the driver programmed
+ * through COMMON_CFG into host pointers.
+ *
+ * Every input here is guest-controlled, so validate before handing the
+ * results to the vq_getchain() fast path: a zero address means the driver
+ * never programmed that ring, and paddr_guest2host() yields NULL for any
+ * range not wholly inside guest memory.  On failure the queue is left
+ * unmapped and disabled rather than half-initialised.
+ */
+static int
+vi_modern_vq_map(struct virtio_softc *vs, struct vqueue_info *vq)
+{
+	struct vmctx *ctx = vs->vs_pi->pi_vmctx;
+	struct vring_desc *desc;
+	struct vring_avail *avail;
+	struct vring_used *used;
+	size_t nq = vq->vq_qsize;
+
+	if (nq == 0 || (nq & (nq - 1)) != 0 || nq > vq->vq_qsize_max)
+		return (-1);
+	if (vq->vq_desc_addr == 0 || vq->vq_avail_addr == 0 ||
+	    vq->vq_used_addr == 0)
+		return (-1);
+
+	/*
+	 * avail is flags + idx + ring[nq] + used_event, all uint16_t.
+	 * used is flags + idx + avail_event as uint16_t, plus ring[nq].
+	 */
+	desc = paddr_guest2host(ctx, vq->vq_desc_addr,
+	    nq * sizeof(struct vring_desc));
+	avail = paddr_guest2host(ctx, vq->vq_avail_addr,
+	    (3 + nq) * sizeof(uint16_t));
+	used = paddr_guest2host(ctx, vq->vq_used_addr,
+	    3 * sizeof(uint16_t) + nq * sizeof(struct vring_used_elem));
+	if (desc == NULL || avail == NULL || used == NULL)
+		return (-1);
+
+	vq->vq_desc = desc;
+	vq->vq_avail = avail;
+	vq->vq_used = used;
+	vq->vq_flags |= VQ_ALLOC;
+	return (0);
+}
+
 static void
 vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
     uint64_t v)
@@ -747,7 +826,14 @@ vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
 			    vs->vs_negotiated_caps);
 		return;
 	case offsetof(struct virtio_pci_common_cfg, queue_select):
-		vs->vs_curq = v;
+		/*
+		 * Keep the stored index in range.  It is used as an array
+		 * subscript below, and vs_curq is an int, so a wide write
+		 * would otherwise truncate to a negative value and slip
+		 * past the "too large" bound check.
+		 */
+		vs->vs_curq = v < (uint64_t)vs->vs_vc->vc_nvq ? (int)v :
+		    vs->vs_vc->vc_nvq;
 		return;
 	}
 
@@ -756,23 +842,30 @@ vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
 	vq = &vs->vs_queues[vs->vs_curq];
 	switch (off) {
 	case offsetof(struct virtio_pci_common_cfg, queue_size):
-		vq->vq_qsize = v; break;
+		/*
+		 * Spec 1.0 §4.1.4.3.2 lets the driver shrink the queue but
+		 * not grow it past the size the device published, and the
+		 * ring index arithmetic requires a power of two.  Ignore
+		 * anything else rather than carry it into vi_modern_vq_map().
+		 */
+		if (v == 0 || v > vq->vq_qsize_max || (v & (v - 1)) != 0)
+			break;
+		vq->vq_qsize = v;
+		break;
 	case offsetof(struct virtio_pci_common_cfg, queue_msix_vector):
 		vq->vq_msix_idx = v; break;
 	case offsetof(struct virtio_pci_common_cfg, queue_enable):
-		vq->vq_enable = v;
-		if (v == 1) {
-			struct vmctx *ctx = vs->vs_pi->pi_vmctx;
-			size_t nq = vq->vq_qsize;
-
-			vq->vq_desc = paddr_guest2host(ctx,
-			    vq->vq_desc_addr, 16 * nq);
-			vq->vq_avail = paddr_guest2host(ctx,
-			    vq->vq_avail_addr, 6 + 2 * nq);
-			vq->vq_used = paddr_guest2host(ctx,
-			    vq->vq_used_addr, 6 + 8 * nq);
-			vq->vq_flags |= VQ_ALLOC;
+		if (v != 1) {
+			vq->vq_enable = 0;
+			vq->vq_flags &= ~VQ_ALLOC;
+			vq->vq_desc = NULL;
+			vq->vq_avail = NULL;
+			vq->vq_used = NULL;
+			break;
 		}
+		if (vi_modern_vq_map(vs, vq) != 0)
+			break;
+		vq->vq_enable = 1;
 		break;
 	case offsetof(struct virtio_pci_common_cfg, queue_desc_lo):
 		vq->vq_desc_addr =
@@ -1178,6 +1271,11 @@ vi_pci_snapshot_softc(struct virtio_softc *vs, struct vm_snapshot_meta *meta)
 	SNAPSHOT_VAR_OR_LEAVE(vs->vs_isr, meta, ret, done);
 	SNAPSHOT_VAR_OR_LEAVE(vs->vs_msix_cfg_idx, meta, ret, done);
 
+	/* Modern transport state; inert when vs_modern_bar is -1. */
+	SNAPSHOT_VAR_OR_LEAVE(vs->vs_feature_select, meta, ret, done);
+	SNAPSHOT_VAR_OR_LEAVE(vs->vs_guest_feature_select, meta, ret, done);
+	SNAPSHOT_VAR_OR_LEAVE(vs->vs_config_generation, meta, ret, done);
+
 done:
 	return (ret);
 }
@@ -1222,6 +1320,18 @@ vi_pci_snapshot_queues(struct virtio_softc *vs, struct vm_snapshot_meta *meta)
 		SNAPSHOT_VAR_OR_LEAVE(vq->vq_msix_idx, meta, ret, done);
 
 		SNAPSHOT_VAR_OR_LEAVE(vq->vq_pfn, meta, ret, done);
+
+		/*
+		 * Modern transport ring addresses.  The vq_desc / vq_avail /
+		 * vq_used pointers themselves are re-translated below by the
+		 * GUEST2HOST macros, which serve both transports; these are
+		 * the GPAs the driver programmed, kept so the queue can be
+		 * re-enabled coherently after restore.
+		 */
+		SNAPSHOT_VAR_OR_LEAVE(vq->vq_desc_addr, meta, ret, done);
+		SNAPSHOT_VAR_OR_LEAVE(vq->vq_avail_addr, meta, ret, done);
+		SNAPSHOT_VAR_OR_LEAVE(vq->vq_used_addr, meta, ret, done);
+		SNAPSHOT_VAR_OR_LEAVE(vq->vq_enable, meta, ret, done);
 
 		if (!vq_ring_ready(vq))
 			continue;

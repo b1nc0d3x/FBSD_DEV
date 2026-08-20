@@ -237,7 +237,7 @@ struct virtio_softc {
 	int	vs_flags;		/* VIRTIO_* flags from above */
 	pthread_mutex_t *vs_mtx;	/* POSIX mutex, if any */
 	struct pci_devinst *vs_pi;	/* PCI device instance */
-	uint32_t vs_negotiated_caps;	/* negotiated capabilities */
+	uint64_t vs_negotiated_caps;	/* negotiated capabilities */
 	struct vqueue_info *vs_queues;	/* one per vc_nvq */
 	int	vs_curq;		/* current queue */
 	uint8_t	vs_status;		/* value from last status write */
@@ -331,6 +331,7 @@ struct vqueue_info {
 	uint64_t vq_avail_addr;
 	uint64_t vq_used_addr;
 	uint16_t vq_enable;		/* 0/1 written by driver */
+	uint16_t vq_qsize_max;		/* device-set ceiling for vq_qsize */
 };
 /* as noted above, these are sort of backwards, name-wise */
 #define VQ_AVAIL_EVENT_IDX(vq) \
@@ -430,6 +431,7 @@ int	vi_intr_init(struct virtio_softc *vs, int barnum, int use_msix);
 void	vi_reset_dev(struct virtio_softc *);
 void	vi_set_io_bar(struct virtio_softc *, int);
 int	vi_add_modern_capabilities(struct virtio_softc *, int barnum);
+void	vi_config_changed(struct virtio_softc *);
 uint64_t vi_pci_modern_read(struct pci_devinst *, uint64_t offset, int size);
 void	vi_pci_modern_write(struct pci_devinst *, uint64_t offset, int size,
 	    uint64_t value);
