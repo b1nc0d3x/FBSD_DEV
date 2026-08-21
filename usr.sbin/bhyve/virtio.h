@@ -237,7 +237,7 @@ struct virtio_softc {
 	int	vs_flags;		/* VIRTIO_* flags from above */
 	pthread_mutex_t *vs_mtx;	/* POSIX mutex, if any */
 	struct pci_devinst *vs_pi;	/* PCI device instance */
-	uint64_t vs_negotiated_caps;	/* negotiated capabilities */
+	uint64_t vs_negotiated_caps;	/* features negotiated with the driver, 64-bit */
 	struct vqueue_info *vs_queues;	/* one per vc_nvq */
 	int	vs_curq;		/* current queue */
 	uint8_t	vs_status;		/* value from last status write */
@@ -249,10 +249,10 @@ struct virtio_softc {
 	 * == -1 means legacy-only; vi_add_modern_capabilities sets it and
 	 * publishes the four cap regions into config space.
 	 */
-	int	vs_modern_bar;
-	uint32_t vs_feature_select;	/* device_feature_select */
-	uint32_t vs_guest_feature_select;
-	uint8_t vs_config_generation;	/* bumped on cfg change */
+	int	vs_modern_bar;		/* BAR carrying the modern transport, -1 = legacy only */
+	uint32_t vs_feature_select;	/* which 32-bit host-feature word device_feature returns */
+	uint32_t vs_guest_feature_select;/* which 32-bit guest-feature word the driver is writing */
+	uint8_t vs_config_generation;	/* bumped on device-config change for a consistent snapshot */
 };
 
 #define	VS_LOCK(vs)							\
@@ -327,12 +327,12 @@ struct vqueue_info {
 	struct vring_used *vq_used;	/* the "used" ring */
 
 	/* Modern transport per-queue state (spec 1.0 common_cfg). */
-	uint64_t vq_desc_addr;
-	uint64_t vq_avail_addr;
-	uint64_t vq_used_addr;
-	uint16_t vq_enable;		/* 0/1 written by driver */
-	uint16_t vq_qsize_max;		/* device-set ceiling for vq_qsize */
-	uint16_t vq_qsize_neg;		/* driver-selected size, 0 = use max */
+	uint64_t vq_desc_addr;		/* modern descriptor-ring guest address */
+	uint64_t vq_avail_addr;		/* modern available-ring guest address */
+	uint64_t vq_used_addr;		/* modern used-ring guest address */
+	uint16_t vq_enable;		/* queue enable, 0/1 written by the driver */
+	uint16_t vq_qsize_max;		/* device-set ceiling for the queue size */
+	uint16_t vq_qsize_neg;		/* driver-selected queue size, 0 = use the max */
 };
 /* as noted above, these are sort of backwards, name-wise */
 #define VQ_AVAIL_EVENT_IDX(vq) \

@@ -191,6 +191,7 @@ vi_set_io_bar(struct virtio_softc *vs, int barnum)
 #define	VTCFG_MODERN_REGION_SIZE	0x1000
 #define	VTCFG_MODERN_NOTIFY_MULT	4
 
+/* Emit one modern virtio-pci vendor capability describing a config region. */
 static int
 vi_emit_modern_cap(struct pci_devinst *pi, uint8_t cfg_type,
     uint8_t bar, uint32_t offset, uint32_t length)
@@ -207,6 +208,7 @@ vi_emit_modern_cap(struct pci_devinst *pi, uint8_t cfg_type,
 	return (pci_emul_add_capability(pi, (u_char *)&cap, sizeof(cap)));
 }
 
+/* Publish the modern virtio-pci transport (its four capabilities and BAR) for a backend that opts in. */
 int
 vi_add_modern_capabilities(struct virtio_softc *vs, int barnum)
 {
@@ -357,6 +359,7 @@ vi_add_modern_capabilities(struct virtio_softc *vs, int barnum)
  * bump is harmless, since drivers compare generations rather than
  * counting them.
  */
+/* Bump the config generation and raise a config-change interrupt after a backend edits its device config. */
 void
 vi_config_changed(struct virtio_softc *vs)
 {
@@ -416,6 +419,7 @@ vi_intr_init(struct virtio_softc *vs, int barnum, int use_msix)
  * modern capabilities were published, or the backend's own size on a
  * device that never published them.
  */
+/* Queue size the device advertises to the driver. */
 static uint16_t
 vi_vq_advertised_size(struct vqueue_info *vq)
 {
@@ -824,6 +828,7 @@ vi_find_cr(int offset) {
  * rest: a 4-byte read at offset 16 covers msix_config and num_queues, and
  * would otherwise report the device as having no queues.
  */
+/* Byte width of the common-config register at this offset. */
 static int
 vi_modern_common_width(uint64_t off)
 {
@@ -856,6 +861,7 @@ vi_modern_common_width(uint64_t off)
 #undef	VTCFG_CC
 }
 
+/* Read a modern common-config register. */
 static uint64_t
 vi_modern_common_read(struct virtio_softc *vs, uint64_t off, int size)
 {
@@ -949,6 +955,7 @@ vi_modern_common_read(struct virtio_softc *vs, uint64_t off, int size)
  * range not wholly inside guest memory.  On failure the queue is left
  * unmapped and disabled rather than half-initialised.
  */
+/* Translate a queue's descriptor/avail/used rings into host pointers when the driver enables it. */
 static int
 vi_modern_vq_map(struct virtio_softc *vs, struct vqueue_info *vq)
 {
@@ -1004,6 +1011,7 @@ vi_modern_vq_map(struct virtio_softc *vs, struct vqueue_info *vq)
 	return (0);
 }
 
+/* Write a modern common-config register: feature select, queue setup, or device status. */
 static void
 vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
     uint64_t v)
@@ -1220,6 +1228,7 @@ vi_modern_common_write(struct virtio_softc *vs, uint64_t off, int size,
 	(void)size;
 }
 
+/* Dispatch a read on the modern BAR to the matching config region. */
 uint64_t
 vi_pci_modern_read(struct pci_devinst *pi, uint64_t offset, int size)
 {
@@ -1302,6 +1311,7 @@ vi_pci_modern_read(struct pci_devinst *pi, uint64_t offset, int size)
 	return (v);
 }
 
+/* Dispatch a write on the modern BAR to the matching config region. */
 void
 vi_pci_modern_write(struct pci_devinst *pi, uint64_t offset, int size,
     uint64_t value)
