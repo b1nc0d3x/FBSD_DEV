@@ -1,0 +1,124 @@
+#!/bin/sh
+#
+# Post-boot KMS / display-framework loader.  loader.conf preload
+# still panics on arm64 (preload_protect data abort) on freshly-built
+# kmods, so anything that historically went there now kldloads here
+# after the kernel has stabilized.
+#
+
+kldload umodem 2>&1 | logger -t boot
+
+case "$(uname -i)" in
+RP64KERN_KMS)
+	kldload /boot/modules/fgpu.ko 2>&1 | logger -t fgpu
+	kldload /boot/kernel/kms.ko 2>&1 | logger -t kms
+	kldload /boot/kernel/rk_kms.ko 2>&1 | logger -t kms
+
+	# USB-C DP auto-bringup recipe validated 2026-07-20.
+	#
+	# Do NOT call `sysctl dev.rk_kms.0.config=2` — config_dp runs a
+	# scaffold modeset with fb=NULL then intentionally clears
+	# commit_modeset=0 so Xorg's SETCRTC after it doesn't push VOP
+	# into standby.  Result: Xorg SETCRTC then does nothing and
+	# panel stays dark.
+	#
+	# Instead: 1) train the DP link via usbc_bringup_now, 2) set
+	# the three sysctls Xorg's set_config reads (output=1 DP,
+	# dp_enable=1, commit_modeset=RK_KMS_STAGE_ALL=0x7f), 3) kick
+	# Xorg via service slim restart so it fires a fresh SETCRTC.
+	# That SETCRTC reads commit_modeset=0x7f and runs all 7 VOP
+	# stages with Xorg's real fb bound to WIN0.
+	(
+		# Poll up to 30 s for cdn_dp firmware to be attach-ready.
+		# usbc_bringup_now fired against a not-ready cdn_dp is a
+		# no-op; we retry every 500 ms until stage reaches 19.
+		i=0
+		while [ "$i" -lt 60 ]; do
+			s=$(sysctl -n dev.rk_cdn_dp.0.stage 2>/dev/null)
+			if [ "$s" = "19" ]; then
+				logger -t kms "cdn_dp reached stage 19 after $((i * 500)) ms"
+				break
+			fi
+			sysctl dev.rk_kms.0.usbc_bringup_now=1 >/dev/null 2>&1
+			sleep 0.5
+			i=$((i + 1))
+		done
+
+		s=$(sysctl -n dev.rk_cdn_dp.0.stage 2>/dev/null)
+		if [ "$s" != "19" ]; then
+			logger -t kms "cdn_dp never reached stage 19 (=$s); DP not brought up"
+			exit 0
+		fi
+
+		# Link is trained.  Push the sysctls Xorg SETCRTC needs.
+		# debug=1 makes rk_kms print set_config + STAGE lines to
+		# dmesg so we can verify the modeset chain fires — silent
+		# by default which made earlier reboot verification useless.
+		sysctl dev.rk_kms.0.debug=1 2>&1 | logger -t kms
+		sysctl dev.rk_kms.0.output=1 2>&1 | logger -t kms
+		sysctl dev.rk_kms.0.dp_enable=1 2>&1 | logger -t kms
+		sysctl dev.rk_kms.0.commit_modeset=0x7f 2>&1 | logger -t kms
+
+		# Kick Xorg so its SETCRTC fires against the new sysctls.
+		# On cold boot, slim/Xorg starts BEFORE our sysctls are set
+		# and its first SETCRTC sees commit_modeset=0 → no VOP stages
+		# run → monitor stays dark.  Wait for slim to be up, then
+		# force restart so a fresh Xorg SETCRTC picks up commit=0x7f.
+		# Also cleans up any stale /tmp/.X0-lock from a killed prior
+		# Xorg instance that would otherwise block the restart.
+		j=0
+		while [ "$j" -lt 40 ]; do
+			if pgrep -q slim 2>/dev/null; then
+				break
+			fi
+			sleep 0.5
+			j=$((j + 1))
+		done
+		if pgrep -q slim 2>/dev/null; then
+			logger -t kms "slim up after $((j * 500)) ms; restarting to fire fresh SETCRTC"
+			pkill -9 Xorg 2>/dev/null
+			pkill -9 slim  2>/dev/null
+			sleep 1
+			rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null
+			sleep 1
+			service slim start 2>&1 | logger -t kms
+
+			# That fresh SETCRTC re-runs cdn_dp's bring-up and
+			# reprograms the framer, which zeroes the MHDP audio
+			# packetizer — AUDIO_SRC_CNTL, SMPL2PKT_CNTL and
+			# PIF_PKT_ALLOC all read back 0, so the sink ends up
+			# with a trained link and no audio packets.  rk_kms
+			# only arms audio from usbc_bringup, i.e. on a fresh
+			# cable attach, so nothing re-arms it after a modeset.
+			# Wait for Xorg, then arm; twice, spaced out, because
+			# SETCRTC lands asynchronously after slim start.
+			# Drop this once the rk_kms fix that re-arms audio in
+			# rk_kms_dp_modeset is built into the running kernel.
+			k=0
+			while [ "$k" -lt 40 ]; do
+				if pgrep -q Xorg 2>/dev/null; then
+					break
+				fi
+				sleep 0.5
+				k=$((k + 1))
+			done
+			sleep 3
+			sysctl dev.rk_cdn_dp.0.audio_start_now=1 2>&1 |
+			    logger -t kms
+			sleep 5
+			sysctl dev.rk_cdn_dp.0.audio_start_now=1 2>&1 |
+			    logger -t kms
+		else
+			logger -t kms "slim never started; nothing to restart"
+		fi
+	) &
+	;;
+RP64KERN_DRMCOMPAT)
+	kldload /boot/modules/drmcompat.ko 2>&1 | logger -t drmcompat
+	kldload /boot/modules/rk_drmcompat.ko 2>&1 | logger -t drmcompat
+	;;
+*)
+	kldload /boot/modules/drmcompat.ko 2>&1 | logger -t drmcompat
+	kldload /boot/modules/drmcompat_stub.ko 2>&1 | logger -t drmcompat
+	;;
+esac

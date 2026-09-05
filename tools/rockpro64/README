@@ -1,0 +1,18 @@
+RockPro64 (armbsd) reference config
+
+Build:
+
+	make buildkernel TARGET=arm64 TARGET_ARCH=aarch64 KERNCONF=RP64KERN_KMS
+
+This builds the kernel plus kms.ko, rk_kms.ko, rtwn.ko and
+if_rtwn_usb.ko.  fgpu builds out of tree against this src.
+
+kernel= in loader.conf is unreliable on this board; the loader menu
+autodetects /boot/kernel* and boots its own first entry.  Use
+nextboot -k <name> instead.
+
+loader.conf and rc.local are what this board runs, kept for reference.
+The build does not install them.  rc.local sets dev.rk_kms.0.output,
+dp_enable and commit_modeset, which are default-off in the driver; the
+DP bring-up itself lives in rk_cdn_dp.  The audio_start_now calls are a
+stopgap until the rk_kms audio re-arm fix is in the running kernel.
