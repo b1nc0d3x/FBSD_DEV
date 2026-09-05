@@ -101,6 +101,8 @@ SUBDIR=	\
 	${_dpdk_lpm4} \
 	${_dpdk_lpm6} \
 	${_dpms} \
+	kms \
+	${_rk_kms} \
 	dummymbuf \
 	dummynet \
 	${_dwwdt} \
@@ -658,6 +660,7 @@ _mpi3mr=mpi3mr
 # Specific to the Raspberry Pi.
 .if ${MACHINE_CPUARCH} == "aarch64"
 _genet=		genet
+_rk_kms=	rk_kms
 .endif
 
 .if ${MACHINE_CPUARCH} == "amd64" || ${MACHINE_CPUARCH} == "aarch64" || \

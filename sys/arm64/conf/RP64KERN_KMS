@@ -1,0 +1,62 @@
+#
+# RP64KERN_KMS -- RockPro64/RK3399 kernel running kms
+# instead of drm2.
+#
+# Phase 9i milestone: drm2 + rk_drm are gone.  Display ownership is
+# handed to the kms framework and its RK3399 driver
+# rk_kms, both loaded as modules at boot via loader.conf:
+#
+#   kms_load="YES"
+#   rk_kms_load="YES"
+#
+# Display state machine, post-boot:
+#   set sysctls dev.rk_kms.0.commit_modeset=1, .output=0|1,
+#   .hdmi_enable=1 (HDMI path) or .dp_enable=1 (DP path),
+#   .vblank_enable=1, then issue SETCRTC via drm_probe / Xorg.
+#
+# The DP path still goes through rk_cdn_dp (statically linked); the
+# only change is which DRM framework drives it.  fusb302 + altmode +
+# PD stack are unchanged.
+#
+
+cpu		ARM64
+ident		RP64KERN_KMS
+
+include		"std.arm64"
+include		"std.dev"
+include		"std.rockchip"
+
+#
+# Debugger support (serial DDB).
+# Note: entering DDB on panic is controlled by loader tunables/sysctls
+# (e.g. debug.kdb.panic / debug.debugger_on_panic), not just these options.
+#
+options		KDB
+options		KDB_TRACE
+options		DDB
+options		BREAK_TO_DEBUGGER
+options		ALT_BREAK_TO_DEBUGGER
+
+# rk3399_power must be compiled in: rk_cdn_dp resolves rk3399_power_enable_domain
+# as a direct kernel symbol (not through module dependency chain).
+# fusb302 + rk_cdn_dp are now compiled in (was modules) so they attach during
+# normal device probe rather than at userland kld_list time — moves panel
+# bring-up earlier in boot by several seconds.  Revert to module form if a
+# probe-time hang reappears (kld_list slot in /etc/rc.conf still works fine).
+device		rk3399_power
+device		fbd
+# drm2 + rk_drm removed in Phase 9i.  kms + rk_kms load as
+# modules from /boot/kernel/.  fbd stays for the boot console
+# framebuffer (vt over efifb) -- kms doesn't replace that path
+# yet, just owns /dev/dri/cardN.
+device		fusb302
+device		rk_cdn_dp
+
+# HDMI audio path (Stage 3): pcm framework + DAI binder + I2S2 + a
+# placeholder codec.  audio_soc binds the CPU-side DAI (rk_i2s on
+# i2s2 @ 0xff8a0000) to a dummy-codec on the boot DT's
+# simple-audio-card node, exposing /dev/dsp0 to userland.  Without
+# the simple-audio-card DT node this is harmless -- the framework
+# just doesn't bind anything.
+device		sound
+options		SOC_ROCKCHIP_RK3399
