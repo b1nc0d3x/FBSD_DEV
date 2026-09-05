@@ -1,0 +1,113 @@
+fbsdx86 (Intel HD 630, Kabylake-S GT2, PCI 8086:5912)
+Initial post-boot live MMIO state captured 2026-06-10 via dev.igen.0.re scaffold.
+
+Firmware/loader has Pipe A scanning out 1920x1080@60 8bpc HDMI on DDI_B
+via Transcoder A.  No other pipe / transcoder / DDI is active.
+
+# Pipe + power
+CDCLK_CTL          0x46000  = 0x0c000544   CD2X div=3, freq_decimal=0x144
+PIPE_A CONF        0x70008  = 0xc0000000   bit31 ENABLE + bit30 STATE -> Pipe A active
+PIPE_B CONF        0x71008  = 0x00000000   disabled
+PIPE_C CONF        0x72008  = 0x00000000   disabled
+
+# Transcoder A timing (decoded HTOTAL/HSYNC/VTOTAL/VSYNC = +1 encoded)
+TRANS_A HTOTAL     0x60000  = 0x0897077f   HTOTAL=2200, HACTIVE=1920
+TRANS_A HSYNC      0x60008  = 0x080307d7   HSYNC_START=2008, HSYNC_END=2052 (width 44)
+TRANS_A VTOTAL     0x6000c  = 0x04640437   VTOTAL=1125, VACTIVE=1080
+TRANS_A VSYNC      0x60014  = 0x043e0439   VSYNC_START=1082, VSYNC_END=1087 (width 5)
+Derived mode:                              1920x1080@60 (148.5 MHz pixclk, CEA-VIC 16)
+
+# Transcoder DDI function control
+TRANS_DDI_FUNC_A   0x60400  = 0x90030000   ENABLE | PORT_SEL=1 (DDI_B) | MODE=HDMI |
+                                           8bpc | PVSYNC | PHSYNC
+TRANS_DDI_FUNC_B   0x61400  = 0x00030000   PVSYNC|PHSYNC sticky, no enable
+TRANS_DDI_FUNC_C   0x62400  = 0x00030000   PVSYNC|PHSYNC sticky, no enable
+TRANS_DDI_FUNC_EDP 0x6F400  = 0x00030000   PVSYNC|PHSYNC sticky, no enable
+
+# DDI buffer state
+DDI_BUF_CTL_A      0x64000  = 0x00000081   bit7 IDLE_STATUS set, bit0 set; ENABLE=0 -> parked
+DDI_BUF_CTL_B      0x64100  = 0x80000000   bit31 ENABLE=1, no IDLE bit -> live port (HDMI)
+DDI_BUF_CTL_C      0x64200  = 0x00000000   cold
+DDI_BUF_CTL_D      0x64300  = 0x00000000   cold
+DDI_BUF_CTL_E      0x64400  = 0x00000000   cold
+
+# Misc
+NORTH_GMBUS        0xc6014  = 0x2a480000   prescaler region
+
+Decoded conclusions for next bring-up steps:
+  - target port for first EDID read = DDI_B (HDMI on physical HDMI header)
+  - GMBus port number for HDMI/DDC on DDI_B = 5 (SKL+ GMBUS_PIN_DPB=5,
+    not 4 as I first mis-read; DPC=4 / DPD=6)
+  - active mode is the classic 1080p60 CEA-VIC 16; safe target to re-program
+  - 8bpc, HDMI mode; no DP link training needed for round-trip
+
+GMBus xfer status 2026-06-13 -- EDID WORKING:
+  XYM W156F1, mfg=632d, product=0x1566.
+  DTD 0: pixclk=148.50 MHz, HActive=1920, HBlank=280, HTotal=2200,
+         VActive=1080.  Matches firmware-programmed Pipe A mode exactly.
+  Unblocked by two fixes:
+    (a) Display WA #0868 — set PCH_GMBUSUNIT_CLK_GATE_DIS (bit 31 of
+        SOUTH_DSPCLK_GATE_D at 0xc2020) and KEEP it disabled across
+        xfers.  Toggling per-xfer left the controller in a transient
+        state that caused intermittent NAK / wedge.
+    (b) Explicit W1C of GMBUS_INUSE (bit 15 of GMBUS2) at end of every
+        xfer.  Without this, the next attempt sees INUSE stuck and the
+        controller doesn't actually run on the wire.
+  Pin map confirmed by working read: pin 5 = HDMI-B = canonical SKL+
+  mapping (matches VBT child[1]).
+
+Earlier (pre-fix) GMBus xfer status 2026-06-10:
+  Controller is reachable (PCH GMBus at 0xc5100 responds to writes; INUSE
+  W1C visible).  GMBus state machine completes electrically only on pin 4
+  (canonical DDI_C) with NAK at EDID slave 0x50; pins 1/2/3/5/6/7/8/9 all
+  timeout on the address-write phase.
+
+  Tested 2026-06-10:
+    a) Re-asserting DDI_BUF_CTL_B ENABLE (already was 0x80000000, idle=0)
+       made no difference — buffer was already awake; DDC line is not
+       gated by DDI_BUF state on this board.
+    b) Full slave-address scan 0x08..0x64 on pin 4: every address NAKs.
+       Beyond 0x65 the bus wedges with GMBUS2=0x00008000 (INUSE stuck).
+       Conclusion: no I2C slave answers on pin 4 either.
+
+  Net: firmware-programmed Pipe A is actively scanning to DDI_B but the
+  physical DDC line of whichever connector matters is either (1) on a
+  port not in the canonical SKL+ pin map for this desktop motherboard,
+  or (2) the monitor was unplugged after boot and the firmware-programmed
+  mode is scanning to nothing.
+
+VBT parse 2026-06-10: rules out (1).
+  ASLS=0xbf96b018  OpRegion sig "IntelGra..."  $VBT v100 BDB v209
+  Child devices for this board's HD 630:
+    child[0]: eDP   on DP-A   ddc_pin=3  aux=0x40   (laptop panel slot)
+    child[1]: HDMI  on HDMI-B ddc_pin=5  aux=0x00   <- firmware mode target
+    child[2]: DP+HDMI on DP-C ddc_pin=4  aux=0x20   <- pin 4's NAK explained
+    child[3]: DP+HDMI on DP-D ddc_pin=6  aux=0x30
+    child[4]: DP    on DP-E   ddc_pin=0  aux=0x40
+  Canonical SKL+ pin map IS correct on this board.  Pin 5 (HDMI-B) being
+  dead confirms (2): no monitor on the HDMI port firmware programmed.
+  Pin 4 NAK-only state matches HDMI-C/DP-C dual being wired but unplugged.
+
+  Next: HPD live status read (PCH_PORT_HOTPLUG / DE_HPD_ISR around
+  0xc4030 / 0x44030) to find which connector actually has signal, then
+  read EDID over GMBus or AUX of THAT port — not the firmware-programmed
+  one.
+
+HPD register dump 2026-06-10:
+  SFUSE_STRAP      = 0x00000006   bits[2:0] = 110: DDI_B + DDI_C present,
+                                   DDI_D NOT populated on the package.
+  SHOTPLUG_CTL_DDI = 0x00101010   per-port nibble: bit0=short, bit1=long,
+                                   bit3=enable.  Status bits set on DDI_B
+                                   short, DDI_D short (latched from prior
+                                   state).  NO enable bits set on any
+                                   port — firmware never armed HPD.
+  SDEISR           = 0x00200000   bit 21 set; likely DDI_A or other.
+
+  Net: firmware programmed Pipe A -> HDMI-B but never enabled HPD on
+  DDI_B, and SFUSE confirms HDMI-B is wired on the package.  GMBus pin
+  5 wire is genuinely dead.  Most consistent conclusion: NO MONITOR is
+  plugged into fbsdx86's HDMI-B right now; firmware set a default
+  hot-pluggable mode and the pipe is scanning to nothing.
+
+  Real next step needs physical access: plug a monitor into HDMI-B
+  (or HDMI-C/DP-C, which is pin 4) and retry edid_read_b=1.

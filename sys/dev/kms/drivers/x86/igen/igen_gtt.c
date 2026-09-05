@@ -1,0 +1,1161 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
+ *
+ * igen GTT + scanout playground.
+ *
+ * The Graphics Translation Table at BAR0 + 0x800000 covers 4 GiB of
+ * graphics address space at 4 KiB page granularity (gen8+ 8-byte PTEs).
+ * This file owns:
+ *   - GTT introspection (gtt_dump) + read/write helpers
+ *   - 8 MiB scratch FB allocator (igen_test_fb_alloc + GTT slot cache)
+ *   - Driver-owned persistent scanout buffer + animation kthread
+ *     (scanout_hold sysctl, diagnostic patterns, Lissajous dot)
+ *   - User-FB GTT slot allocator (igen_gtt_bind_user_fb) consumed by
+ *     atomic_commit in igen.c to give each ADDFB2 dumb buffer its own
+ *     permanent GTT mapping
+ *   - expose_scanout_fb: registers a driver-owned drm_framebuffer
+ *     against the kms mode-object table so atomic_test programs can
+ *     bind it by FB_ID
+ *
+ * Exported entry points:
+ *   uint32_t igen_gtt_bind_user_fb(sc, fb);
+ *   void     igen_test_fb_free(sc, fb);
+ *   void     igen_anim_stop(sc);
+ *   void     igen_gtt_register_sysctls(sc);
+ *
+ * Sysctls registered here (children of dev.igen.<n>.re.):
+ *   gtt_dump, gtt_alloc_test, test_fb_make, test_fb_flip,
+ *   scanout_hold, expose_scanout_fb.
+ *
+ * &igen_owned_fb_funcs is defined in igen.c and referenced here by
+ * pointer comparison + as the funcs table for the exposed FB.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/bus.h>
+#include <sys/kernel.h>
+#include <sys/kthread.h>
+#include <sys/lock.h>
+#include <sys/malloc.h>
+#include <sys/proc.h>
+#include <sys/sysctl.h>
+
+#include <vm/vm.h>
+#include <vm/pmap.h>
+#include <vm/vm_page.h>
+
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+
+#include <kms/drm_atomic.h>
+#include <kms/drm_connector.h>
+#include <kms/drm_crtc.h>
+#include <kms/drm_device.h>
+#include <kms/drm_drv.h>
+#include <kms/drm_encoder.h>
+#include <kms/drm_file.h>
+#include <kms/drm_framebuffer.h>
+#include <kms/drm_gem.h>
+#include <kms/drm_mode_config.h>
+#include <kms/drm_plane.h>
+
+#include "igen_internal.h"
+
+MALLOC_DECLARE(M_KMS);
+
+/* ------------------------------- GTT -------------------------------------- */
+
+/*
+ * Graphics Translation Table lives at different offsets and uses different
+ * PTE widths across gens:
+ *
+ *   Gen 7.5 (HSW): 4 MiB BAR0.  GTT at upper 2 MiB (offset 0x00200000).
+ *                  4-byte PTEs.  Gen 6/7 encoding:
+ *                    bit 0:      VALID
+ *                    bits[2:1]:  cache type (00=UC, 10=LLC, 11=LLC/eLLC)
+ *                    bits[31:12]: PFN
+ *                  No explicit WRITEABLE bit (all GTT is writeable).
+ *
+ *   Gen 8+ (BDW/SKL): 8+ MiB BAR0.  GTT at upper half (offset 0x00800000).
+ *                     8-byte PTEs.  Gen 8+ encoding:
+ *                       bit 0:        VALID
+ *                       bit 1:        WRITEABLE
+ *                       bits[3:2]:    PAT_INDEX
+ *                       bit 11:       LLC_CACHEABLE
+ *                       bits[63:12]:  PFN
+ */
+#define	HSW_GTT_BASE		0x00200000	/* HSW GTT offset in BAR0 */
+#define	SKL_GTT_BASE		0x00800000	/* SKL+ GTT offset in BAR0 */
+#define	GTT_PTE_VALID		(1u << 0)
+#define	GTT_PTE_WRITEABLE	(1u << 1)	/* gen8+ only */
+
+/*
+ * Per-gen GGTT entry cap for the H7 backstop.  HSW GGTT is 2 GiB / 4 KiB
+ * = 512 Ki entries; SKL+ is 4 GiB / 4 KiB = 1 Mi entries.  The single 1
+ * Mi bound previously used let HSW writes land past the real GGTT into
+ * neighbouring MMIO at BAR0+0x400000..BAR0+0x600000 — real chip damage
+ * potential.  Gen-select for the exact cap and reject anything above.
+ */
+#define	HSW_GTT_ENTRIES		0x00080000	/* 512 Ki entries = 2 GiB */
+#define	SKL_GTT_ENTRIES		0x00100000	/* 1 Mi entries = 4 GiB */
+
+static inline uint32_t
+igen_gtt_entries(struct igen_softc *sc)
+{
+	return (sc->gen == IGEN_GEN_HSW ? HSW_GTT_ENTRIES : SKL_GTT_ENTRIES);
+}
+
+/*
+ * Primary-plane registers needed for the page-flip path.  PLANE_SURF is
+ * the armed (next-vblank) surface offset; PLANE_SURFLIVE reads back the
+ * surface address HW is currently scanning out.  PIPE_FRMCOUNT is the
+ * vblank-incremented frame counter — a sanity check that the pipe is
+ * actually running (not just that we wrote a register).
+ */
+#define	PLANE_SURF(p)		(0x7019c + (p) * 0x1000)
+#define	PLANE_SURFLIVE(p)	(0x701ac + (p) * 0x1000)
+#define	PIPE_FRMCOUNT(p)	(0x70040 + (p) * 0x1000)
+
+/*
+ * Gen-aware GTT accessors.  HSW uses 4-byte PTEs at BAR0+0x200000; SKL+
+ * uses 8-byte PTEs at BAR0+0x800000.  Callers pass logical entry_idx;
+ * this layer handles the wire format.
+ */
+static inline uint32_t
+igen_gtt_base(struct igen_softc *sc)
+{
+	return (sc->gen == IGEN_GEN_HSW ? HSW_GTT_BASE : SKL_GTT_BASE);
+}
+
+static inline uint32_t
+igen_gtt_pte_size(struct igen_softc *sc)
+{
+	return (sc->gen == IGEN_GEN_HSW ? 4u : 8u);
+}
+
+uint64_t
+igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx)
+{
+	uint32_t off, lo, hi;
+
+	if (entry_idx >= igen_gtt_entries(sc)) {
+		printf("igen: gtt_read entry_idx=0x%x out of range (max 0x%x)\n",
+		    entry_idx, igen_gtt_entries(sc) - 1);
+		return (0);
+	}
+	off = igen_gtt_base(sc) + entry_idx * igen_gtt_pte_size(sc);
+	if (sc->gen == IGEN_GEN_HSW) {
+		return ((uint64_t)igen_r32(sc, off));
+	}
+	lo = igen_r32(sc, off);
+	hi = igen_r32(sc, off + 4);
+	return ((uint64_t)hi << 32) | lo;
+}
+
+void
+igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
+    uint64_t pte)
+{
+	uint32_t off;
+
+	if (entry_idx >= igen_gtt_entries(sc)) {
+		printf("igen: gtt_write entry_idx=0x%x out of range (max 0x%x)"
+		    " — REFUSED (H7 backstop)\n",
+		    entry_idx, igen_gtt_entries(sc) - 1);
+		return;
+	}
+	off = igen_gtt_base(sc) + entry_idx * igen_gtt_pte_size(sc);
+	if (sc->gen == IGEN_GEN_HSW) {
+		/* Gen 7 GTT PTE is 32-bit with a split-encoded 40-bit phys:
+		 *   PTE[31:12] = addr[31:12]   (low  20 bits of PFN)
+		 *   PTE[11:4]  = addr[39:32]   (high 8 bits of phys, i.e.
+		 *                               shifted right by 28 into
+		 *                               [11:4])
+		 *   PTE[3:2]   = cache-select  (0 = UC, fine for LLC iGPU)
+		 *   PTE[0]     = VALID
+		 * Matches Linux i915 gen6_pte_encode:
+		 *   ((addr) & ~BIT_ULL(40)) | (((addr) >> 28) & 0xff0)
+		 *
+		 * Prior code only kept (pte & 0xfffff000ULL) so any phys addr
+		 * above 4 GiB got truncated — on fbsdmac obj->pages[0] at
+		 * 0x3bb000000 became 0xbb000000, display DMA scanned wrong
+		 * memory, panel showed multi-color striations (2026-08-06).
+		 */
+		uint64_t addr = pte & ~0xfffULL;
+		uint32_t pfn_valid = (uint32_t)((addr & ~(1ULL << 40)) |
+		    (((addr) >> 28) & 0xff0ULL)) | GTT_PTE_VALID;
+		igen_w32(sc, off, pfn_valid);
+		return;
+	}
+	igen_w32(sc, off, (uint32_t)pte);
+	igen_w32(sc, off + 4, (uint32_t)(pte >> 32));
+}
+
+/* struct igen_test_fb is now defined in igen_internal.h. */
+
+/* Test-FB lives at GTT[0x80000..] — same safe-past-firmware zone. */
+#define	TEST_FB_GTT_FIRST	0x80000
+/*
+ * USER_FB_GTT_* are forward-declared near the softc.  Each slot is
+ * 2048 entries (8 MiB scanout buffer) so a 1920x1080 XR24 FB fits in
+ * one slot.  Per-fb slot cache lives on the softc; 3-buffer animation
+ * gets 3 distinct PLANE_SURF addresses and HW never re-maps a live
+ * scanout buffer.
+ */
+
+/*
+ * Bind a generic drm_framebuffer (whose GEM object holds the backing
+ * pages) into the GTT so HW can scan from it.  Walks ps->fb->gem_objs[0]
+ * page array, writes one GTT PTE per page at USER_FB_GTT_FIRST.
+ * Returns the GTT byte offset usable in PLANE_SURF, or 0 on error.
+ *
+ * Caller-owned: we don't unmap on FB destroy because the same range is
+ * reused for the next user FB.  Single active scanout buffer at a time.
+ */
+uint32_t
+igen_gtt_bind_user_fb(struct igen_softc *sc,
+    struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *obj = fb->gem_objs[0];
+
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
+		return (0);
+	if (obj->npages > USER_FB_GTT_SLOT_PAGES) {
+		device_printf(sc->dev,
+		    "gtt_bind: FB too big (%u pages, slot=%u)\n",
+		    (unsigned)obj->npages, USER_FB_GTT_SLOT_PAGES);
+		return (0);
+	}
+
+	/*
+	 * Cache coherency: GEM pages allocated via VM_MEMATTR_DEFAULT
+	 * (write-back on x86) hold compositor writes in CPU cache; the
+	 * display engine reads through GTT which bypasses the CPU cache
+	 * entirely, so without a flush it scans stale/zeroed lines —
+	 * screen goes black with backlight on.  Flush unconditionally,
+	 * before the cache-hit early-return: compositors reuse the same
+	 * FB per frame (dumb-buffer double-buffering, kwin's damage
+	 * repaint) so hitting our slot cache doesn't imply cache-clean
+	 * pages.  See project_igen9_scanout_2026_06_15.md path A.
+	 */
+	pmap_invalidate_cache_pages(obj->pages, obj->npages);
+
+	/* Cache hit: reuse the slot we already mapped this FB into. */
+	for (uint32_t i = 0; i < USER_FB_GTT_NSLOTS; i++)
+		if (sc->user_fb_slots[i].fb == fb)
+			return (sc->user_fb_slots[i].surf);
+
+	/* Find empty slot; if none, round-robin evict. */
+	uint32_t slot = USER_FB_GTT_NSLOTS;
+	for (uint32_t i = 0; i < USER_FB_GTT_NSLOTS; i++)
+		if (sc->user_fb_slots[i].fb == NULL) { slot = i; break; }
+	if (slot == USER_FB_GTT_NSLOTS) {
+		slot = sc->user_fb_next_slot;
+		sc->user_fb_next_slot =
+		    (sc->user_fb_next_slot + 1) % USER_FB_GTT_NSLOTS;
+	}
+
+	uint32_t base = (sc->gen == IGEN_GEN_HSW) ?
+	    HSW_USER_FB_GTT_FIRST : SKL_USER_FB_GTT_FIRST;
+	uint32_t first_idx = base + slot * USER_FB_GTT_SLOT_PAGES;
+	for (size_t i = 0; i < obj->npages; i++) {
+		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
+		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |
+		    GTT_PTE_WRITEABLE;
+		igen_gtt_write(sc, first_idx + i, pte);
+	}
+	uint32_t surf = first_idx * PAGE_SIZE;
+	sc->user_fb_slots[slot].fb = fb;
+	sc->user_fb_slots[slot].surf = surf;
+	return (surf);
+}
+
+uint32_t
+igen_gtt_bind_cursor(struct igen_softc *sc, struct drm_gem_object *obj)
+{
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
+		return (0);
+	if (obj->npages > CURSOR_GTT_PAGES)
+		return (0);
+	for (size_t i = 0; i < obj->npages; i++) {
+		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
+		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |
+		    GTT_PTE_WRITEABLE;
+		igen_gtt_write(sc, CURSOR_GTT_FIRST + i, pte);
+	}
+	return ((uint32_t)CURSOR_GTT_FIRST * PAGE_SIZE);
+}
+
+static int
+igen_test_fb_alloc(struct igen_softc *sc,
+    struct igen_test_fb *fb, uint32_t w, uint32_t h)
+{
+	fb->width = w;
+	fb->height = h;
+	fb->stride = w * 4;
+	fb->size = (size_t)fb->stride * h;
+	fb->size = (fb->size + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+	fb->gtt_count = fb->size / PAGE_SIZE;
+	fb->gtt_first_idx = TEST_FB_GTT_FIRST;
+
+	fb->va = contigmalloc(fb->size, M_KMS, M_WAITOK | M_ZERO,
+	    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	if (fb->va == NULL)
+		return (ENOMEM);
+	fb->pa = pmap_kextract((vm_offset_t)fb->va);
+
+	for (uint32_t i = 0; i < fb->gtt_count; i++) {
+		uint64_t pte = ((fb->pa + (uint64_t)i * PAGE_SIZE) & ~0xfffULL)
+		    | GTT_PTE_VALID | GTT_PTE_WRITEABLE;
+		igen_gtt_write(sc, fb->gtt_first_idx + i, pte);
+	}
+	fb->mapped = true;
+	return (0);
+}
+
+/*
+ * Bind a GEM object into GGTT at a caller-supplied byte address (softpin
+ * target).  Used by the EXECBUFFER2 handler for each obj[i] before the
+ * batch is dispatched: it writes one PTE per backing page pointing at
+ * the GEM's wired pages, so the engine's BB_START jumps into real BO
+ * content instead of scratch.
+ *
+ * `ggtt_byte_addr` must be page-aligned.  Ranges collide-checked against
+ * our reserved render engine slots (ring / LRC / HWSP at
+ * IGT_GTT_FIRST_RCS_RING..HWSP+PAGES) so a bad softpin from userspace
+ * can't stomp on ring buffers that live in the same GGTT.
+ *
+ * Idempotent — repeatedly binding the same BO at the same address just
+ * re-writes the same PTEs.  Callers do not need to unbind first.
+ *
+ * Cache coherency: same reason as bind_user_fb — GEM pages are WB-cached
+ * on x86, GPU reads via GGTT bypass CPU cache, so we invalidate the
+ * cache lines for the BO before the engine sees them.
+ *
+ * Returns 0 on success, or an errno (EINVAL for alignment / overlap,
+ * ENOSPC if the range is past our GGTT size).
+ */
+int
+igen_gtt_bind_gem_at(struct igen_softc *sc, struct drm_gem_object *obj,
+    uint64_t ggtt_byte_addr)
+{
+	/*
+	 * Engine-reserved GGTT window.  Ring + LRC + HWSP live at
+	 * IGT_GTT_FIRST_RCS_RING = 0x80800, private to igen_gt.c.  Reserve
+	 * 32 pages (128 KB) generously here so future growth (a second
+	 * engine's ring, guc scratch, etc.) doesn't need a re-sync.
+	 * Userspace softpin refused if it overlaps.
+	 */
+	const uint32_t rsv_start = 0x80800;
+	const uint32_t rsv_end = 0x80820;
+
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
+		return (EINVAL);
+	if ((ggtt_byte_addr & (PAGE_SIZE - 1)) != 0)
+		return (EINVAL);
+
+	/*
+	 * H4 (2026-08-03 review): do the range math in u64 and reject
+	 * addresses past the physical GGTT.  Previously first_idx was a
+	 * u32 truncation of ggtt_byte_addr/PAGE_SIZE, so a userspace
+	 * softpin near 0xFFFFFF00_00000 would alias to a low index that
+	 * passed the reservation-overlap check, then igen_gtt_write's H7
+	 * backstop would also see the truncated index and let the write
+	 * through.  With i915_dispatch_enable that was arbitrary GGTT
+	 * remap from any unprivileged client.
+	 */
+	uint64_t first_page = ggtt_byte_addr / PAGE_SIZE;
+	uint64_t last_page = first_page + (uint64_t)obj->npages;
+	if (last_page < first_page ||	/* u64 wrap */
+	    last_page > (uint64_t)igen_gtt_entries(sc)) {
+		device_printf(sc->dev,
+		    "gtt_bind_gem_at: softpin=0x%jx npages=%zu"
+		    " past GGTT ceiling (0x%x pages)\n",
+		    (uintmax_t)ggtt_byte_addr, obj->npages,
+		    igen_gtt_entries(sc));
+		return (EINVAL);
+	}
+
+	uint32_t first_idx = (uint32_t)first_page;
+	uint32_t bind_end = (uint32_t)last_page;
+	if (first_idx < rsv_end && bind_end > rsv_start) {
+		device_printf(sc->dev,
+		    "gtt_bind_gem_at: softpin range [0x%x..0x%x)"
+		    " overlaps engine reservation [0x%x..0x%x)\n",
+		    first_idx, bind_end, rsv_start, rsv_end);
+		return (EINVAL);
+	}
+
+	pmap_invalidate_cache_pages(obj->pages, obj->npages);
+	for (size_t i = 0; i < obj->npages; i++) {
+		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
+		/*
+		 * PTE bit 7 selects PPAT index 4 (WB | LLC+eLLC | Age 0)
+		 * — coherent with CPU cache.  See igen_gt_init_ppat() in
+		 * igen_gt.c for the PPAT table setup.  Without bit 7 the
+		 * PTE resolves to PPAT[0] whose contents are firmware-
+		 * dependent — safest to be explicit for user softpin BOs
+		 * which have to round-trip CPU<->GPU cleanly.
+		 */
+		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |
+		    GTT_PTE_WRITEABLE | 0x80ULL;
+		igen_gtt_write(sc, first_idx + i, pte);
+	}
+	/*
+	 * Per-bind traces gated behind dev.igen.<n>.debug — iris + kwin
+	 * issue EXECBUFFER2 constantly for GL rendering; each batch fires
+	 * one bind_gem_at per BO, so keeping these as unconditional
+	 * device_printfs flooded the serial console at frame rate.  Keep
+	 * the readback (helpful when a BO bound wrong) at level>1; keep
+	 * the post-store view (helpful for post-batch debug) at level>2.
+	 */
+	if (sc->sc_debug > 1) {
+		vm_paddr_t pa0 = VM_PAGE_TO_PHYS(obj->pages[0]);
+		uint32_t *kva0 = (uint32_t *)PHYS_TO_DMAP(pa0);
+
+		device_printf(sc->dev,
+		    "gtt_bind_gem_at: %zu page(s), softpin=0x%llx (slot 0x%x), "
+		    "pa[0]=0x%llx, pte[0]=0x%llx, readback=0x%llx\n",
+		    obj->npages, (unsigned long long)ggtt_byte_addr,
+		    first_idx, (unsigned long long)pa0,
+		    (unsigned long long)((pa0 & ~0xfffULL) | GTT_PTE_VALID |
+		        GTT_PTE_WRITEABLE),
+		    (unsigned long long)igen_gtt_read(sc, first_idx));
+		if (sc->sc_debug > 2) {
+			device_printf(sc->dev,
+			    "gtt_bind_gem_at: BO[0..7]  = %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			    kva0[0], kva0[1], kva0[2], kva0[3],
+			    kva0[4], kva0[5], kva0[6], kva0[7]);
+			device_printf(sc->dev,
+			    "gtt_bind_gem_at: BO[0x40] = %08x  (post-execbuffer2 store target)\n",
+			    kva0[0x40]);
+		}
+	}
+	return (0);
+}
+
+/*
+ * H5 (2026-08-03 review): per-file softpin binding tracker.
+ *
+ * Every successful igen_gtt_bind_gem_at from EXECBUFFER2 gets recorded
+ * into a small list attached to drm_file->driver_priv, so file close
+ * can walk the list and clear the PTEs before the underlying GEM pages
+ * are freed and reused by unrelated kernel allocations.  Without this,
+ * i915_dispatch_enable=1 lets the GPU keep reading/writing DRAM at any
+ * softpin address the client used, long after the client is gone.
+ *
+ * Storage: single tail-inserted TAILQ.  Entries are 24 B each, held
+ * under file_priv->lock; workload upper bound is ~1000 BOs per batch,
+ * ~24 KiB of tracker overhead per file.
+ */
+struct igen_softpin_binding {
+	TAILQ_ENTRY(igen_softpin_binding)	link;
+	uint32_t				first_idx;
+	uint32_t				npages;
+};
+
+struct igen_file_priv {
+	struct sx					lock;
+	TAILQ_HEAD(, igen_softpin_binding)		bindings;
+	uint32_t					count;
+};
+
+static struct igen_file_priv *
+igen_file_priv_get_or_alloc(struct drm_file *file)
+{
+	struct igen_file_priv *fp;
+
+	if (file == NULL)
+		return (NULL);
+	fp = file->driver_priv;
+	if (fp != NULL)
+		return (fp);
+	fp = malloc(sizeof(*fp), M_KMS, M_WAITOK | M_ZERO);
+	sx_init(&fp->lock, "igen_softpin");
+	TAILQ_INIT(&fp->bindings);
+	file->driver_priv = fp;
+	return (fp);
+}
+
+/*
+ * Clear a range of GGTT PTEs.  Idempotent; used both from
+ * igen_file_free (per-binding unwind at fd close) and from any future
+ * explicit unbind path.  Callers hold no lock; igen_gtt_write is safe
+ * to call from any context.
+ */
+void
+igen_gtt_unbind_range(struct igen_softc *sc, uint32_t first_idx,
+    uint32_t npages)
+{
+	uint32_t i;
+
+	for (i = 0; i < npages; i++)
+		igen_gtt_write(sc, first_idx + i, 0);
+}
+
+/*
+ * Record a successful softpin bind so the file_free callback can undo
+ * it.  Duplicates (same first_idx) simply get another entry — unbind
+ * writes 0 either way, so idempotent.  Returns 0 on success, or errno.
+ * Callers do not need to handle failure; a full-mem case here just
+ * means the eventual file_free won't unbind that PTE, leaving the
+ * pre-fix behaviour unchanged for one binding.
+ */
+int
+igen_softpin_track(struct drm_file *file, uint32_t first_idx,
+    uint32_t npages)
+{
+	struct igen_file_priv *fp;
+	struct igen_softpin_binding *b;
+
+	fp = igen_file_priv_get_or_alloc(file);
+	if (fp == NULL)
+		return (EINVAL);
+	b = malloc(sizeof(*b), M_KMS, M_NOWAIT | M_ZERO);
+	if (b == NULL)
+		return (ENOMEM);
+	b->first_idx = first_idx;
+	b->npages = npages;
+	sx_xlock(&fp->lock);
+	TAILQ_INSERT_TAIL(&fp->bindings, b, link);
+	fp->count++;
+	sx_xunlock(&fp->lock);
+	return (0);
+}
+
+/*
+ * Driver file_free callback, registered in igen_driver.file_free.
+ * kms_file_dtor calls this after detaching all mode_config pending
+ * events but before releasing the drm_file storage.  We walk the
+ * softpin binding list, clear each range of GGTT PTEs, and free the
+ * tracker itself so the drm_file goes back to a clean state.
+ *
+ * sc is retrieved from file->dev->driver_priv (igen sets it in
+ * kms_dev_register).
+ */
+void
+igen_file_free(struct drm_file *file)
+{
+	struct igen_file_priv *fp;
+	struct igen_softpin_binding *b;
+	struct igen_softc *sc;
+	uint32_t count = 0;
+
+	if (file == NULL || file->driver_priv == NULL)
+		return;
+	fp = file->driver_priv;
+	sc = (struct igen_softc *)file->dev->driver_priv;
+
+	sx_xlock(&fp->lock);
+	while ((b = TAILQ_FIRST(&fp->bindings)) != NULL) {
+		TAILQ_REMOVE(&fp->bindings, b, link);
+		if (sc != NULL)
+			igen_gtt_unbind_range(sc, b->first_idx, b->npages);
+		count++;
+		free(b, M_KMS);
+	}
+	sx_xunlock(&fp->lock);
+	sx_destroy(&fp->lock);
+	free(fp, M_KMS);
+	file->driver_priv = NULL;
+
+	if (sc != NULL && sc->sc_debug > 0 && count > 0)
+		device_printf(sc->dev,
+		    "igen_file_free: unbound %u softpin binding(s)\n", count);
+}
+
+void
+igen_test_fb_free(struct igen_softc *sc,
+    struct igen_test_fb *fb)
+{
+	if (fb->mapped) {
+		for (uint32_t i = 0; i < fb->gtt_count; i++)
+			igen_gtt_write(sc, fb->gtt_first_idx + i, 0);
+		fb->mapped = false;
+	}
+	if (fb->va != NULL) {
+		contigfree(fb->va, fb->size, M_KMS);
+		fb->va = NULL;
+	}
+}
+
+/* 64×64 checkerboard, two-color, in XRGB8888. */
+static void
+igen_test_fb_fill_checker(struct igen_test_fb *fb,
+    uint32_t color_a, uint32_t color_b)
+{
+	uint32_t *px = (uint32_t *)fb->va;
+	uint32_t row_stride_px = fb->stride / 4;
+
+	for (uint32_t y = 0; y < fb->height; y++) {
+		for (uint32_t x = 0; x < fb->width; x++) {
+			bool tile = ((x / 64) + (y / 64)) & 1;
+			px[y * row_stride_px + x] = tile ? color_a : color_b;
+		}
+	}
+}
+
+/*
+ * Self-describing diagnostic pattern in XRGB8888:
+ *   - horizontal R gradient, vertical G gradient (proves color depth)
+ *   - black grid every 100 px (proves x/y addressing + stride)
+ *   - solid white 32-px squares in each corner (anchors orientation)
+ *   - solid red 64-px band along top, green 64-px band along bottom
+ *     (immediately recognisable as "this is our buffer not the desktop")
+ */
+static void
+igen_test_fb_fill_diag(struct igen_test_fb *fb)
+{
+	uint32_t *px = (uint32_t *)fb->va;
+	uint32_t row_stride_px = fb->stride / 4;
+	uint32_t w = fb->width;
+	uint32_t h = fb->height;
+
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			uint32_t r = (x * 255) / (w - 1);
+			uint32_t g = (y * 255) / (h - 1);
+			uint32_t color = (r << 16) | (g << 8);
+
+			if ((x % 100) == 0 || (y % 100) == 0)
+				color = 0;
+			if (y < 64)
+				color = 0x00ff0000;	/* top red band */
+			else if (y >= h - 64)
+				color = 0x0000ff00;	/* bottom green band */
+			if ((x < 32 && y < 32) ||
+			    (x >= w - 32 && y < 32) ||
+			    (x < 32 && y >= h - 32) ||
+			    (x >= w - 32 && y >= h - 32))
+				color = 0x00ffffff;	/* corner anchors */
+			px[y * row_stride_px + x] = color;
+		}
+	}
+}
+
+/*
+ * Animation kthread.  Owns the held FB while it's alive: each tick
+ * stamps a moving white dot onto the FB at a new position, demonstrating
+ * that CPU writes through the kernel mapping reach physical memory that
+ * HW reads via GTT.  Sleeps 16 ms between frames (~60 Hz) to align with
+ * scanout rate.
+ */
+static void
+igen_anim_thread(void *arg)
+{
+	struct igen_softc *sc = arg;
+	uint32_t frame = 0;
+	uint32_t prev_x = 0, prev_y = 0;
+
+	while (!sc->anim_stop && sc->scanout_held && sc->scanout_fb != NULL) {
+		struct igen_test_fb *fb = sc->scanout_fb;
+		uint32_t *px = (uint32_t *)fb->va;
+		uint32_t row_stride_px = fb->stride / 4;
+
+		/* Lissajous figure scaled to interior of FB minus 64-px banding. */
+		uint32_t cx = fb->width  / 2;
+		uint32_t cy = fb->height / 2;
+		uint32_t r1 = (fb->width  / 2) - 100;
+		uint32_t r2 = (fb->height / 2) - 100;
+		uint32_t t = frame;
+		int sin_t1 = (int)((int64_t)r1 *
+		    (int)((t * 3) % 360) / 180 - r1);
+		int sin_t2 = (int)((int64_t)r2 *
+		    (int)((t * 5) % 360) / 180 - r2);
+		uint32_t x = cx + sin_t1;
+		uint32_t y = cy + sin_t2;
+		if (x >= fb->width)  x = fb->width - 32;
+		if (y >= fb->height) y = fb->height - 32;
+
+		/* Erase previous 32x32 dot. */
+		for (uint32_t dy = 0; dy < 32 && (prev_y + dy) < fb->height; dy++) {
+			for (uint32_t dx = 0; dx < 32 && (prev_x + dx) < fb->width; dx++)
+				px[(prev_y + dy) * row_stride_px + (prev_x + dx)] =
+				    0x00202020;	/* dark grey trail */
+		}
+		/* Draw new dot. */
+		for (uint32_t dy = 0; dy < 32 && (y + dy) < fb->height; dy++) {
+			for (uint32_t dx = 0; dx < 32 && (x + dx) < fb->width; dx++)
+				px[(y + dy) * row_stride_px + (x + dx)] = 0x00ffffff;
+		}
+		prev_x = x; prev_y = y;
+		frame++;
+		pause("gen9ani", hz / 60);
+	}
+	sc->anim_active = false;
+	kthread_exit();
+}
+
+static void
+igen_anim_start(struct igen_softc *sc)
+{
+	if (sc->anim_active)
+		return;
+	sc->anim_stop = false;
+	sc->anim_active = true;
+	if (kthread_add(igen_anim_thread, sc, NULL, &sc->anim_td,
+	    0, 0, "gen9anim") != 0) {
+		sc->anim_active = false;
+		device_printf(sc->dev, "anim: kthread_add failed\n");
+	}
+}
+
+void
+igen_anim_stop(struct igen_softc *sc)
+{
+	if (!sc->anim_active)
+		return;
+	sc->anim_stop = true;
+	while (sc->anim_active)
+		pause("gen9axw", hz / 100);
+}
+
+/*
+ * expose_scanout_fb: allocate a test_fb (if not already there), wrap it
+ * in a driver-owned drm_framebuffer, and register with the framework
+ * so userspace can reference it by FB_ID in an atomic_commit.  Prints
+ * the assigned FB_ID + the CRTC + plane IDs needed to use it.
+ *
+ * One-shot: subsequent triggers print the existing FB_ID without
+ * allocating again.  Cleared on detach.
+ */
+static struct igen_owned_fb *igen_exposed_fb = NULL;
+
+static int
+igen_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	if (igen_exposed_fb != NULL) {
+		device_printf(sc->dev,
+		    "expose_scanout_fb: already exposed as FB_ID=%u"
+		    "  CRTC_ID=%u  PLANE_ID=%u\n",
+		    igen_exposed_fb->base.base.id,
+		    sc->crtc.base.id, sc->primary.base.id);
+		return (0);
+	}
+
+	struct igen_owned_fb *ofb = malloc(sizeof(*ofb), M_KMS,
+	    M_WAITOK | M_ZERO);
+	struct igen_test_fb *tfb = malloc(sizeof(*tfb), M_KMS,
+	    M_WAITOK | M_ZERO);
+	error = igen_test_fb_alloc(sc, tfb, 1920, 1080);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "expose_scanout_fb: alloc failed %d\n", error);
+		free(tfb, M_KMS);
+		free(ofb, M_KMS);
+		return (0);
+	}
+	igen_test_fb_fill_diag(tfb);
+	ofb->test_fb = tfb;
+
+	ofb->base.width  = tfb->width;
+	ofb->base.height = tfb->height;
+	ofb->base.format = 0x34325258;	/* XR24 */
+	ofb->base.pitches[0] = tfb->stride;
+	error = kms_framebuffer_init(sc->drm_dev, &ofb->base,
+	    &igen_owned_fb_funcs);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "expose_scanout_fb: framebuffer_init failed %d\n", error);
+		igen_test_fb_free(sc, tfb);
+		free(tfb, M_KMS);
+		free(ofb, M_KMS);
+		return (0);
+	}
+	igen_exposed_fb = ofb;
+
+	device_printf(sc->dev,
+	    "expose_scanout_fb: exposed FB_ID=%u  CRTC_ID=%u  PLANE_ID=%u\n",
+	    ofb->base.base.id, sc->crtc.base.id, sc->primary.base.id);
+	device_printf(sc->dev,
+	    "  format=XR24  pitch=%u  size=%ux%u  GTT byte offset=0x%llx\n",
+	    tfb->stride, tfb->width, tfb->height,
+	    (unsigned long long)tfb->gtt_first_idx * PAGE_SIZE);
+	return (0);
+}
+
+/*
+ * scanout_hold: persistent flip.  Write 1 to allocate + flip; write 0
+ * to restore + free.  Lets userspace observe arbitrary work happening
+ * over the static checker buffer.  Idempotent in both directions.
+ */
+static int
+igen_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int hold = sc->scanout_held ? 1 : 0;
+	int error = sysctl_handle_int(oidp, &hold, 0, req);
+
+	if (error || req->newptr == NULL)
+		return (error);
+
+	if (hold && !sc->scanout_held) {
+		uint32_t w = 1920, h = 1080;
+		/*
+		 * Prefer the connector's native mode if we have an EDID
+		 * cached — that's what the transcoder will be programmed
+		 * for if we go through hsw_panel_on, and a mismatched
+		 * source / pipe size scans junk.
+		 */
+		if (sc->cached_edid_len >= 128) {
+			const uint8_t *d = sc->cached_edid + 54;
+			uint32_t hactive = d[2] | ((d[4] & 0xf0) << 4);
+			uint32_t vactive = d[5] | ((d[7] & 0xf0) << 4);
+			if (hactive >= 640 && hactive <= 8192 &&
+			    vactive >= 480 && vactive <= 8192) {
+				w = hactive;
+				h = vactive;
+			}
+		}
+		sc->scanout_fb = malloc(sizeof(*sc->scanout_fb),
+		    M_KMS, M_WAITOK | M_ZERO);
+		error = igen_test_fb_alloc(sc, sc->scanout_fb, w, h);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "scanout_hold: alloc failed: %d\n", error);
+			free(sc->scanout_fb, M_KMS);
+			sc->scanout_fb = NULL;
+			return (0);
+		}
+		/*
+		 * hold value picks pattern:
+		 *   1 -> checker (red/blue)
+		 *   2 -> self-describing diagnostic gradient + grid
+		 *   3 -> diagnostic + animation kthread (moving dot)
+		 * Anything else > 0 -> checker.
+		 */
+		if (hold == 2 || hold == 3)
+			igen_test_fb_fill_diag(sc->scanout_fb);
+		else
+			igen_test_fb_fill_checker(sc->scanout_fb,
+			    0x00ff0000, 0x000000ff);
+
+		sc->scanout_prev_surf = igen_r32(sc, PLANE_SURF(0));
+		uint32_t new_surf = sc->scanout_fb->gtt_first_idx * PAGE_SIZE;
+		igen_w32(sc, PLANE_SURF(0), new_surf);
+		sc->scanout_held = true;
+
+		DPRINTF(sc, 0,
+		    "scanout_hold: ON  PLANE_SURF 0x%08x -> 0x%08x\n",
+		    sc->scanout_prev_surf, new_surf);
+
+		if (hold == 3)
+			igen_anim_start(sc);
+	} else if (!hold && sc->scanout_held) {
+		igen_anim_stop(sc);
+		igen_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+		pause("gen9rst", hz / 20);
+		igen_test_fb_free(sc, sc->scanout_fb);
+		free(sc->scanout_fb, M_KMS);
+		sc->scanout_fb = NULL;
+		sc->scanout_held = false;
+		DPRINTF(sc, 0,
+		    "scanout_hold: OFF  PLANE_SURF restored to 0x%08x\n",
+		    sc->scanout_prev_surf);
+	}
+	return (0);
+}
+
+static int
+igen_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int hold_sec = 0;
+	int error = sysctl_handle_int(oidp, &hold_sec, 0, req);
+
+	if (error || req->newptr == NULL)
+		return (error);
+	if (hold_sec <= 0)
+		return (0);
+	if (hold_sec > 10)
+		hold_sec = 10;
+
+	struct igen_test_fb fb = { 0 };
+	error = igen_test_fb_alloc(sc, &fb, 1920, 1080);
+	if (error != 0) {
+		device_printf(sc->dev, "test_fb_flip: alloc failed: %d\n",
+		    error);
+		return (0);
+	}
+	igen_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
+
+	/*
+	 * Flip plane 1 of pipe A to scan from our buffer.  Our FB matches
+	 * the firmware-programmed scanout in every observable parameter
+	 * (1920x1080, XRGB8888, linear, stride 7680) so a single PLANE_SURF
+	 * write is the entire change.  PLANE_SURF is the "armed" register —
+	 * the change takes effect at the next vblank.
+	 */
+	uint32_t prev_surf = igen_r32(sc, PLANE_SURF(0));
+	uint32_t new_surf  = fb.gtt_first_idx * PAGE_SIZE;
+	uint32_t live_before = igen_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t frm_before  = igen_r32(sc, PIPE_FRMCOUNT(0));
+
+	device_printf(sc->dev,
+	    "test_fb_flip: PLANE_SURF 0x%08x -> 0x%08x (hold %d s)\n",
+	    prev_surf, new_surf, hold_sec);
+	device_printf(sc->dev,
+	    "  pre:   SURFLIVE=0x%08x  FRMCOUNT=%u\n",
+	    live_before, frm_before);
+
+	igen_w32(sc, PLANE_SURF(0), new_surf);
+
+	/*
+	 * Sample SURFLIVE shortly after the arm to confirm HW latched it
+	 * at the next vblank.  At 60 Hz a vblank arrives every ~16.7 ms;
+	 * 50 ms of pause is plenty.
+	 */
+	pause("gen9arm", hz / 20);
+	uint32_t live_armed = igen_r32(sc, PLANE_SURFLIVE(0));
+	device_printf(sc->dev,
+	    "  armed: SURFLIVE=0x%08x  %s\n", live_armed,
+	    ((live_armed & 0xfffff000) == new_surf) ?
+	    "FLIP TOOK" : "FLIP DID NOT TAKE");
+
+	pause("gen9flp", hold_sec * hz);
+	uint32_t live_end = igen_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t frm_end  = igen_r32(sc, PIPE_FRMCOUNT(0));
+
+	igen_w32(sc, PLANE_SURF(0), prev_surf);
+	pause("gen9rst", hz / 20);
+	uint32_t live_restored = igen_r32(sc, PLANE_SURFLIVE(0));
+
+	device_printf(sc->dev,
+	    "  during: SURFLIVE=0x%08x  FRMCOUNT=%u  (advanced %u frames)\n",
+	    live_end, frm_end, frm_end - frm_before);
+	device_printf(sc->dev,
+	    "  after restore: SURFLIVE=0x%08x  %s\n",
+	    live_restored,
+	    ((live_restored & 0xfffff000) == (prev_surf & 0xfffff000)) ?
+	    "RESTORED OK" : "RESTORE FAILED");
+	igen_test_fb_free(sc, &fb);
+	return (0);
+}
+
+static int
+igen_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	struct igen_test_fb fb = { 0 };
+	error = igen_test_fb_alloc(sc, &fb, 1920, 1080);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "test_fb: alloc failed (%d) — need %u KiB contig\n",
+		    error, 1920 * 1080 * 4 / 1024);
+		return (0);
+	}
+	igen_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
+
+	uint32_t *first = (uint32_t *)fb.va;
+	device_printf(sc->dev,
+	    "test_fb: %ux%u stride=%u size=%zu KiB  va=%p  pa=0x%llx\n",
+	    fb.width, fb.height, fb.stride, fb.size / 1024,
+	    fb.va, (unsigned long long)fb.pa);
+	device_printf(sc->dev,
+	    "  GTT mapped at [%u..%u]  GTT byte offset=0x%llx\n",
+	    fb.gtt_first_idx, fb.gtt_first_idx + fb.gtt_count - 1,
+	    (unsigned long long)fb.gtt_first_idx * PAGE_SIZE);
+	device_printf(sc->dev,
+	    "  first 4 px: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+	    first[0], first[1], first[2], first[3]);
+	device_printf(sc->dev,
+	    "  GTT[%u] readback = 0x%016llx (expect VALID+WRITEABLE + pa)\n",
+	    fb.gtt_first_idx,
+	    (unsigned long long)igen_gtt_read(sc, fb.gtt_first_idx));
+
+	igen_test_fb_free(sc, &fb);
+	device_printf(sc->dev, "test_fb: freed cleanly\n");
+	return (0);
+}
+
+/*
+ * Allocate one wired kernel page, map it via GTT entry `idx`, read the
+ * PTE back to prove the GTT is writable, then free the page (clearing
+ * the PTE first).  This is the smoke-test that the GTT write path
+ * works before we build the page-flip logic on top.
+ */
+static int
+igen_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	/*
+	 * Pick an index well past anything firmware might be using.  The
+	 * full GTT covers 4 GiB / 4 KiB = 1Mi entries; index 0x80000 is at
+	 * 2 GiB into the GTT-mapped address space, way beyond any plausible
+	 * scanout / engine context reservation.
+	 */
+	const uint32_t test_idx = 0x80000;
+	void *va = contigmalloc(PAGE_SIZE, M_KMS, M_WAITOK | M_ZERO,
+	    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	if (va == NULL) {
+		device_printf(sc->dev, "gtt_alloc_test: contigmalloc failed\n");
+		return (0);
+	}
+	vm_paddr_t pa = pmap_kextract((vm_offset_t)va);
+	uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID | GTT_PTE_WRITEABLE;
+
+	uint64_t before = igen_gtt_read(sc, test_idx);
+	igen_gtt_write(sc, test_idx, pte);
+	uint64_t after = igen_gtt_read(sc, test_idx);
+
+	device_printf(sc->dev,
+	    "gtt_alloc_test: va=%p  pa=0x%llx  wrote PTE=0x%llx\n",
+	    va, (unsigned long long)pa, (unsigned long long)pte);
+	device_printf(sc->dev,
+	    "  GTT[%u] before=0x%016llx  after=0x%016llx  %s\n",
+	    test_idx,
+	    (unsigned long long)before, (unsigned long long)after,
+	    (after == pte) ? "RW OK" : "MISMATCH");
+
+	/*
+	 * Restore the original PTE before freeing the page so HW can't
+	 * dangling-ref it AND any firmware mapping that happened to live
+	 * here stays intact.
+	 */
+	igen_gtt_write(sc, test_idx, before);
+	contigfree(va, PAGE_SIZE, M_KMS);
+	return (0);
+}
+
+static int
+igen_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	uint32_t start = (uint32_t)trigger;
+	uint32_t count = 2048;
+	if (start >= 0x80000)
+		start = 0;
+	if (start + count > 0x80000)
+		count = 0x80000 - start;
+
+	uint32_t valid_count = 0, last_pfn = 0, runs = 0;
+	uint64_t first_pfn = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t pte = igen_gtt_read(sc, start + i);
+		if (pte & GTT_PTE_VALID) {
+			uint64_t pfn = (pte >> 12);
+			if (valid_count == 0)
+				first_pfn = pfn;
+			if (valid_count == 0 || pfn != last_pfn + 1)
+				runs++;
+			last_pfn = pfn;
+			valid_count++;
+		}
+	}
+	device_printf(sc->dev,
+	    "gtt: PTEs [0x%x..0x%x): %u valid, %u contiguous runs,"
+	    " first PFN=0x%llx (phys 0x%llx)\n",
+	    start, start + count, valid_count, runs,
+	    (unsigned long long)first_pfn,
+	    (unsigned long long)(first_pfn << 12));
+
+	/* Pretty-print the first 8 PTEs verbatim. */
+	for (uint32_t i = 0; i < 8; i++) {
+		uint64_t pte = igen_gtt_read(sc, start + i);
+		device_printf(sc->dev,
+		    "  GTT[0x%x] = 0x%016llx  %s%s  PFN=0x%llx\n",
+		    start + i, (unsigned long long)pte,
+		    (pte & GTT_PTE_VALID) ? "V" : "-",
+		    (pte & GTT_PTE_WRITEABLE) ? "W" : "-",
+		    (unsigned long long)(pte >> 12));
+	}
+	return (0);
+}
+
+/*
+ * Register the GTT + scanout-playground sysctls under dev.igen.<n>.re.
+ * Called from igen_re_sysctls_init in igen.c.
+ */
+void
+igen_gtt_register_sysctls(struct igen_softc *sc)
+{
+	struct sysctl_ctx_list *ctx = &sc->re_sysctl_ctx;
+	struct sysctl_oid_list *children =
+	    SYSCTL_CHILDREN(sc->re_sysctl_tree);
+
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "gtt_dump",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_gtt_dump, "I",
+	    "write 1 to scan first 2048 GTT PTEs and print first 8");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "gtt_alloc_test",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_gtt_alloc_test, "I",
+	    "write 1 to alloc 1 page, map at GTT[2048], read back, free");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "test_fb_make",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_test_fb_make, "I",
+	    "write 1 to alloc + GTT-map + checker-fill an 8 MiB 1920x1080 FB");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "test_fb_flip",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_test_fb_flip, "I",
+	    "write N (seconds 1..10) to flip PLANE_SURF to our checker FB"
+	    " then restore");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "scanout_hold",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_scanout_hold, "I",
+	    "1 = checker, 2 = diagnostic gradient+grid, both flip PLANE_SURF"
+	    " and HOLD;  0 = restore firmware FB + free");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "expose_scanout_fb",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_expose_scanout_fb, "I",
+	    "write 1 to allocate + register a driver-owned drm_framebuffer"
+	    " for userspace MODE_ATOMIC; prints FB_ID, CRTC_ID, PLANE_ID");
+}
+
+/*
+ * Detach unwind: stop the animation kthread, restore firmware PLANE_SURF
+ * if we still hold it, free the persistent scanout_fb and the exposed
+ * drm_framebuffer.  Called from igen.c igen_detach.
+ */
+void
+igen_gtt_detach(struct igen_softc *sc)
+{
+	if (sc->scanout_held && sc->scanout_fb != NULL) {
+		igen_anim_stop(sc);
+		igen_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+		pause("igenrst", hz / 20);
+		igen_test_fb_free(sc, sc->scanout_fb);
+		free(sc->scanout_fb, M_KMS);
+		sc->scanout_fb = NULL;
+		sc->scanout_held = false;
+	}
+	if (igen_exposed_fb != NULL) {
+		if (sc->scanout_held) {
+			igen_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+			sc->scanout_held = false;
+		}
+		kms_framebuffer_cleanup(&igen_exposed_fb->base);
+		igen_test_fb_free(sc, igen_exposed_fb->test_fb);
+		free(igen_exposed_fb->test_fb, M_KMS);
+		free(igen_exposed_fb, M_KMS);
+		igen_exposed_fb = NULL;
+	}
+}
