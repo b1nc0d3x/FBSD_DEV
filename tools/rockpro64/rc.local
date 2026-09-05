@@ -78,36 +78,16 @@ RP64KERN_KMS)
 			logger -t kms "slim up after $((j * 500)) ms; restarting to fire fresh SETCRTC"
 			pkill -9 Xorg 2>/dev/null
 			pkill -9 slim  2>/dev/null
+			# slim's Xorg does not die with slim.  The orphan
+			# keeps vt9, so the replacement server exits with
+			# VT_SETMODE VT_PROCESS failed and slim gives up,
+			# leaving a trained link with nothing drawing on it.
+			pkill -9 Xorg 2>/dev/null
 			sleep 1
 			rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null
 			sleep 1
 			service slim start 2>&1 | logger -t kms
 
-			# That fresh SETCRTC re-runs cdn_dp's bring-up and
-			# reprograms the framer, which zeroes the MHDP audio
-			# packetizer — AUDIO_SRC_CNTL, SMPL2PKT_CNTL and
-			# PIF_PKT_ALLOC all read back 0, so the sink ends up
-			# with a trained link and no audio packets.  rk_kms
-			# only arms audio from usbc_bringup, i.e. on a fresh
-			# cable attach, so nothing re-arms it after a modeset.
-			# Wait for Xorg, then arm; twice, spaced out, because
-			# SETCRTC lands asynchronously after slim start.
-			# Drop this once the rk_kms fix that re-arms audio in
-			# rk_kms_dp_modeset is built into the running kernel.
-			k=0
-			while [ "$k" -lt 40 ]; do
-				if pgrep -q Xorg 2>/dev/null; then
-					break
-				fi
-				sleep 0.5
-				k=$((k + 1))
-			done
-			sleep 3
-			sysctl dev.rk_cdn_dp.0.audio_start_now=1 2>&1 |
-			    logger -t kms
-			sleep 5
-			sysctl dev.rk_cdn_dp.0.audio_start_now=1 2>&1 |
-			    logger -t kms
 		else
 			logger -t kms "slim never started; nothing to restart"
 		fi

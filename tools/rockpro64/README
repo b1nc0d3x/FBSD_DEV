@@ -14,5 +14,7 @@ nextboot -k <name> instead.
 loader.conf and rc.local are what this board runs, kept for reference.
 The build does not install them.  rc.local sets dev.rk_kms.0.output,
 dp_enable and commit_modeset, which are default-off in the driver; the
-DP bring-up itself lives in rk_cdn_dp.  The audio_start_now calls are a
-stopgap until the rk_kms audio re-arm fix is in the running kernel.
+DP bring-up itself lives in rk_cdn_dp.  It also kills Xorg along with
+slim when it restarts the display manager -- slim's server does not die
+with it, and the orphan keeps vt9, so the replacement exits with
+VT_SETMODE VT_PROCESS failed.
