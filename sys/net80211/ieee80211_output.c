@@ -2162,6 +2162,40 @@ ieee80211_add_cfparms(uint8_t *frm, struct ieee80211com *ic)
 #undef ADDSHORT
 }
 
+/*
+ * Append a minimal Extended Capabilities IE (tag 127) to mgmt frames.
+ * Without this, modern HE/HT APs (especially Asus families running
+ * full HE/MU-EDCA mode) treat the STA as "legacy" and queue EAPOL
+ * traffic into a slot that's only flushed irregularly -- visible as
+ * intermittent rejection of MAC-ACKed M2 frames.
+ *
+ * Bits set:
+ *   - 19  BSS Transition Management   (byte 2 bit 3 = 0x08)
+ *   - 31  Interworking                (byte 3 bit 7 = 0x80)
+ *   - 63  Operating Mode Notification (byte 7 bit 7 = 0x80)
+ *
+ * Length 10 bytes matches what mainline Linux mac80211 emits for an
+ * HT-only STA against an HE BSS; APs accept 10-byte ext-cap bodies as
+ * standard per 802.11-2020.
+ */
+static uint8_t *
+ieee80211_add_extcap(uint8_t *frm, struct ieee80211vap *vap __unused)
+{
+	*frm++ = IEEE80211_ELEMID_EXTCAP;
+	*frm++ = 10;
+	*frm++ = 0x00;
+	*frm++ = 0x00;
+	*frm++ = 0x08;	/* BSS Transition Management */
+	*frm++ = 0x80;	/* Interworking */
+	*frm++ = 0x00;
+	*frm++ = 0x00;
+	*frm++ = 0x00;
+	*frm++ = 0x80;	/* Operating Mode Notification */
+	*frm++ = 0x00;
+	*frm++ = 0x00;
+	return (frm);
+}
+
 static __inline uint8_t *
 add_appie(uint8_t *frm, const struct ieee80211_appie *ie)
 {
@@ -2829,6 +2863,7 @@ ieee80211_send_mgmt(struct ieee80211_node *ni, int type, int arg)
 #ifdef IEEE80211_SUPPORT_SUPERG
 		       + sizeof(struct ieee80211_ath_ie)
 #endif
+		       + 2 + 10	/* Extended Capabilities IE */
 		       + (vap->iv_appie_wpa != NULL ?
 				vap->iv_appie_wpa->ie_len : 0)
 		       + (vap->iv_appie_assocreq != NULL ?
@@ -2896,6 +2931,16 @@ ieee80211_send_mgmt(struct ieee80211_node *ni, int type, int arg)
 		    ni->ni_ies.vhtcap_ie[0] == IEEE80211_ELEMID_VHT_CAP) {
 			frm = ieee80211_add_vhtcap(frm, ni);
 		}
+
+		/*
+		 * Extended Capabilities IE -- modern HT/HE APs gate
+		 * EAPOL state-machine behavior on a STA advertising at
+		 * least Operating Mode Notification + Interworking +
+		 * BSS Transition Management.  Always send; the cost is
+		 * 12 bytes and the benefit is consistent treatment as a
+		 * post-2008 STA rather than legacy.
+		 */
+		frm = ieee80211_add_extcap(frm, vap);
 
 		frm = ieee80211_add_wpa(frm, vap);
 		if ((vap->iv_flags & IEEE80211_F_WME) &&

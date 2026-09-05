@@ -39,6 +39,9 @@ SRCS	+= r12a_beacon.c r12a_calib.c r12a_caps.c r12a_chan.c r12a_fw.c \
 SRCS	+= r21a_beacon.c r21a_calib.c r21a_chan.c r21a_fw.c r21a_init.c \
 	   r21a_led.c r21a_rom.c r21a_rx.c r21a.h r21a_priv.h r21a_reg.h
 
+.PATH:	   ${SRCTOP}/sys/dev/rtwn/rtl8723b
+SRCS	+= r23b.h r23b_priv.h
+
 opt_rtwn.h:
 	@echo "#define RTWN_DEBUG 1" > ${.TARGET}
 .if ${MK_SOURCELESS_UCODE} == "no"

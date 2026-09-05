@@ -29,6 +29,10 @@ SRCS	+= r12au_attach.c r12au_init.c r12au_rx.c r12au_tx.c \
 SRCS	+= r21au_attach.c r21au_init.c r21au_dfs.c \
 	   r21au.h r21au_reg.h
 
+.PATH: ${SRCTOP}/sys/dev/rtwn/rtl8723b/usb
+SRCS	+= r23bu_attach.c r23bu_init.c \
+	   r23bu.h
+
 opt_rtwn.h:
 	@echo "#define RTWN_DEBUG 1" > ${.TARGET}
 .if ${MK_SOURCELESS_UCODE} == "no"

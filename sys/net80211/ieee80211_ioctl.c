@@ -1280,8 +1280,19 @@ ieee80211_ioctl_delkey(struct ieee80211vap *vap, struct ieee80211req *ireq)
 		ieee80211_node_delucastkey(ni);
 		ieee80211_free_node(ni);
 	} else {
-		if (kid >= IEEE80211_WEP_NKID)
+		if (kid >= IEEE80211_WEP_NKID) {
+			/*
+			 * IGTK slots (802.11-2016 keyid 4 & 5) live outside
+			 * iv_nw_keys[].  Full IGTK support requires the
+			 * net80211-igtk-support patch; without it, treat
+			 * IGTK-slot deletes as a harmless no-op so wpa_supplicant
+			 * startup cleanup doesn't EINVAL and bail out of the
+			 * 4-way handshake before installing PTK.
+			 */
+			if (kid == 4 || kid == 5)
+				return 0;
 			return EINVAL;
+		}
 		/* XXX error return */
 		ieee80211_crypto_delkey(vap, &vap->iv_nw_keys[kid]);
 	}
